@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Supervise four independent two-H200 HTTP workers in one Slurm node job."""
+"""Supervise independent two-H200 HTTP workers in one Slurm node job."""
 
 from __future__ import annotations
 
@@ -21,6 +21,68 @@ def write_json(path, value):
     temporary.replace(path)
 
 
+def stop_child(child):
+    process = child["process"]
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+
+
+def refresh_workers(children, start, opener, registry):
+    """Quarantine an exhausted worker while leaving healthy GPU pairs running."""
+    states = []
+    for index, child in enumerate(children):
+        if child["process"].poll() is not None:
+            (registry / f"{child['port']}.ready.json").unlink(missing_ok=True)
+            if child["attempt"] >= 2:
+                if not child.get("disabled"):
+                    print(f"DISABLED worker={index} after three failures; see {child['log']}", flush=True)
+                child["disabled"] = True
+            else:
+                children[index] = child = start(index, child["attempt"] + 1)
+        if child.get("disabled"):
+            health = {"status": "failed", "error": "worker exhausted three attempts"}
+        else:
+            try:
+                with opener.open(child["endpoint"] + "/healthz", timeout=2) as response:
+                    health = json.load(response)
+            except urllib.error.HTTPError as error:
+                try:
+                    health = json.load(error)
+                except ValueError:
+                    health = {"status": "unreachable"}
+            except (OSError, ValueError):
+                health = {"status": "unreachable"}
+            if health.get("status") == "ready":
+                child["ready_seen"] = True
+            if not child["ready_seen"] and time.monotonic() - child["started"] > 1800:
+                print(f"STARTUP_TIMEOUT worker={index}; see {child['log']}", flush=True)
+                stop_child(child)
+                (registry / f"{child['port']}.ready.json").unlink(missing_ok=True)
+                child["disabled"] = child["attempt"] >= 2
+                health = {"status": "failed" if child["disabled"] else "restarting",
+                          "error": "worker was not ready after 30 minutes"}
+        states.append({key: value for key, value in child.items() if key not in {"process", "started"}} | {"health": health})
+    return states
+
+
+def node_status(states):
+    if all(item["health"].get("status") == "ready" for item in states):
+        return "ready"
+    if all(item.get("disabled") for item in states):
+        return "failed"
+    if any(item.get("disabled") or item.get("ready_seen") for item in states):
+        return "degraded"
+    return "starting"
+
+
 def main():
     os.umask(0o077)
     root = Path(os.environ["H3_DEPLOY_ROOT"])
@@ -34,16 +96,17 @@ def main():
     if len(token_file.read_text().strip()) < 32:
         raise ValueError("Missing deployment bearer token")
     devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
-    if len(devices) != 8 or any(not item.strip() for item in devices):
-        raise ValueError(f"Expected eight Slurm-assigned GPUs, got {devices}")
+    if len(devices) not in {2, 4, 6, 8} or any(not item.strip() for item in devices):
+        raise ValueError(f"Expected 2, 4, 6, or 8 Slurm-assigned GPUs, got {devices}")
+    workers = len(devices) // 2
     cpus = sorted(os.sched_getaffinity(0))
     if len(cpus) < 32:
         raise ValueError(f"Expected at least 32 allocated logical CPUs, got {len(cpus)}")
     import fastapi
     import uvicorn
     names = subprocess.check_output(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], text=True).splitlines()
-    if len(names) != 8 or any("H200" not in name for name in names):
-        raise ValueError("The node allocation must contain eight H200 GPUs")
+    if len(names) < len(devices) or any("H200" not in name for name in names):
+        raise ValueError("The node allocation must contain H200 GPUs")
     print(json.dumps({"node": hostname, "address": address, "job_id": job_id, "cpus": cpus,
                       "devices": devices, "fastapi": fastapi.__version__, "uvicorn": uvicorn.__version__}), flush=True)
 
@@ -60,7 +123,7 @@ def main():
     def start(index, attempt):
         port = 18080 + index
         pair = devices[2 * index:2 * index + 2]
-        assigned_cpus = cpus[index * len(cpus) // 4:(index + 1) * len(cpus) // 4]
+        assigned_cpus = cpus[index * len(cpus) // workers:(index + 1) * len(cpus) // workers]
         ready_file = registry / f"{port}.ready.json"
         ready_file.unlink(missing_ok=True)
         log_path = registry / f"{job_id}-{port}-attempt{attempt}.log"
@@ -73,7 +136,7 @@ def main():
                    "--output-dir", str(local / f"sol-h3-service/{port}"), "--token-file", str(token_file),
                    "--host", address, "--port", str(port), "--attention-backend", "sol",
                    "--warmup-prompt-file", str(root / "demo_prompt.json"), "--ready-file", str(ready_file),
-                   "--queue-capacity", "8", "--encoder-threads", "8"]
+                   "--queue-capacity", "8", "--encoder-threads", "8", "--gate-failure", "dense"]
         process = subprocess.Popen(command, cwd=root / "Sol-H3", env=env, stdout=log, stderr=subprocess.STDOUT,
                                    start_new_session=True)
         log.close()
@@ -83,51 +146,28 @@ def main():
                 "ready_seen": False}
 
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    states = []
     try:
-        for index in range(4):
+        for index in range(workers):
             children.append(start(index, 0))
         while not stopping:
-            states = []
-            for index, child in enumerate(children):
-                if child["process"].poll() is not None:
-                    if child["attempt"] >= 2:
-                        raise RuntimeError(f"Worker {index} failed three times; see {child['log']}")
-                    children[index] = child = start(index, child["attempt"] + 1)
-                try:
-                    with opener.open(child["endpoint"] + "/healthz", timeout=2) as response:
-                        health = json.load(response)
-                except urllib.error.HTTPError as error:
-                    health = json.load(error)
-                except (OSError, ValueError):
-                    health = {"status": "unreachable"}
-                if health.get("status") == "ready":
-                    child["ready_seen"] = True
-                # Shape compilation can briefly hold the GIL and delay HTTP.
-                # A startup deadline must never become a lifetime deadline for
-                # an already healthy worker after a single slow health probe.
-                if not child["ready_seen"] and time.monotonic() - child["started"] > 1800:
-                    raise RuntimeError(f"Worker {index} was not ready after 30 minutes; see {child['log']}")
-                states.append({key: value for key, value in child.items() if key not in {"process", "started"}} | {"health": health})
+            states = refresh_workers(children, start, opener, registry)
+            status = node_status(states)
             write_json(registry / "node.json", {"hostname": hostname, "address": address, "slurm_job_id": job_id,
-                                                "updated_at": time.time(), "status": "ready" if all(x["health"].get("status") == "ready" for x in states) else "starting",
+                                                "updated_at": time.time(), "status": status,
                                                 "workers": states})
+            if status == "failed":
+                raise RuntimeError("All workers exhausted their retries; releasing node allocation")
             for _ in range(10):
                 if stopping:
                     break
                 time.sleep(1)
     finally:
         for child in children:
-            if child["process"].poll() is None:
-                os.killpg(child["process"].pid, signal.SIGTERM)
-        for child in children:
-            try:
-                child["process"].wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                os.killpg(child["process"].pid, signal.SIGKILL)
-                child["process"].wait()
+            stop_child(child)
             (registry / f"{child['port']}.ready.json").unlink(missing_ok=True)
         write_json(registry / "node.json", {"hostname": hostname, "address": address, "slurm_job_id": job_id,
-                                            "updated_at": time.time(), "status": "stopped", "workers": []})
+                                            "updated_at": time.time(), "status": "stopped", "workers": states})
 
 
 if __name__ == "__main__":

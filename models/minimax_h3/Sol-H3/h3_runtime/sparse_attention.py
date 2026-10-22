@@ -123,6 +123,12 @@ class H3SparseAttention:
         self.dense_layers = int(os.environ.get("SOL_ATTN_FIRST_DENSE_LAYERS", dense_layers))
         self.sink_mode = os.environ.get("H3_SOL_SINK_MODE", sink_mode).lower()
         self.gate_enabled = os.environ.get("SOL_ATTN_CORRECTNESS_GATE", "1" if gate else "0") == "1"
+        # Benchmarks remain fail-closed. A service can explicitly use dense SDPA
+        # for a rejected shape without accepting the rejected kernel's output.
+        self.gate_failure = os.environ.get("SOL_ATTN_GATE_FAILURE", "error")
+        if self.gate_failure not in {"error", "dense"}:
+            raise ValueError("SOL_ATTN_GATE_FAILURE must be 'error' or 'dense'")
+        self.gate_each_request = os.environ.get("SOL_ATTN_GATE_EACH_REQUEST", "0") == "1"
         self.packed_input = os.environ.get("H3_SOL_PACKED_INPUT", "1") == "1"
         self.backend = os.environ.get("H3_SOL_BACKEND", backend).lower()
         bucket_override = os.environ.get("H3_SOL_COMPILE_BUCKET_SIZE")
@@ -171,12 +177,17 @@ class H3SparseAttention:
         self._prev_timestep: float | None = None
         self._direction = 0
         self._sparse_at_request_start = 0
+        self._fallback_at_request_start = 0
         self.last_request_sparse_calls: int | None = None
+        self.last_request_gate_fallback_calls: int | None = None
 
         self.sparse_calls = 0
         self.dense_calls = 0
+        self.gate_fallback_calls = 0
+        self.gate_failures = 0
         self.declined: dict[str, int] = {}
         self._gated_shapes: set = set()
+        self._rejected_shapes: dict = {}
         self._density: dict | None = None
         self.gate_stats: dict | None = None
         # A configuration that asked for sparse attention and silently got dense is a wrong
@@ -233,6 +244,8 @@ class H3SparseAttention:
 
         if layout_changed or reversal:
             self._close_request()
+            if self.gate_each_request:
+                self._gated_shapes.clear()
             self.request += 1
             self.step = 0
             self._direction = 0
@@ -277,8 +290,12 @@ class H3SparseAttention:
         # the measured request, and only the measured one is what the latency describes.
         self.last_request_sparse_calls = self.sparse_calls - self._sparse_at_request_start
         self._sparse_at_request_start = self.sparse_calls
+        self.last_request_gate_fallback_calls = self.gate_fallback_calls - self._fallback_at_request_start
+        self._fallback_at_request_start = self.gate_fallback_calls
         if self.step + 1 <= self.dense_steps or self.last_request_sparse_calls > 0:
             return
+        if self.gate_failure == "dense" and self.last_request_gate_fallback_calls:
+            return  # Explicit, reported recovery; not an unnoticed sparse misconfiguration.
         message = (f"request {self.request} ran {self.step + 1} forwards past dense_steps="
                    f"{self.dense_steps} without one sparse call; declines={self.declined}")
         if self.strict:
@@ -385,8 +402,8 @@ class H3SparseAttention:
             qb, kb, vb = (x.unsqueeze(0).contiguous() for x in (q, k, v))
 
         if self.backend == "sol_bsa":
-            if self.gate_enabled:
-                self._run_bsa_gate(qb, kb, vb)
+            if self.gate_enabled and not self._run_bsa_gate(qb, kb, vb):
+                return self._gate_dense(q, k, v)
             out, density = _sol_bsa_attention(
                 qb, kb, vb,
                 tau=self.tau,
@@ -402,8 +419,8 @@ class H3SparseAttention:
                 print(f"[sol_attn_h3] SOL/BSA route density {self._density}", flush=True)
         else:
             sol_attn = _import_kernel()
-            if self.gate_enabled:
-                self._run_gate(sol_attn, qb, kb, vb)
+            if self.gate_enabled and not self._run_gate(sol_attn, qb, kb, vb):
+                return self._gate_dense(q, k, v)
             if self._density is None:
                 self._density = _estimate_density(qb, kb, vb, tau=self.tau,
                                                   thresh_type=self.thresh_type,
@@ -456,8 +473,8 @@ class H3SparseAttention:
 
         capacity = _compile_capacity(tokens, self.compile_bucket_size)
         qb, kb, vb = dequantize_qkv_padded(packet, tokens, heads, capacity)
-        if self.gate_enabled:
-            self._run_bsa_gate(qb[:, :tokens], kb[:, :tokens], vb[:, :tokens])
+        if self.gate_enabled and not self._run_bsa_gate(qb[:, :tokens], kb[:, :tokens], vb[:, :tokens]):
+            return self._gate_dense(qb[0, :tokens], kb[0, :tokens], vb[0, :tokens])
         out, density = _sol_bsa_attention(
             qb, kb, vb,
             tau=self.tau,
@@ -476,12 +493,29 @@ class H3SparseAttention:
         self.sparse_calls += 1
         return out.squeeze(0)
 
-    def _run_bsa_gate(self, qb, kb, vb) -> None:
-        """Check block64 BSA against dense SDPA with every block selected."""
-        key = (_compile_capacity(qb.shape[1], self.compile_bucket_size),
-               *tuple(int(x) for x in qb.shape[2:]))
+    def _gate_dense(self, q, k, v):
+        self.gate_fallback_calls += 1
+        self.dense_calls += 1
+        return _dense(q, k, v)
+
+    def _gate_key(self, qb):
+        # Logical length matters even when different lengths share a compile bucket.
+        return (self.backend, *tuple(int(x) for x in qb.shape[1:]))
+
+    def _cached_gate(self, key):
+        if key in self._rejected_shapes:
+            self.gate_stats = self._rejected_shapes[key]
+            return False
         if key in self._gated_shapes:
-            return
+            return True
+        return None
+
+    def _run_bsa_gate(self, qb, kb, vb) -> bool:
+        """Check block64 BSA against dense SDPA with every block selected."""
+        key = self._gate_key(qb)
+        cached = self._cached_gate(key)
+        if cached is not None:
+            return cached
         BSA = _import_bsa()
         heads = min(int(os.environ.get("SOL_ATTN_GATE_HEADS", str(qb.shape[2]))), qb.shape[2])
         qs, ks, vs = (x[:, :, :heads].contiguous() for x in (qb, kb, vb))
@@ -507,37 +541,19 @@ class H3SparseAttention:
         want = _dense(qs[0], ks[0], vs[0]).unsqueeze(0)
         torch.cuda.synchronize(qb.device)
 
-        diff = (got.float() - want.float()).abs()
-        stats = {
-            "max_abs": float(diff.max().item()),
-            "mean_abs": float(diff.mean().item()),
-            "rel_l2": float((torch.linalg.vector_norm(got.float() - want.float())
-                             / torch.linalg.vector_norm(want.float()).clamp_min(1e-12)).item()),
-        }
-        limits = {
-            "max_abs": float(os.environ.get("SOL_ATTN_GATE_MAX_ABS",
-                                            "0.15" if qb.shape[1] >= 32768 else "0.08")),
-            "mean_abs": float(os.environ.get("SOL_ATTN_GATE_MEAN_ABS", "0.002")),
-            "rel_l2": float(os.environ.get("SOL_ATTN_GATE_REL_L2", "0.005")),
-        }
-        passed = _agree(all(stats[name] <= limit for name, limit in limits.items()))
-        self.gate_stats = {"backend": "sol_bsa", "passed": passed, "shape": list(qs.shape), **stats}
-        print(f"[sol_attn_h3] BSA correctness gate {'PASS' if passed else 'FAIL'} {stats} "
-              f"limits {limits}", flush=True)
-        if not passed:
-            raise RuntimeError(f"cuDNN BSA correctness gate failed on real QKV: {stats} > {limits}")
-        self._gated_shapes.add(key)
+        return self._finish_gate(key, got, want)
 
-    def _run_gate(self, sol_attn, qb, kb, vb) -> None:
+    def _run_gate(self, sol_attn, qb, kb, vb) -> bool:
         """Route everything and check the kernel against SDPA, on the real QKV, once per shape.
 
         `tau=-1000` drives every block above threshold, so the kernel's own arithmetic is what is
         being measured rather than the routing policy. A random-tensor probe cannot do this: it
         answers a question about the kernel, not about this model's tensors at this shape.
         """
-        key = tuple(int(x) for x in qb.shape[1:])
-        if key in self._gated_shapes:
-            return
+        key = self._gate_key(qb)
+        cached = self._cached_gate(key)
+        if cached is not None:
+            return cached
         # All heads by default, not one. `preprocess.prepare` autotunes its Triton kernels on a key
         # of `T` alone, so a first call at one head would cache a configuration chosen for a 1-head
         # grid and every production 7-head call at the same `T` would inherit it. Gating at the
@@ -555,7 +571,10 @@ class H3SparseAttention:
         )
         want = _dense(qs[0], ks[0], vs[0]).unsqueeze(0)
         torch.cuda.synchronize(qb.device)
+        return self._finish_gate(key, got, want)
 
+    def _finish_gate(self, key, got, want) -> bool:
+        """Agree on the verdict before any rank raises or switches to dense."""
         diff = (got.float() - want.float()).abs()
         stats = {
             "max_abs": float(diff.max().item()),
@@ -565,23 +584,42 @@ class H3SparseAttention:
         }
         limits = {
             "max_abs": float(os.environ.get("SOL_ATTN_GATE_MAX_ABS",
-                                            "0.15" if qb.shape[1] >= 32768 else "0.08")),
+                                            "0.15" if want.shape[1] >= 32768 else "0.08")),
             "mean_abs": float(os.environ.get("SOL_ATTN_GATE_MEAN_ABS", "0.002")),
             "rel_l2": float(os.environ.get("SOL_ATTN_GATE_REL_L2", "0.005")),
         }
-        passed = all(stats[name] <= limit for name, limit in limits.items())
+        reference_finite = _agree(bool(torch.isfinite(want).all().item()))
+        local_passed = reference_finite and all(stats[name] <= limit for name, limit in limits.items())
         # Ulysses gives each rank a disjoint set of heads, so this verdict is genuinely per-rank
         # and the ranks can disagree. Raising on one alone would leave the other seven blocked in
         # the next all-to-all: `bench_scale` catches the exception and moves to the next config, so
         # no process exits non-zero and `--kill-on-bad-exit` never fires — the allocation would sit
         # there until the three-hour walltime expired. Agree first, then fail together.
-        passed = _agree(passed)
-        self.gate_stats = {"passed": passed, "shape": list(qs.shape), **stats}
+        passed = _agree(local_passed)
+        peak = int(diff.reshape(-1).argmax().item())
+        self.gate_stats = {"backend": self.backend, "passed": passed, "local_passed": local_passed,
+                           "shape": list(want.shape), "limits": limits, "reference_finite": reference_finite,
+                           "max_error_reference": float(want.reshape(-1)[peak].item()),
+                           "max_error_output": float(got.reshape(-1)[peak].item()),
+                           "outliers": int((diff > limits["max_abs"]).sum().item()),
+                           "action": "sparse" if passed else self.gate_failure, **stats}
+        # A nonfinite kernel result may recover through a finite reference, but
+        # its diagnostics must still be valid JSON in the service job record.
+        self.gate_stats = {name: None if isinstance(value, float) and not math.isfinite(value) else value
+                           for name, value in self.gate_stats.items()}
         print(f"[sol_attn_h3] correctness gate {'PASS' if passed else 'FAIL'} {stats} "
-              f"limits {limits}", flush=True)
+              f"limits {limits} details {self.gate_stats}", flush=True)
+        if not reference_finite:
+            raise RuntimeError("Attention correctness gate has a nonfinite dense reference; cannot recover")
         if not passed:
+            self.gate_failures += 1
+            if self.gate_failure == "dense":
+                self._rejected_shapes[key] = self.gate_stats
+                print(f"[sol_attn_h3] dense SDPA fallback for rejected shape {key} on all ranks", flush=True)
+                return False
             raise RuntimeError(f"Sol-Attn correctness gate failed on real QKV: {stats} > {limits}")
         self._gated_shapes.add(key)
+        return True
 
     def stats(self) -> dict:
         total = self.sparse_calls + self.dense_calls
@@ -637,6 +675,12 @@ class H3SparseAttention:
         return {
             "sparse_calls": self.sparse_calls,
             "dense_calls": self.dense_calls,
+            "gate_fallback_calls": self.gate_fallback_calls,
+            "gate_fallback_calls_measured_request": self.last_request_gate_fallback_calls,
+            "gate_failures": self.gate_failures,
+            "gate_failure_policy": self.gate_failure,
+            "gate_each_request": self.gate_each_request,
+            "gate_rejected_shapes": len(self._rejected_shapes),
             # Totals cover the warmup request too; this is the measured one alone. With the cache
             # active most block-stack calls never happen, so the totals stop being a proxy.
             "sparse_calls_measured_request": self.last_request_sparse_calls,

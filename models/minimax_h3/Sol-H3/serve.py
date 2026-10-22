@@ -185,6 +185,8 @@ def parse_args(argv=None):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--attention-backend", choices=("sol", "sol_bsa", "dense"), default="sol")
+    parser.add_argument("--gate-failure", choices=("error", "dense"), default="dense",
+                        help="Use dense SDPA for shapes rejected by the numerical gate (service default)")
     parser.add_argument("--queue-capacity", type=int, default=8)
     parser.add_argument("--encoder-threads", type=int, default=8)
     parser.add_argument("--min-free-gib", type=int, default=20)
@@ -225,6 +227,8 @@ def main():
     if args.attention_backend != "dense":
         os.environ["SOL_ATTN_STRICT"] = "1"
         os.environ["SOL_ATTN_CORRECTNESS_GATE"] = "1"
+        os.environ["SOL_ATTN_GATE_FAILURE"] = args.gate_failure
+        os.environ["SOL_ATTN_GATE_EACH_REQUEST"] = "1"
         if os.environ.get("H3_SOL_BACKEND", args.attention_backend) != args.attention_backend:
             raise ValueError("H3_SOL_BACKEND conflicts with selected backend")
     if world_size > 1:
@@ -241,6 +245,7 @@ def main():
             state = WorkerState(args.output_dir, capacity=args.queue_capacity, min_free_gib=args.min_free_gib,
                                 metadata={"hostname": socket.gethostname(), "gpus": world_size,
                                           "gpu": torch.cuda.get_device_name(device), "attention": args.attention_backend,
+                                          "gate_failure_policy": args.gate_failure, "gate_each_request": True,
                                           "duration_seconds": [5, 10], "width": 1344, "height": 768,
                                           "fps": 24, "transformer_forwards": 4,
                                           "encoder_threads": args.encoder_threads,
@@ -266,6 +271,9 @@ def main():
         def execute(prompt, duration, seed, path):
             torch.cuda.reset_peak_memory_stats(device)
             forwards[0] = 0
+            attention = engine.sparse_attention
+            counters = ("sparse_calls", "dense_calls", "gate_fallback_calls", "gate_failures")
+            before = {key: getattr(attention, key) for key in counters} if attention else {}
             started = time.perf_counter()
             media = engine.generate(prompt, duration=duration, seed=seed)
             if forwards[0] != 4:
@@ -282,13 +290,19 @@ def main():
             elapsed = time.perf_counter() - started
             memory = {"rank": rank, "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30,
                       "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / 2**30}
-            memories = [memory]
+            attention_stats = ({key: getattr(attention, key) - before[key] for key in counters}
+                               | {"gate": attention.gate_stats, "rejected_shapes": len(attention._rejected_shapes)}
+                               if attention else None)
+            rank_result = {"memory": memory, "attention": {"rank": rank, **attention_stats} if attention_stats else None}
+            ranks = [rank_result]
             if world_size > 1:
-                memories = [None] * world_size
-                dist.all_gather_object(memories, memory, group=control)
+                ranks = [None] * world_size
+                dist.all_gather_object(ranks, rank_result, group=control)
             if rank == 0:
                 return {"pipeline_s": pipeline_s, "processing_s": elapsed, "media": profile,
-                        "transformer_forwards": forwards[0], "memory": memories,
+                        "transformer_forwards": forwards[0], "memory": [item["memory"] for item in ranks],
+                        "attention": [item["attention"] for item in ranks],
+                        "used_gate_fallback": any(item["attention"] and item["attention"]["gate_fallback_calls"] for item in ranks),
                         "bytes": path.stat().st_size}
 
         prompt = read_prompt(args.warmup_prompt_file)

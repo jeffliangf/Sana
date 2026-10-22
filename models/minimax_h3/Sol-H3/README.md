@@ -23,8 +23,12 @@ To retain separate LoRA branch arithmetic, use `--lora-mode separate`, or
 
 ### Access the deployed H200 service
 
-The deployment is on the Fukushima H200 cluster. These are the connection
-details for another client or Codex session; the `10.2.201.*` addresses are
+Use **`http://10.2.201.187:18080`** for every request. This persistent gateway
+dispatches to healthy GPU workers and keeps the same address when GPU counts,
+worker ports, or Slurm jobs change. Submission, status polling, and video downloads
+all use this one URL and the existing bearer token.
+
+The deployment is on the Fukushima H200 cluster. The `10.2.201.*` addresses are
 private and require cluster network access or an SSH tunnel.
 
 | Item | Value |
@@ -33,13 +37,12 @@ private and require cluster network access or an SSH tunnel.
 | Existing deployment owner | `jeff` |
 | Jeff's key on this workstation | `/home/jeff/.ssh/gmi` |
 | Shared service token file on the cluster | `/home/jeff/sol-h3-h200/deployment/token` |
-| Node `fukushimadc-02-hgx-0002` | `10.2.201.2`, ports `18080`–`18083` |
-| Node `fukushimadc-02-hgx-0006` | `10.2.201.6`, ports `18080`–`18083` |
-| Node `fukushimadc-02-hgx-0023` | `10.2.201.23`, ports `18080`–`18083` |
+| Stable API base URL | **`http://10.2.201.187:18080`** |
 | Shared deployment code and logs | `/home/jeff/sol-h3-h200` |
 
-The three service Slurm jobs are `3377`, `3374`, and `3380`, respectively.
-Check `/healthz` before using a worker. Each worker uses two H200 GPUs and
+As of 2026-10-22, the allocation is **20 H200 GPUs / ten two-GPU workers**:
+four GPUs on 0002 and eight each on 0006 and 0023. Clients do not need this worker
+list. Check the gateway's `/healthz` for current capacity. Each worker uses two H200 GPUs and
 accepts 5- or 10-second text-to-video requests at 1344x768 / 24 fps with audio.
 The model is **H3-Base FL2VA plus the four-step FastH3 adapter**.
 
@@ -48,7 +51,7 @@ Log in from this workstation, then query the private endpoint:
 ```bash
 ssh -i ~/.ssh/gmi -p 44222 jeff@157.66.255.187
 # On the cluster login host:
-curl --noproxy '*' --fail http://10.2.201.2:18080/healthz
+curl --noproxy '*' --fail http://10.2.201.187:18080/healthz
 ```
 
 To call it from another machine, run this tunnel on the **client machine** and
@@ -57,11 +60,11 @@ keep the terminal open:
 ```bash
 ssh -i ~/.ssh/gmi -p 44222 -N \
   -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
-  -L 127.0.0.1:28080:10.2.201.2:18080 jeff@157.66.255.187
+  -L 127.0.0.1:28080:10.2.201.187:18080 jeff@157.66.255.187
 ```
 
-Then use `http://127.0.0.1:28080` as the base URL on that machine. Add more `-L`
-forwards with distinct local ports to reach additional workers. A tunnel on a
+Then use `http://127.0.0.1:28080` as the base URL on that machine. This single
+tunnel reaches the entire worker pool. A tunnel on a
 login host does not make that host's loopback address available to Ray actors on
 other compute hosts. Run forwarding on each client host or provide network routing.
 Other people need authorized SSH access and the service bearer token; the listed
@@ -77,7 +80,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-base = "http://10.2.201.2:18080"
+base = "http://10.2.201.187:18080"
 token = Path("/home/jeff/sol-h3-h200/deployment/token").read_text().strip()
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -109,17 +112,93 @@ PY
 ```
 
 For a tunneled client, change `base` and use a protected local copy of the token
-file. Keep status and download requests on the same worker that accepted the job.
+file. Keep submission, status, and download requests on the gateway URL.
 HTTP 401 means the token is missing/incorrect, 422 means invalid parameters,
-429 means the queue is full, and 503 means the worker is starting or unavailable.
+429 means the queues are full, 503 means no worker is ready, and 507 means
+insufficient output storage. A worker's 429, 503, or 507 response rejects the
+request before acceptance, so the gateway can safely try another worker.
+An ambiguous submission failure returns 502; inspect recovery state before
+resubmitting, because a worker may already have accepted the request.
 The token is not needed for `/healthz`.
 
 For verl, see the **Self-hosted H3 on H200** section of
 `/home/jeff/verl/examples/prompt_rewrite/README.md`. Its new-run options are
-`--h3-backend self-hosted`, `--h3-endpoints <comma-separated worker URLs>`, and
+`--h3-backend self-hosted`, `--h3-endpoints http://10.2.201.187:18080`, and
 `--h3-token-file <shared token filename>`. The policy can continue calling
 `h3_max(prompt)`; the adapter performs submission, polling, download, and media
 validation against this service.
+
+Existing clients configured with individual worker URLs need a one-time switch
+to the gateway for **new** requests. Jobs submitted directly to a worker remain
+on that worker; the gateway only owns jobs submitted through it. Keep existing
+verl runs and saved job recovery files on their frozen endpoint configuration;
+prepare a new run to use the gateway. Future changes to the gateway's worker
+pool do not change the client's configuration or recovery identity.
+
+### Operate the stable gateway
+
+`gateway.py` is a CPU service on the persistent login host, outside GPU Slurm
+allocations. `deploy_h200_gateway.sh` installs its Python environment and systemd
+user service/socket. Run it on `jeff@157.66.255.187:44222`:
+
+```bash
+bash /home/jeff/sol-h3-h200/Sol-H3/deploy_h200_gateway.sh
+systemctl --user status h3-gateway.socket h3-gateway.service
+journalctl --user -u h3-gateway.service -n 50
+```
+
+User lingering keeps the service running after SSH logout and starts it at boot.
+The socket keeps the same listener across service restarts. The deployment script
+pins the address in `gateway/endpoint.json` and refuses an accidental address or
+port change on later updates. Update gateway code, then run
+`systemctl --user restart h3-gateway.service`; GPU workers continue running.
+This is one gateway host, so a host or network outage can still interrupt access.
+
+The gateway reads `deployment/*/node.json` and probes workers every two seconds.
+Stale registries, disabled workers, and workers without a ready health response
+receive no new jobs. New allocations launched with `deploy_h200_node.sh` join
+automatically when ready. Requests go to a worker with the shortest queue.
+Each accepted job is pinned to its original worker in `gateway/jobs/<id>.json`;
+completed videos are copied to shared `gateway/videos/<id>.mp4` before the
+gateway reports success. Those results remain downloadable after that worker
+is retired, and gateway restarts resume polling accepted jobs without resubmitting.
+
+For maintenance, atomically write `gateway/pool.json` under
+`/home/jeff/sol-h3-h200` with one of these configurations:
+
+```json
+{"excluded_workers": ["http://10.2.201.2:18080", "http://10.2.201.2:18081"]}
+```
+
+This drains the listed workers: they receive no new gateway jobs, while their
+accepted jobs continue polling and archiving. Wait until their gateway job
+records are failed or have `video_cached: true`, and their own `/healthz` has
+`active_job: null` and `queued: 0`, before stopping their allocation. Direct
+clients must also stop submitting to a retiring worker. Abruptly stopping a GPU
+worker can interrupt its unfinished jobs; the gateway does not silently repeat
+generation on another worker.
+
+`{"workers": ["http://10.2.201.6:18080"]}` explicitly sets the admitted pool.
+`{"workers": []}` pauses new submissions; health and new submissions return 503,
+but completed status and video downloads still work. Delete `pool.json` or write
+`{}` to restore automatic discovery. Pool changes require no gateway restart.
+
+Internal worker addresses as of 2026-10-22 are 0002 (`10.2.201.2:18080–18081`,
+job 3471), 0006 (`10.2.201.6:18080–18083`, job 3469), and 0023
+(`10.2.201.23:18080–18083`, job 3470). Node 0002's old 18082–18083 workers
+are offline; their GPU allocation is in use by other jobs.
+
+On 2026-10-22, gateway validation passed **12/12 live generations**: ten
+simultaneous 5-second requests covered every worker and survived a gateway
+restart while pending; two simultaneous 10-second requests used verl's actual
+client with the admitted pool reduced to two workers. Both client outputs passed
+media validation and resumed without resubmission. All twelve completed videos
+were downloaded and checksum-verified with the admitted pool temporarily empty.
+The full ten-worker pool was restored, with no GPU worker restarts or uncertain
+submissions. The SSH tunnel was also checked from the client workstation.
+Gateway/HTTP/supervisor tests passed 17 cases and the verl client passed 12 cases.
+Evidence is in `deployment/gateway-20261022/report.json` on the cluster and
+`runs/minimax_h3_h200_gateway_20261022/report.json` in this checkout.
 
 ### Launch another service
 
@@ -157,10 +236,28 @@ the request. The service validates four transformer forwards and audio/video
 stream metadata before marking a request successful. A failed distributed
 generation terminates the process group instead of reusing inconsistent GPU state.
 
-`deploy_h200_node.sh` and `serve_node.py` provide the Slurm node deployment: four
-independent two-GPU workers, ports 18080–18083, eight CPU encoder threads per
+The service keeps the numerical correctness gate enabled with its existing
+limits. `--gate-failure dense` (the service default) uses dense SDPA when **any
+rank** rejects a kernel's result. Rejected results are discarded and the shape
+stays on dense attention for that worker's lifetime. Accepted shapes are checked
+again on the first eligible sparse call of each new request. A nonfinite dense
+reference, CUDA error, or failed collective still terminates the worker.
+`--gate-failure error` restores the fatal gate behavior; benchmarks retain that
+strict default. No numerical tolerance was increased.
+
+Completed job JSON includes `used_gate_fallback` and per-rank `attention`
+counters (`sparse_calls`, `dense_calls`, `gate_fallback_calls`, `gate_failures`)
+plus the gate's measured errors. Dense fallback can be slower, so include those
+counters when reporting latency. `/healthz` exposes `gate_failure_policy`.
+
+`deploy_h200_node.sh` and `serve_node.py` provide the Slurm node deployment: one
+independent worker per GPU pair (2/4/6/8 allocated GPUs), ports starting at 18080
+through at most 18083, eight CPU encoder threads per
 worker, and separate CPU affinities. They bind to the node's internal IP and
-supervise each process group with up to two restarts. The launcher defaults to
+supervise each process group with up to two restarts. An exhausted worker is
+disabled while healthy siblings continue; the node registry reports `degraded`.
+If every worker exhausts its retries, the supervisor exits and releases the
+allocation. The launcher defaults to
 `/home/jeff/sol-h3-h200` for shared code/registry and `/raid/jeff` for environments,
 checkpoints, caches, and outputs. It expects a private `deployment/token` and can
 initialize a fresh node from a checksummed `deployment/staging` snapshot. The
@@ -178,10 +275,41 @@ records are beside it. Check live `/healthz` responses when using the registry,
 because a hard node failure can leave stale files. Stop a deployment with
 `scancel <its-job-id>`. Outputs are retained until explicitly removed; admission
 stops when free disk space falls below 20 GiB. The HTTP endpoints are intended for
-the private cluster network or an SSH tunnel. Cross-worker routing and integration
-with a training client are separate from this service.
+the private cluster network or an SSH tunnel. The gateway above provides routing
+across workers; use its fixed URL in training clients.
 
-### Concurrent H200 validation
+The repair evidence and pre-restart request snapshots are on the cluster under
+`deployment/gate-repair-20261022/`. Existing MP4s remain in
+`/raid/jeff/sol-h3-service/<port>/` on their original node, including outputs
+belonging to currently offline ports. Recovery replays use fresh job IDs; they do
+not change a client's saved batch recovery ledger or automatically resume it.
+
+### Gate recovery validation
+
+The 2026-10-22 repair passed 19 regression tests and a two-H200 distributed check:
+one rank's rejection sends both ranks to an exact dense result, and a nonfinite
+dense reference remains fatal on both ranks. Four recovered failing requests
+completed on node 0006, then completed again on the same workers with zero
+restarts. All eight used the reported dense fallback.
+
+The subsequent fleet replay completed **26/26 distinct previously failing
+requests** across all ten workers, also with zero restarts. At 06:41 UTC, all ten
+live health endpoints returned 200/ready. The separate
+`deployment/gate-repair-20261022/replay-map.json` maps each original job ID to its
+successful validation replacement so the batch client can reuse those videos.
+The client's recovery state was not modified.
+
+For those four **10-second clips**, the first replay took **50.85 s median** and
+the repeat took **44.71 s median** (44.68–45.97 s). These are service processing
+times through MP4 encoding, excluding model warmup, queueing, and downloads.
+Every authenticated download matched its recorded size. One recovered clip was
+fully decoded: 243 video frames and nonzero stereo audio. Detailed evidence is
+in `deployment/gate-repair-20261022/` on the cluster.
+
+### Initial sparse-attention validation (historical)
+
+The following timings predate the gate repair and cover requests whose sparse
+gates passed. They do not describe requests that now require dense fallback.
 
 On 2026-10-22, two eight-H200 nodes ran four two-GPU workers each. All **64 HTTP
 generation requests passed**: three simultaneous eight-request rounds per
