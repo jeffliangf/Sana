@@ -126,9 +126,18 @@ class H3SparseAttention:
         self.packed_input = os.environ.get("H3_SOL_PACKED_INPUT", "1") == "1"
         self.backend = os.environ.get("H3_SOL_BACKEND", backend).lower()
         bucket_override = os.environ.get("H3_SOL_COMPILE_BUCKET_SIZE")
+        # Direct Sol's padded-token masking is implemented only by its SM100
+        # kernel. Hopper must use the logical sequence length; BSA handles
+        # bucket tails independently and keeps its existing default.
+        default_bucket_size = 4096
+        if self.backend == "sol" and (
+            not torch.cuda.is_available()
+            or torch.cuda.get_device_capability() not in {(10, 0), (10, 3)}
+        ):
+            default_bucket_size = 0
         self.compile_bucket_size = int(
             bucket_override if bucket_override is not None
-            else "4096"
+            else default_bucket_size
         )
         if self.backend not in {"sol", "sol_bsa"}:
             raise ValueError(
@@ -481,14 +490,20 @@ class H3SparseAttention:
         indices = ids.view(1, 1, 1, blocks).expand(1, heads, blocks, blocks).contiguous()
         sizes = torch.full((blocks,), 64, device=qs.device, dtype=torch.int32)
         sizes[-1] = qs.shape[1] - (blocks - 1) * 64
+        # SM90 requires full query tiles even though KV supports a partial
+        # final block. Pad queries only and compare the original logical rows;
+        # adding unmasked zero keys would change the dense reference.
+        q_run = qs
+        if torch.cuda.get_device_capability(qs.device) == (9, 0) and qs.shape[1] % 64:
+            q_run = F.pad(qs, (0, 0, 0, 0, 0, blocks * 64 - qs.shape[1]))
         got = BSA.block_sparse_attention_forward(
-            qs, ks, vs, indices,
+            q_run, ks, vs, indices,
             block_sparse_num=blocks,
             block_sizes=sizes,
             sparse_block_size=64,
             layout="bshd",
             kv_splits=1,
-        )["o_tensor"]
+        )["o_tensor"][:, :qs.shape[1]]
         want = _dense(qs[0], ks[0], vs[0]).unsqueeze(0)
         torch.cuda.synchronize(qb.device)
 

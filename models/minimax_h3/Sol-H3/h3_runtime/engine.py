@@ -77,12 +77,14 @@ class GeneratedMedia:
     duration: int
     seed: int
 
-    def save_async(self, output_path: str | Path):
+    def save_async(self, output_path: str | Path, *, encoder_threads: int = 36):
         """Stage output and encode it in the background."""
         from .encoding import start_fast_video_encode
 
         if self.video is None:
             raise RuntimeError("this output has already been handed to an encoder")
+        if encoder_threads < 1:
+            raise ValueError("encoder_threads must be positive")
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         job = start_fast_video_encode(
@@ -93,7 +95,7 @@ class GeneratedMedia:
             audio_sample_rate=self.audio_sample_rate,
             chunk_frames=8,
             fragmented=True,
-            encoder_threads=36,
+            encoder_threads=encoder_threads,
             pyav_zero_copy=True,
             overlap_audio=True,
         )
@@ -102,8 +104,8 @@ class GeneratedMedia:
         self.audio = None
         return job
 
-    def save(self, output_path: str | Path) -> Path:
-        job = self.save_async(output_path)
+    def save(self, output_path: str | Path, *, encoder_threads: int = 36) -> Path:
+        job = self.save_async(output_path, encoder_threads=encoder_threads)
         job.wait()
         output_path = Path(output_path)
         return output_path

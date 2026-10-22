@@ -29,6 +29,10 @@ deployment configuration and actual browser-loop validation.
 
 ## SOL-H3
 
+For the already deployed H200 service, see the
+[access guide](Sol-H3/README.md#access-the-deployed-h200-service), including the
+SSH gateway, worker addresses, token location, tunnel setup, and a complete API example.
+
 The standalone [`Sol-H3`](Sol-H3/) runtime covers distilled
 4-step T2V, first-frame I2V, and the MiniMax-H3 Ref2VA partition. It supports synchronized video
 and audio, 5/10/15-second outputs at 1344x768, Ulysses sequence parallelism over as many as eight
