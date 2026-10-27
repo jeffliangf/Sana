@@ -21,6 +21,15 @@ To retain separate LoRA branch arithmetic, use `--lora-mode separate`, or
 
 ## Resident H200 service
 
+For the fixed gateway contract, storage safeguards, H100/H200 configuration, and
+the complete deployment/drain procedure, use the dedicated
+[deployment design and runbook](DEPLOYMENT.md).
+
+**Last recorded state (2026-10-26): all four H200 nodes were intentionally drained
+and stopped.** The gateway was retained for existing downloads. The capacity and
+allocation IDs below describe the last active fleet, not a current reservation.
+The 2026-10-27 hardening changes are local and have not been deployed.
+
 ### Access the deployed H200 service
 
 Use **`http://10.2.201.187:18080`** for every request. This persistent gateway
@@ -40,9 +49,12 @@ private and require cluster network access or an SSH tunnel.
 | Stable API base URL | **`http://10.2.201.187:18080`** |
 | Shared deployment code and logs | `/home/jeff/sol-h3-h200` |
 
-As of 2026-10-22, the allocation is **20 H200 GPUs / ten two-GPU workers**:
-four GPUs on 0002 and eight each on 0006 and 0023. Clients do not need this worker
-list. Check the gateway's `/healthz` for current capacity. Each worker uses two H200 GPUs and
+The last active allocation (2026-10-24 through the Oct 26 stop) was
+**32 H200 GPUs / sixteen two-GPU workers**: eight GPUs each on 0002, 0006, 0023,
+and 0048. Clients do not need this worker list. That pool supported sixteen
+simultaneous generations and 128 waiting jobs, with an external batch concurrency
+of 20. Recalculate caller concurrency for the next fleet's healthy worker count.
+Check the gateway's `/healthz` for current capacity. Each worker uses two H200 GPUs and
 accepts 5- or 10-second text-to-video requests at 1344x768 / 24 fps with audio.
 The model is **H3-Base FL2VA plus the four-step FastH3 adapter**.
 
@@ -155,8 +167,10 @@ port change on later updates. Update gateway code, then run
 This is one gateway host, so a host or network outage can still interrupt access.
 
 The gateway reads `deployment/*/node.json` and probes workers every two seconds.
-Stale registries, disabled workers, and workers without a ready health response
-receive no new jobs. New allocations launched with `deploy_h200_node.sh` join
+Registries older than 300 seconds, disabled workers, and workers without a ready
+health response receive no new jobs. Heartbeats older than 120 seconds are reported
+stale during that bounded grace period. Explicit stops and exclusions take effect
+immediately. New allocations launched with `deploy_node.sh` join
 automatically when ready. Requests go to a worker with the shortest queue.
 Each accepted job is pinned to its original worker in `gateway/jobs/<id>.json`;
 completed videos are copied to shared `gateway/videos/<id>.mp4` before the
@@ -183,10 +197,18 @@ generation on another worker.
 but completed status and video downloads still work. Delete `pool.json` or write
 `{}` to restore automatic discovery. Pool changes require no gateway restart.
 
-Internal worker addresses as of 2026-10-22 are 0002 (`10.2.201.2:18080–18081`,
-job 3471), 0006 (`10.2.201.6:18080–18083`, job 3469), and 0023
-(`10.2.201.23:18080–18083`, job 3470). Node 0002's old 18082–18083 workers
-are offline; their GPU allocation is in use by other jobs.
+Historical worker addresses (these Slurm jobs were cancelled on 2026-10-26):
+
+| Node | Worker addresses | Slurm jobs |
+|---|---|---|
+| 0002 | `10.2.201.2:18080–18083` | 3865 (18080–18081), 3867 (18082–18083) |
+| 0006 | `10.2.201.6:18080–18083` | 3863 |
+| 0023 | `10.2.201.23:18080–18083` | 3864 |
+| 0048 | `10.2.201.48:18080–18083` | 3866 (18080–18081), 3868 (18082–18083) |
+
+Each node had eight allocated GPUs and four workers. Nodes 0002 and 0048 used
+two separate four-GPU allocations, so adding capacity did not restart their
+original workers. Clients continue using the gateway URL.
 
 On 2026-10-22, gateway validation passed **12/12 live generations**: ten
 simultaneous 5-second requests covered every worker and survived a gateway
@@ -199,6 +221,56 @@ submissions. The SSH tunnel was also checked from the client workstation.
 Gateway/HTTP/supervisor tests passed 17 cases and the verl client passed 12 cases.
 Evidence is in `deployment/gateway-20261022/report.json` on the cluster and
 `runs/minimax_h3_h200_gateway_20261022/report.json` in this checkout.
+
+The 2026-10-23 expansion added four separately allocated GPUs on 0048, with
+64 CPU threads and 800 GiB of host memory reserved through Slurm. The new
+workers stayed excluded from gateway dispatch until both passed 5-second and
+10-second generation checks, including a previously failing prompt. Both then
+passed generation, polling, and authenticated download through the fixed
+gateway URL: **6/6 requests passed**, covering all four added GPUs. The gateway
+process, original allocations, and original worker attempts were unchanged.
+Evidence is in `deployment/scale-0048-20261023/` on the cluster and
+`runs/minimax_h3_h200_scale_0048_20261023/` in this checkout. The original pool
+completed another 63 requests during this expansion before the new workers
+were admitted. No client URL, token, or concurrency change is needed.
+
+A second expansion on 2026-10-23 added four more GPUs each on 0002 and 0048,
+using ports 18082–18083 and separate supervisor registries. Each added allocation
+reserves 64 CPU threads and 800 GiB of host memory. All four new workers passed
+5- and 10-second generation checks before admission, including a previously
+failing prompt, then each passed a 10-second request through the fixed gateway:
+**12/12 requests passed**, with authenticated downloads and no worker restarts.
+The gateway process and original allocations were unchanged. All original TCP
+listeners remained available, including 0048's separate loopback service, and
+all 25 historical completed videos on 0002's reused ports were preserved.
+HTTP, gateway, and supervisor tests passed **26 cases**. Evidence is in
+`deployment/scale-fill-0002-0048-20261023/` on the cluster and
+`runs/minimax_h3_h200_fill_0002_0048_20261023/` in this checkout.
+
+On 2026-10-24 at approximately 06:56 UTC, all six allocations failed after
+shared-storage writes returned `ENOSPC` or `EIO`. A failed registry heartbeat
+escaped the supervisor loop and triggered worker shutdown. The supervisor now
+retries failed registry writes on subsequent iterations while keeping workers
+running. Worker logs, readiness files, and supervisor logs use node-local disk.
+The regression suite passed **28 cases**, including both storage errors followed
+by recovery without worker restarts. Incident snapshots and request recovery
+records are in `deployment/storage-recovery-20261024/` on the cluster and
+`runs/minimax_h3_h200_storage_recovery_20261024/` in this checkout.
+
+The restart retained every worker port and the gateway process. **16/16 live
+requests passed** through the gateway, covering all 32 GPUs with authenticated,
+checksum-verified downloads. Eight 5-second requests used the demo prompt and
+eight 10-second requests exercised the numerical fallback. All 4,988 previously
+completed worker videos were present before restart. Of 19 pending gateway jobs,
+one completed video was recovered and 18 requests are now explicitly failed;
+`pending-before.json` and `pending-after.json` preserve their recovery records.
+Interrupted jobs were not automatically resubmitted.
+
+Shared storage remains necessary for gateway job persistence and video archives.
+If registry publication stays unavailable for more than 120 seconds, automatic
+discovery stops routing new work to those stale entries until publication resumes.
+The supervisors keep resident workers running, and completed outputs remain on
+local disk.
 
 ### Launch another service
 
@@ -250,9 +322,10 @@ counters (`sparse_calls`, `dense_calls`, `gate_fallback_calls`, `gate_failures`)
 plus the gate's measured errors. Dense fallback can be slower, so include those
 counters when reporting latency. `/healthz` exposes `gate_failure_policy`.
 
-`deploy_h200_node.sh` and `serve_node.py` provide the Slurm node deployment: one
-independent worker per GPU pair (2/4/6/8 allocated GPUs), ports starting at 18080
-through at most 18083, eight CPU encoder threads per
+`deploy_node.sh` and `serve_node.py` provide the Slurm node deployment, with
+`deploy_h200_node.sh` retaining the old entry point. Defaults are one independent
+worker per H200 GPU pair (2/4/6/8 allocated GPUs), consecutive ports
+starting at `H3_BASE_PORT` (default 18080), eight CPU encoder threads per
 worker, and separate CPU affinities. They bind to the node's internal IP and
 supervise each process group with up to two restarts. An exhausted worker is
 disabled while healthy siblings continue; the node registry reports `degraded`.
@@ -261,8 +334,10 @@ allocation. The launcher defaults to
 `/home/jeff/sol-h3-h200` for shared code/registry and `/raid/jeff` for environments,
 checkpoints, caches, and outputs. It expects a private `deployment/token` and can
 initialize a fresh node from a checksummed `deployment/staging` snapshot. The
-staged venv must use the same absolute path on every node; `H3_DEPLOY_ROOT` and
-`H3_LOCAL_ROOT` override the site paths when preparing another deployment.
+staged venv is tied to `/raid/jeff/sol-h3-venv`. Other paths and H100 nodes require
+a prepared environment; `H3_VENV` and `H3_CHECKPOINT_ROOT` select it and the weights.
+`H3_GPU_TYPE=H100` defaults to four GPUs per worker; live H100 validation is still
+required. See [the runbook](DEPLOYMENT.md#parameterize-the-next-fleet) for all settings.
 
 ```bash
 sbatch --partition=all --nodes=1 --ntasks=1 --cpus-per-task=160 --mem=1600G \
@@ -270,8 +345,28 @@ sbatch --partition=all --nodes=1 --ntasks=1 --cpus-per-task=160 --mem=1600G \
   --nodelist=YOUR_NODE deploy_h200_node.sh
 ```
 
-The node registry is `deployment/<hostname>/node.json`; worker logs and readiness
-records are beside it. Check live `/healthz` responses when using the registry,
+To add a separate four-GPU allocation on a node already serving ports
+18080–18081, reserve idle GPUs through Slurm and use a free port range:
+
+```bash
+sbatch --partition=all --nodes=1 --ntasks=1 --cpus-per-task=64 --mem=800G \
+  --gres=gpu:nvidia_h200:4 --constraint=h200 --time=0 \
+  --export=ALL,H3_BASE_PORT=18082 \
+  --nodelist=YOUR_NODE deploy_h200_node.sh
+```
+
+Confirm both ports are unused before launching. Exclude the new endpoints in
+`gateway/pool.json` during validation, then remove those exclusions to admit
+them without restarting the gateway. Keep other operators' pool settings intact.
+
+The default node registry is `deployment/<hostname>/node.json`. A nondefault
+base port uses `deployment/<hostname>-p<base-port>/node.json`, so concurrent
+allocations keep separate state. Worker logs and readiness records are local to
+the GPU node under `$H3_LOCAL_ROOT/sol-h3-supervisor/<registry-name>/` (normally
+`/raid/jeff/sol-h3-supervisor/`). Supervisor output is in
+`$H3_LOCAL_ROOT/sol-h3-supervisor/supervisor-<slurm-job-id>.log`; the Slurm launch
+log prints this path. The shared registry records each worker's local log path.
+Check live `/healthz` responses when using the registry,
 because a hard node failure can leave stale files. Stop a deployment with
 `scancel <its-job-id>`. Outputs are retained until explicitly removed; admission
 stops when free disk space falls below 20 GiB. The HTTP endpoints are intended for

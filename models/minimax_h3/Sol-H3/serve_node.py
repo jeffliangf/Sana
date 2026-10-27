@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Supervise independent two-H200 HTTP workers in one Slurm node job."""
+"""Supervise independent H200 or H100 HTTP workers in one Slurm node job."""
 
 from __future__ import annotations
 
+from contextlib import suppress
 import json
 import os
 from pathlib import Path
@@ -14,11 +15,25 @@ import time
 import urllib.error
 import urllib.request
 
+from service_storage import atomic_json, quiet_print
 
 def write_json(path, value):
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value, indent=2) + "\n")
-    temporary.replace(path)
+    atomic_json(path, value)
+
+
+def publish_registry(path, value):
+    """A shared-filesystem heartbeat failure must not stop healthy GPU workers."""
+    try:
+        write_json(path, value)
+    except OSError as error:
+        # Keep supervising and retry on the next iteration. Discovery may pause
+        # while storage is unavailable, but resident workers retain their jobs.
+        try:
+            print(f"REGISTRY_WRITE_FAILED path={path} error={error!r}; will retry", flush=True)
+        except OSError:
+            pass
+        return False
+    return True
 
 
 def stop_child(child):
@@ -40,15 +55,21 @@ def refresh_workers(children, start, opener, registry):
     states = []
     for index, child in enumerate(children):
         if child["process"].poll() is not None:
-            (registry / f"{child['port']}.ready.json").unlink(missing_ok=True)
+            with suppress(OSError):
+                (registry / f"{child['port']}.ready.json").unlink(missing_ok=True)
             if child["attempt"] >= 2:
                 if not child.get("disabled"):
-                    print(f"DISABLED worker={index} after three failures; see {child['log']}", flush=True)
+                    quiet_print(f"DISABLED worker={index} after three failures; see {child['log']}")
                 child["disabled"] = True
-            else:
-                children[index] = child = start(index, child["attempt"] + 1)
+            elif not child.get("disabled"):
+                try:
+                    children[index] = child = start(index, child["attempt"] + 1)
+                except OSError as error:
+                    child["disabled"] = True
+                    child["restart_error"] = str(error)
+                    quiet_print(f"RESTART_FAILED worker={index} error={error!r}; siblings remain running")
         if child.get("disabled"):
-            health = {"status": "failed", "error": "worker exhausted three attempts"}
+            health = {"status": "failed", "error": child.get("restart_error", "worker exhausted three attempts")}
         else:
             try:
                 with opener.open(child["endpoint"] + "/healthz", timeout=2) as response:
@@ -63,9 +84,10 @@ def refresh_workers(children, start, opener, registry):
             if health.get("status") == "ready":
                 child["ready_seen"] = True
             if not child["ready_seen"] and time.monotonic() - child["started"] > 1800:
-                print(f"STARTUP_TIMEOUT worker={index}; see {child['log']}", flush=True)
+                quiet_print(f"STARTUP_TIMEOUT worker={index}; see {child['log']}")
                 stop_child(child)
-                (registry / f"{child['port']}.ready.json").unlink(missing_ok=True)
+                with suppress(OSError):
+                    (registry / f"{child['port']}.ready.json").unlink(missing_ok=True)
                 child["disabled"] = child["attempt"] >= 2
                 health = {"status": "failed" if child["disabled"] else "restarting",
                           "error": "worker was not ready after 30 minutes"}
@@ -83,32 +105,57 @@ def node_status(states):
     return "starting"
 
 
+def allocation_layout(root, hostname, workers, base_port=18080):
+    """Keep concurrent allocations on one host in separate port and registry ranges."""
+    if not 1 <= workers <= 4 or not 1 <= base_port <= 65536 - workers:
+        raise ValueError("Expected one to four workers with ports in 1..65535")
+    name = hostname if base_port == 18080 else f"{hostname}-p{base_port}"
+    return Path(root) / "deployment" / name, list(range(base_port, base_port + workers))
+
+
+def gpu_layout(devices, gpu_type, gpus_per_worker):
+    if gpu_type not in {"H100", "H200"}:
+        raise ValueError("H3_GPU_TYPE must be H100 or H200")
+    if gpus_per_worker not in {2, 4}:
+        raise ValueError("H3_GPUS_PER_WORKER must be 2 or 4")
+    if (not 2 <= len(devices) <= 8 or len(devices) % gpus_per_worker or
+            any(not device.strip() for device in devices) or len(set(devices)) != len(devices)):
+        raise ValueError("Assigned GPUs must be unique and divisible into complete worker groups")
+    return [devices[i:i + gpus_per_worker] for i in range(0, len(devices), gpus_per_worker)]
+
+
 def main():
     os.umask(0o077)
     root = Path(os.environ["H3_DEPLOY_ROOT"])
     local = Path(os.environ["H3_LOCAL_ROOT"])
     job_id = os.environ["SLURM_JOB_ID"]
     hostname = socket.gethostname()
-    address = socket.gethostbyname(hostname)
-    registry = root / "deployment" / hostname
-    registry.mkdir(parents=True, exist_ok=True)
+    address = os.environ.get("H3_BIND_HOST") or socket.gethostbyname(hostname)
     token_file = root / "deployment" / "token"
     if len(token_file.read_text().strip()) < 32:
         raise ValueError("Missing deployment bearer token")
     devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
-    if len(devices) not in {2, 4, 6, 8} or any(not item.strip() for item in devices):
-        raise ValueError(f"Expected 2, 4, 6, or 8 Slurm-assigned GPUs, got {devices}")
-    workers = len(devices) // 2
+    gpu_type = os.environ.get("H3_GPU_TYPE", "H200").upper()
+    group_size = int(os.environ.get("H3_GPUS_PER_WORKER", "4" if gpu_type == "H100" else "2"))
+    groups = gpu_layout(devices, gpu_type, group_size)
+    workers = len(groups)
+    base_port = int(os.environ.get("H3_BASE_PORT", "18080"))
+    registry, ports = allocation_layout(root, hostname, workers, base_port)
+    registry.mkdir(parents=True, exist_ok=True)
+    runtime = local / "sol-h3-supervisor" / registry.name
+    runtime.mkdir(parents=True, exist_ok=True)
     cpus = sorted(os.sched_getaffinity(0))
     if len(cpus) < 32:
         raise ValueError(f"Expected at least 32 allocated logical CPUs, got {len(cpus)}")
     import fastapi
     import uvicorn
     names = subprocess.check_output(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], text=True).splitlines()
-    if len(names) < len(devices) or any("H200" not in name for name in names):
-        raise ValueError("The node allocation must contain H200 GPUs")
-    print(json.dumps({"node": hostname, "address": address, "job_id": job_id, "cpus": cpus,
-                      "devices": devices, "fastapi": fastapi.__version__, "uvicorn": uvicorn.__version__}), flush=True)
+    if len(names) < len(devices) or any(gpu_type not in name for name in names):
+        raise ValueError(f"The node allocation must contain {gpu_type} GPUs")
+    quiet_print(json.dumps({"node": hostname, "address": address, "job_id": job_id, "cpus": cpus,
+                      "gpu_type": gpu_type, "gpus_per_worker": group_size,
+                      "devices": devices, "ports": ports, "registry": str(registry), "runtime": str(runtime),
+                      "fastapi": fastapi.__version__, "uvicorn": uvicorn.__version__}))
 
     children = []
     stopping = False
@@ -121,28 +168,33 @@ def main():
     signal.signal(signal.SIGINT, stop)
 
     def start(index, attempt):
-        port = 18080 + index
-        pair = devices[2 * index:2 * index + 2]
+        port = ports[index]
+        group = groups[index]
         assigned_cpus = cpus[index * len(cpus) // workers:(index + 1) * len(cpus) // workers]
-        ready_file = registry / f"{port}.ready.json"
-        ready_file.unlink(missing_ok=True)
-        log_path = registry / f"{job_id}-{port}-attempt{attempt}.log"
+        ready_file = runtime / f"{port}.ready.json"
+        with suppress(OSError):
+            ready_file.unlink(missing_ok=True)
+        log_path = runtime / f"{job_id}-{port}-attempt{attempt}.log"
         log = log_path.open("a")
-        env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(pair)}
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(group)}
+        checkpoints = Path(os.environ.get("H3_CHECKPOINT_ROOT", str(local / "sol-h3-checkpoints")))
         command = ["taskset", "--cpu-list", ",".join(map(str, assigned_cpus)),
-                   str(Path(sys.executable).with_name("torchrun")), "--standalone", "--nnodes=1", "--nproc_per_node=2",
-                   "serve.py", "--model", str(local / "sol-h3-checkpoints/MiniMax-H3"),
-                   "--adapter", str(local / "sol-h3-checkpoints/FastH3-4-step-Preview-v1-LoRA/dense-datafree/adapter_model.safetensors"),
+                   str(Path(sys.executable).with_name("torchrun")), "--standalone", "--nnodes=1", f"--nproc_per_node={group_size}",
+                   "serve.py", "--model", str(checkpoints / "MiniMax-H3"),
+                   "--adapter", str(checkpoints / "FastH3-4-step-Preview-v1-LoRA/dense-datafree/adapter_model.safetensors"),
                    "--output-dir", str(local / f"sol-h3-service/{port}"), "--token-file", str(token_file),
                    "--host", address, "--port", str(port), "--attention-backend", "sol",
                    "--warmup-prompt-file", str(root / "demo_prompt.json"), "--ready-file", str(ready_file),
-                   "--queue-capacity", "8", "--encoder-threads", "8", "--gate-failure", "dense"]
-        process = subprocess.Popen(command, cwd=root / "Sol-H3", env=env, stdout=log, stderr=subprocess.STDOUT,
-                                   start_new_session=True)
-        log.close()
-        print(f"START worker={index} port={port} GPUs={pair} pid={process.pid} attempt={attempt}", flush=True)
+                   "--queue-capacity", "8", "--encoder-threads", "8", "--gate-failure", "dense",
+                   "--expect-gpu", gpu_type, "--min-free-gib", os.environ.get("H3_MIN_FREE_GIB", "20")]
+        try:
+            process = subprocess.Popen(command, cwd=root / "Sol-H3", env=env, stdout=log, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
+        finally:
+            log.close()
+        quiet_print(f"START worker={index} port={port} GPUs={group} pid={process.pid} attempt={attempt}")
         return {"process": process, "attempt": attempt, "started": time.monotonic(), "index": index,
-                "port": port, "gpus": pair, "endpoint": f"http://{address}:{port}", "log": str(log_path),
+                "port": port, "gpus": group, "endpoint": f"http://{address}:{port}", "log": str(log_path),
                 "ready_seen": False}
 
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -151,9 +203,10 @@ def main():
         for index in range(workers):
             children.append(start(index, 0))
         while not stopping:
-            states = refresh_workers(children, start, opener, registry)
+            states = refresh_workers(children, start, opener, runtime)
             status = node_status(states)
-            write_json(registry / "node.json", {"hostname": hostname, "address": address, "slurm_job_id": job_id,
+            publish_registry(registry / "node.json", {"hostname": hostname, "address": address, "slurm_job_id": job_id,
+                                                "base_port": base_port,
                                                 "updated_at": time.time(), "status": status,
                                                 "workers": states})
             if status == "failed":
@@ -165,8 +218,10 @@ def main():
     finally:
         for child in children:
             stop_child(child)
-            (registry / f"{child['port']}.ready.json").unlink(missing_ok=True)
-        write_json(registry / "node.json", {"hostname": hostname, "address": address, "slurm_job_id": job_id,
+            with suppress(OSError):
+                (runtime / f"{child['port']}.ready.json").unlink(missing_ok=True)
+        publish_registry(registry / "node.json", {"hostname": hostname, "address": address, "slurm_job_id": job_id,
+                                            "base_port": base_port,
                                             "updated_at": time.time(), "status": "stopped", "workers": states})
 
 

@@ -1,6 +1,7 @@
 """Verify stable jobs and downloads while the worker pool changes."""
 import asyncio
 import collections
+import errno
 import importlib.util
 import json
 from pathlib import Path
@@ -227,5 +228,213 @@ def test_disk_pressure_prevents_new_backend_submission(tmp_path):
             await router.submit(gateway.GenerateRequest(prompt="test"))
         assert error.value.status_code == 507
         assert not fleet.jobs
+        await router.client.aclose()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EIO])
+def test_journal_failure_is_rejected_before_any_backend_post(tmp_path, monkeypatch, code):
+    async def run():
+        fleet = Fleet()
+        router = make_gateway(tmp_path, fleet)
+        await router.refresh_pool()
+        with monkeypatch.context() as patch:
+            def fail(*args, **kwargs):
+                raise OSError(code, "injected journal failure")
+            patch.setattr(gateway, "atomic_json", fail)
+            with pytest.raises(HTTPException) as error:
+                await router.submit(gateway.GenerateRequest(prompt="not accepted"))
+        assert error.value.status_code == 507
+        assert not fleet.jobs and not router.pending
+        assert not any(call[0] == "POST" for call in fleet.calls)
+        assert all(count == 0 for count in router.inflight.values())
+        assert router.health()["status"] == "storage_paused"
+        assert router.storage_available()
+        assert (await router.submit(gateway.GenerateRequest(prompt="recovered")))["id"]
+        await router.client.aclose()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_accepted_job_record_failure_is_recovered_without_resubmission(tmp_path, monkeypatch, restart):
+    async def run():
+        fleet = Fleet()
+        router = make_gateway(tmp_path, fleet)
+        await router.refresh_pool()
+        original = gateway.atomic_json
+        def fail_route(path, value):
+            if path.parent.name == "jobs":
+                raise OSError(errno.ENOSPC, "accepted but route filesystem full")
+            original(path, value)
+        with monkeypatch.context() as patch:
+            patch.setattr(gateway, "atomic_json", fail_route)
+            with pytest.raises(HTTPException) as error:
+                await router.submit(gateway.GenerateRequest(prompt="accepted exactly once"))
+            assert error.value.status_code == 502
+            identifier = error.value.detail["id"]
+            assert error.value.detail["status_url"] == f"/v1/jobs/{identifier}"
+            assert router.public(router.load(identifier))["persistence_pending"]
+            await router.refresh_job(identifier)  # Repeated write failure must not escape maintenance.
+            assert router.completed == 0 and identifier in router.pending
+            with pytest.raises(HTTPException) as paused:
+                await router.submit(gateway.GenerateRequest(prompt="new request"))
+            assert paused.value.status_code == 507
+        if restart:
+            await router.client.aclose()
+            router = make_gateway(tmp_path, fleet)
+            assert identifier in router.pending
+        await router.refresh_job(identifier)
+        assert router.public(router.load(identifier))["status"] == "succeeded"
+        assert router.completed == 1 and not router.pending and not router.unpersisted
+        assert len([call for call in fleet.calls if call[0] == "POST"]) == 1
+        assert not list((router.root / "uncertain").glob("*.json"))
+        await router.client.aclose()
+    asyncio.run(run())
+
+
+def test_archive_metadata_failure_keeps_video_and_retries_only_metadata(tmp_path, monkeypatch):
+    async def run():
+        fleet = Fleet()
+        router = make_gateway(tmp_path, fleet)
+        identifier = (await router.submit(gateway.GenerateRequest(prompt="archive")))["id"]
+        with monkeypatch.context() as patch:
+            def fail(*args):
+                raise OSError(errno.EIO, "cannot persist archived status")
+            patch.setattr(router, "save", fail)
+            await router.refresh_job(identifier)
+            assert router.pending[identifier]["video_cached"]
+            assert router.public(router.load(identifier))["status"] == "running"
+            assert router.completed == 0
+            await router.refresh_job(identifier)
+            assert router.completed == 0
+        await router.refresh_job(identifier)
+        await router.refresh_job(identifier)
+        assert router.public(router.load(identifier))["status"] == "succeeded"
+        assert router.completed == 1
+        assert len([call for call in fleet.calls if call[2].endswith("/video")]) == 1
+        await router.client.aclose()
+    asyncio.run(run())
+
+
+def test_failed_job_metadata_can_recover_after_worker_is_gone(tmp_path, monkeypatch):
+    async def run():
+        fleet = Fleet()
+        router = make_gateway(tmp_path, fleet)
+        identifier = (await router.submit(gateway.GenerateRequest(prompt="failed inference")))["id"]
+        router.pending[identifier]["job"].update(status="failed", error="inference worker failed")
+        before = list(fleet.calls)
+        with monkeypatch.context() as patch:
+            def fail(*args):
+                raise OSError(errno.ENOSPC, "terminal metadata could not be written")
+            patch.setattr(router, "save", fail)
+            await router.refresh_job(identifier)
+            assert identifier in router.unpersisted
+        await router.refresh_job(identifier)
+        assert not router.pending and not router.unpersisted
+        assert router.load(identifier)["job"]["status"] == "failed"
+        assert fleet.calls == before  # Terminal metadata needs no live worker.
+        await router.client.aclose()
+    asyncio.run(run())
+
+
+def test_full_archive_volume_keeps_job_on_original_worker_until_recovery(tmp_path):
+    async def run():
+        fleet = Fleet()
+        router = make_gateway(tmp_path, fleet)
+        identifier = (await router.submit(gateway.GenerateRequest(prompt="archive")))["id"]
+        worker = router.pending[identifier]["worker"]
+        router.min_free_bytes = 2**70
+        await router.refresh_job(identifier)
+        assert router.public(router.load(identifier))["status"] == "running"
+        assert router.health()["status"] == "storage_paused"
+        router.pool_file.write_text('{"workers": []}')
+        await router.refresh_pool()
+        router.min_free_bytes = 0
+        await router.refresh_job(identifier)
+        assert router.load(identifier)["worker"] == worker
+        assert router.public(router.load(identifier))["status"] == "succeeded"
+        assert len([call for call in fleet.calls if call[0] == "POST"]) == 1
+        await router.client.aclose()
+    asyncio.run(run())
+
+
+def test_bad_registry_is_isolated_grace_is_bounded_and_stop_wins(tmp_path, monkeypatch):
+    async def run():
+        router = make_gateway(tmp_path, Fleet())
+        now = time.time()
+        await router.refresh_pool()
+        known = router.registry / "node/node.json"
+        bad = router.registry / "bad/node.json"
+        bad.parent.mkdir()
+        bad.write_text("{")
+        known.write_text("{")
+        monkeypatch.setattr(gateway.time, "time", lambda: now + 180)
+        await router.refresh_pool()
+        assert set(router.ready) == set(URLS)  # Last valid heartbeat plus fresh health probes.
+        assert len(router.registry_errors) == 2
+        router.pool_file.write_text(json.dumps({"excluded_workers": [URLS[0]]}))
+        await router.refresh_pool()
+        assert URLS[0] not in router.ready
+        monkeypatch.setattr(gateway.time, "time", lambda: now + 301)
+        await router.refresh_pool()
+        assert not router.ready
+        known.write_text(json.dumps({"updated_at": now + 301, "status": "stopped",
+                                    "workers": [{"endpoint": url} for url in URLS]}))
+        await router.refresh_pool()
+        assert not router.ready
+        known.write_text("{")
+        await router.refresh_pool()
+        assert not router.ready  # Cached stop must not resurrect the preceding live record.
+        await router.client.aclose()
+    asyncio.run(run())
+
+
+def test_manual_pool_config_errors_fail_closed_and_tunnels_can_supplement_discovery(tmp_path):
+    async def run():
+        router = make_gateway(tmp_path, Fleet())
+        tunnel = "http://127.0.0.1:28084"
+        router.pool_file.write_text(json.dumps({"additional_workers": [tunnel], "excluded_workers": [URLS[0]]}))
+        await router.refresh_pool()
+        assert set(router.ready) == {URLS[1], URLS[2], tunnel}
+        router.pool_file.write_text("{")
+        await router.refresh_pool()
+        assert not router.ready and router.discovery_error
+        router.pool_file.write_text('{"workers": [], "additional_workers": ["http://127.0.0.1:28084"]}')
+        await router.refresh_pool()
+        assert not router.ready  # Explicit global pause overrides supplemental workers.
+        await router.client.aclose()
+    asyncio.run(run())
+
+
+def test_leftover_storage_probe_does_not_break_restart_job_scan(tmp_path, monkeypatch):
+    from service_storage import storage_probe
+    fleet = Fleet()
+    router = make_gateway(tmp_path, fleet)
+    original_unlink = Path.unlink
+    def fail_probe_cleanup(path, *args, **kwargs):
+        if path.name == ".storage-probe":
+            raise OSError(errno.EIO, "probe cleanup failed")
+        return original_unlink(path, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", fail_probe_cleanup)
+        with pytest.raises(OSError):
+            storage_probe(router.root / "jobs")
+    assert (router.root / "jobs/.storage-probe").exists()
+    restarted = make_gateway(tmp_path, fleet)
+    assert not restarted.pending
+    asyncio.run(router.client.aclose())
+    asyncio.run(restarted.client.aclose())
+
+
+@pytest.mark.parametrize("bad", [{"workers": [None]}, {"workers": [{"endpoint": 12}]}, {"updated_at": float("nan")}])
+def test_malformed_registry_cannot_remove_healthy_siblings(tmp_path, bad):
+    async def run():
+        router = make_gateway(tmp_path, Fleet())
+        path = router.registry / "invalid/node.json"
+        path.parent.mkdir()
+        path.write_text(json.dumps({"updated_at": time.time(), "status": "ready", **bad}))
+        await router.refresh_pool()
+        assert set(router.ready) == set(URLS)
+        assert str(path) in router.registry_errors
         await router.client.aclose()
     asyncio.run(run())

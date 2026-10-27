@@ -8,10 +8,10 @@ from contextlib import asynccontextmanager, suppress
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import secrets
-import shutil
 import time
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
@@ -21,11 +21,14 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from serve import GenerateRequest, atomic_json
+from service_storage import check_space, storage_probe
 
 LOG = logging.getLogger("h3.gateway")
 
 
 def origin(value):
+    if not isinstance(value, str):
+        raise ValueError("Worker origin must be a string")
     parsed = urlsplit(value)
     if (parsed.scheme != "http" or not parsed.hostname or parsed.username or parsed.password
             or parsed.path not in {"", "/"} or parsed.query or parsed.fragment):
@@ -62,6 +65,11 @@ class Gateway:
         self.discovered = []
         self.updated_at = 0.0
         self.discovery_error = None
+        self.registry_errors = {}
+        self.registry_cache = {}
+        self.storage_error = None
+        self.storage = {}
+        self.unpersisted = set()
         self.pending = {}
         self.inflight = {}
         self.last_selected = {}
@@ -75,21 +83,76 @@ class Gateway:
             record = json.loads(path.read_text())
             if record["job"]["status"] != "failed" and not record.get("video_cached"):
                 self.pending[record["job"]["id"]] = record
+        # A known acceptance may have reached its journal but not jobs/<id>.json.
+        # Unknown outcomes remain for reconciliation; never replay their POSTs.
+        for path in (self.root / "uncertain").glob("*.json"):
+            attempt = json.loads(path.read_text())
+            if attempt.get("status") == "accepted":
+                record = attempt["record"]
+                identifier = job_id(record["job"]["id"])
+                if not (self.root / "jobs" / f"{identifier}.json").exists():
+                    record["persistence_pending"] = True
+                    self.pending[identifier] = record
+                    self.unpersisted.add(identifier)
+
+    def storage_available(self):
+        try:
+            for name in ("jobs", "uncertain", "videos"):
+                path = self.root / name
+                self.storage[name] = check_space(path, self.min_free_bytes)
+                if self.storage_error:
+                    storage_probe(path)
+        except OSError as error:
+            self.storage_error = str(error)
+            return False
+        if self.unpersisted:
+            return False
+        self.storage_error = None
+        return True
 
     def candidates(self):
-        config = json.loads(self.pool_file.read_text()) if self.pool_file.exists() else {}
+        try:
+            config = json.loads(self.pool_file.read_text())
+        except FileNotFoundError:
+            config = {}
+        if not isinstance(config, dict):
+            raise ValueError("Pool configuration must be an object")
+        for key in ("workers", "additional_workers", "excluded_workers"):
+            if key in config and (not isinstance(config[key], list) or
+                                  any(not isinstance(url, str) for url in config[key])):
+                raise ValueError(f"Pool {key} must be an array of origins")
+        self.registry_errors = {}
         if "workers" in config:
             endpoints = config["workers"]
         else:
-            endpoints = []
-            for path in self.registry.glob("*/node.json"):
-                state = json.loads(path.read_text())
-                # A stale registry must not retain a retired allocation forever.
-                if time.time() - state.get("updated_at", 0) > 120 or state.get("status") in {"stopped", "failed"}:
+            endpoints = list(config.get("additional_workers", []))
+            paths = list(self.registry.glob("*/node.json"))
+            self.registry_cache = {p: s for p, s in self.registry_cache.items() if p in paths}
+            for path in paths:
+                try:
+                    state = json.loads(path.read_text())
+                    if (not isinstance(state, dict) or not isinstance(state.get("updated_at"), (int, float)) or
+                            not math.isfinite(state["updated_at"]) or state["updated_at"] > time.time() + 30):
+                        raise ValueError("Invalid registry timestamp")
+                    workers = state.get("workers", [])
+                    if not isinstance(workers, list) or any(not isinstance(w, dict) for w in workers):
+                        raise ValueError("Invalid registry workers")
+                    urls = [origin(w["endpoint"]) for w in workers if not w.get("disabled")]
+                    state = {**state, "origins": urls}
+                    self.registry_cache[path] = state
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    self.registry_errors[str(path)] = str(error)
+                    state = self.registry_cache.get(path, {})
+                # Bounded grace for failed heartbeats; every candidate still needs
+                # a fresh direct health probe. Explicit stop/disable wins at once.
+                age = time.time() - state.get("updated_at", 0)
+                if age > 300 or state.get("status") in {"stopped", "failed"}:
                     continue
-                endpoints.extend(w["endpoint"] for w in state.get("workers", []) if not w.get("disabled"))
-        excluded = set(config.get("excluded_workers", []))
-        return sorted({origin(url) for url in endpoints if url not in excluded})
+                if age > 120:
+                    self.registry_errors[str(path)] = "Stale heartbeat; using health probes for at most 300 seconds"
+                endpoints.extend(state.get("origins", []))
+        excluded = {origin(url) for url in config.get("excluded_workers", [])}
+        return sorted({origin(url) for url in endpoints} - excluded)
 
     async def refresh_pool(self):
         try:
@@ -97,6 +160,7 @@ class Gateway:
         except (OSError, ValueError, TypeError, KeyError) as error:
             self.discovery_error = str(error)
             self.ready = {}
+            self.updated_at = time.time()
             return
 
         async def inspect(endpoint):
@@ -118,35 +182,65 @@ class Gateway:
 
     def health(self):
         ready = self.ready if time.time() - self.updated_at < 15 else {}
-        return {"status": "ready" if ready else "unavailable", "service": "Sol-H3 gateway",
+        storage_ready = not self.storage_error and not self.unpersisted
+        return {"status": "storage_paused" if not storage_ready else ("ready" if ready else "unavailable"),
+                "service": "Sol-H3 gateway",
                 "workers_ready": len(ready), "workers_discovered": len(self.discovered),
                 "gpus": sum(value.get("gpus", 0) for value in ready.values()),
                 "queued": sum(value.get("queued", 0) for value in ready.values()),
                 "queue_capacity": sum(value["queue_capacity"] for value in ready.values()),
                 "active_job": None, "jobs_pending": len(self.pending),
-                "completed_since_start": self.completed, "pool_updated_at": self.updated_at}
+                "completed_since_start": self.completed, "pool_updated_at": self.updated_at,
+                "discovery_error": self.discovery_error, "registry_errors": self.registry_errors,
+                "storage": {**self.storage, "error": self.storage_error, "pending_writes": len(self.unpersisted)}}
 
     def load(self, identifier):
         path = self.root / "jobs" / f"{job_id(identifier)}.json"
-        if not path.is_file():
-            raise HTTPException(404, "Unknown job")
-        return json.loads(path.read_text())
+        if identifier in self.pending:
+            return self.pending[identifier]
+        try:
+            return json.loads(path.read_text())
+        except FileNotFoundError:
+            raise HTTPException(404, "Unknown job") from None
+        except OSError as error:
+            raise HTTPException(503, "Job storage is temporarily unavailable") from error
 
     def save(self, record):
-        atomic_json(self.root / "jobs" / f"{record['job']['id']}.json", record)
+        value = {k: v for k, v in record.items() if k != "persistence_pending"}
+        atomic_json(self.root / "jobs" / f"{record['job']['id']}.json", value)
+
+    def persist(self, record):
+        identifier = record["job"]["id"]
+        try:
+            self.save(record)
+        except OSError as error:
+            record["persistence_pending"] = True
+            self.unpersisted.add(identifier)
+            self.storage_error = str(error)
+            return False
+        record.pop("persistence_pending", None)
+        self.unpersisted.discard(identifier)
+        if record.get("attempt_id"):
+            with suppress(OSError):
+                (self.root / "uncertain" / f"{record['attempt_id']}.json").unlink(missing_ok=True)
+        return True
 
     @staticmethod
     def public(record):
         value = dict(record["job"])
         identifier = value["id"]
         value.update(status_url=f"/v1/jobs/{identifier}", video_url=f"/v1/jobs/{identifier}/video")
+        if record.get("persistence_pending"):
+            value["persistence_pending"] = True
+            if value["status"] in {"succeeded", "failed"}:
+                value["status"] = "running"
         if value["status"] == "succeeded" and not record.get("video_cached"):
             value["status"] = "running"  # Publish success only after the video is durable here.
         return value
 
     async def submit(self, body):
-        if shutil.disk_usage(self.root).free < self.min_free_bytes:
-            raise HTTPException(507, "Gateway output filesystem has insufficient free space")
+        if not self.storage_available():
+            raise HTTPException(507, "Gateway storage unavailable; request was not accepted")
         if time.time() - self.updated_at > 5:
             await self.refresh_pool()
         tried = set()
@@ -172,16 +266,22 @@ class Gateway:
             tried.add(endpoint)
             attempt_path = self.root / "uncertain" / f"{uuid4()}.json"
             try:
-                atomic_json(attempt_path, {"worker": endpoint, "request": body.model_dump(),
-                                           "submitted_at": time.time(), "status": "submitting"})
+                try:
+                    atomic_json(attempt_path, {"worker": endpoint, "request": body.model_dump(),
+                                               "submitted_at": time.time(), "status": "submitting"})
+                except OSError as error:
+                    self.storage_error = str(error)
+                    raise HTTPException(507, "Gateway could not journal request; no worker accepted it") from error
                 response = await self.client.post(endpoint + "/v1/videos", json=body.model_dump(),
                                                   headers={"Authorization": f"Bearer {self.token}"}, timeout=30)
                 if response.status_code in {429, 503, 507}:
                     rejections.add(response.status_code)
-                    attempt_path.unlink()
+                    with suppress(OSError):
+                        attempt_path.unlink(missing_ok=True)
                     continue  # Explicit rejection: no job was accepted, so another worker is safe.
                 if 400 <= response.status_code < 500:
-                    attempt_path.unlink()
+                    with suppress(OSError):
+                        attempt_path.unlink(missing_ok=True)
                     raise HTTPException(response.status_code, "Worker rejected request")
                 response.raise_for_status()
                 value = response.json()
@@ -191,10 +291,15 @@ class Gateway:
                 if value.get("status") not in {"queued", "running", "succeeded"}:
                     raise ValueError("Unexpected worker admission response")
                 record = {"worker": endpoint, "job": value, "video_cached": False,
-                          "gateway_submitted_at": time.time()}
-                self.save(record)  # Persist the accepting worker before acknowledging the client.
+                          "gateway_submitted_at": time.time(), "attempt_id": attempt_path.stem}
+                # Keep tracking a known acceptance even if shared storage fails
+                # between the worker acknowledgement and writing its route.
                 self.pending[identifier] = record
-                attempt_path.unlink()
+                if not self.persist(record):
+                    with suppress(OSError):
+                        atomic_json(attempt_path, {"status": "accepted", "record": record})
+                    raise HTTPException(502, {"message": "Worker accepted the job but gateway persistence failed; poll this ID, do not resubmit",
+                                              "id": identifier, "status_url": f"/v1/jobs/{identifier}"})
                 return self.public(record)
             except (httpx.HTTPError, ValueError, KeyError) as error:
                 # A timeout can occur after acceptance. Never turn it into a duplicate POST.
@@ -208,7 +313,9 @@ class Gateway:
             if record is None:
                 return
             try:
-                if record["job"]["status"] != "succeeded":
+                if identifier in self.unpersisted and not self.persist(record):
+                    return
+                if record["job"]["status"] not in {"succeeded", "failed"}:
                     response = await self.client.get(record["worker"] + f"/v1/jobs/{identifier}",
                                                      headers={"Authorization": f"Bearer {self.token}"}, timeout=10)
                     response.raise_for_status()
@@ -216,25 +323,27 @@ class Gateway:
                     if value["id"] != identifier or value["status"] not in {"queued", "running", "succeeded", "failed"}:
                         raise ValueError("Unexpected worker status response")
                     record["job"] = value
-                if record["job"]["status"] == "succeeded":
+                if record["job"]["status"] == "succeeded" and not record.get("video_cached"):
                     await self.archive(record)
-                    self.completed += 1
                 record.pop("last_error", None)
                 record["updated_at"] = time.time()
-                self.save(record)
+                if not self.persist(record):
+                    return
                 if record.get("video_cached") or record["job"]["status"] == "failed":
                     self.pending.pop(identifier, None)
+                    self.completed += int(record.get("video_cached", False))
             except (httpx.HTTPError, OSError, ValueError, KeyError) as error:
                 record["last_error"] = str(error)
                 record["updated_at"] = time.time()
-                self.save(record)
+                if isinstance(error, OSError):
+                    self.storage_error = str(error)
+                self.persist(record)
                 LOG.warning("Job %s remains pending: %s", identifier, error)
 
     async def archive(self, record):
-        if shutil.disk_usage(self.root).free < self.min_free_bytes:
-            raise OSError("Gateway output filesystem has insufficient free space")
         identifier = record["job"]["id"]
         target = self.root / "videos" / f"{identifier}.mp4"
+        check_space(target.parent, self.min_free_bytes, reserve_bytes=record["job"]["bytes"])
         temporary = target.with_suffix(".partial")
         digest, size = hashlib.sha256(), 0
         try:
@@ -243,6 +352,7 @@ class Gateway:
                 response.raise_for_status()
                 with temporary.open("wb") as output:
                     async for block in response.aiter_bytes(1024 * 1024):
+                        check_space(target.parent, self.min_free_bytes, reserve_bytes=len(block))
                         output.write(block)
                         digest.update(block)
                         size += len(block)
@@ -253,7 +363,8 @@ class Gateway:
             temporary.replace(target)
             record.update(video_cached=True, video_sha256=digest.hexdigest(), video_bytes=size)
         finally:
-            temporary.unlink(missing_ok=True)
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
 
     async def maintain_pool(self):
         while True:
@@ -267,11 +378,13 @@ class Gateway:
         while True:
             try:
                 await asyncio.gather(*(self.refresh_job(identifier) for identifier in list(self.pending)))
+                self.storage_available()
             except Exception:
                 LOG.exception("Gateway maintenance failed; retrying")
             await asyncio.sleep(self.refresh_seconds)
 
     async def start(self):
+        self.storage_available()
         await self.refresh_pool()
         self.maintenance = [asyncio.create_task(self.maintain_pool()), asyncio.create_task(self.maintain_jobs())]
 
@@ -329,7 +442,7 @@ def create_app(gateway):
     @app.get("/v1/jobs/{identifier}/video", dependencies=[Depends(authorize)])
     async def video(identifier: str):
         record = gateway.load(identifier)
-        if not record.get("video_cached"):
+        if not record.get("video_cached") or record.get("persistence_pending"):
             raise HTTPException(409, "Video is not ready")
         path = gateway.root / "videos" / f"{identifier}.mp4"
         if not path.is_file():

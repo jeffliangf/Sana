@@ -8,13 +8,14 @@ runs on the main thread; rank zero's HTTP thread only validates and queues work.
 from __future__ import annotations
 
 import argparse
+from contextlib import suppress
 from datetime import timedelta
+import errno
 import json
 import os
 from pathlib import Path
 import queue
 import secrets
-import shutil
 import socket
 import threading
 import time
@@ -24,6 +25,8 @@ from uuid import UUID, uuid4
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from service_storage import atomic_json, check_space, quiet_print, storage_probe
 
 
 class GenerateRequest(BaseModel):
@@ -40,10 +43,45 @@ class GenerateRequest(BaseModel):
         return value.strip()
 
 
-def atomic_json(path, value):
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
-    temporary.replace(path)
+class OutputStorageError(OSError):
+    """Rank-zero output I/O failed after all ranks finished inference."""
+
+
+def publish_media(media, path, duration, encoder_threads, inspect_media, *, rank, broadcast):
+    """Tell every rank about output-storage failure before any GPU barrier.
+
+    Encoder exceptions can wrap an OSError. Only known filesystem errors are
+    recoverable here; CUDA, numerical, and malformed-media errors remain fatal.
+    """
+    outcome = [None]
+    profile = None
+    if rank == 0:
+        temporary = path.with_name(f".{path.stem}.partial.mp4")
+        try:
+            media.save(temporary, encoder_threads=encoder_threads)
+            profile = inspect_media(temporary, duration)
+            with temporary.open("rb") as source:
+                os.fsync(source.fileno())
+                size = os.fstat(source.fileno()).st_size
+            temporary.replace(path)
+            outcome[0] = {"bytes": size}
+        except Exception as error:
+            cause = error
+            while cause.__cause__ is not None:
+                cause = cause.__cause__
+            if not isinstance(cause, OSError) or cause.errno not in {
+                errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS, errno.EACCES,
+                errno.ENOENT, errno.EMFILE, errno.ENFILE,
+            }:
+                raise
+            outcome[0] = {"error": str(cause)}
+        finally:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
+    broadcast(outcome)
+    if "error" in outcome[0]:
+        raise OutputStorageError(outcome[0]["error"])
+    return {"media": profile, "bytes": outcome[0]["bytes"]}
 
 
 class WorkerState:
@@ -57,13 +95,47 @@ class WorkerState:
         self.completed = 0
         self.min_free_bytes = min_free_gib * 2**30
         self.metadata = metadata or {}
+        self.records = {}  # Accepted requests remain readable during an I/O outage.
+        self.dirty = {}
+        self.held = None
+        self.storage_error = None
+        self.storage = {}
         # A killed distributed process cannot safely resume an in-flight job.
         # Preserve completed outputs, explicitly fail interrupted requests.
         for path in self.root.glob("*.json"):
             record = json.loads(path.read_text())
             if record.get("status") in {"queued", "running"}:
                 record.update(status="failed", error="worker restarted", finished_at=time.time())
-                atomic_json(path, record)
+                self.persist(record)
+
+    def persist(self, record):
+        identifier = record["id"]
+        try:
+            atomic_json(self.record_path(identifier), record)
+        except OSError as error:
+            self.records[identifier] = self.dirty[identifier] = record
+            self.storage_error = str(error)
+            return False
+        self.dirty.pop(identifier, None)
+        if record["status"] in {"succeeded", "failed"}:
+            self.records.pop(identifier, None)
+        return True
+
+    def recover_storage(self):
+        """Pause inference/admission until accepted state can be persisted again."""
+        with self.lock:
+            for record in list(self.dirty.values()):
+                if not self.persist(record):
+                    return False
+            try:
+                self.storage = check_space(self.root, self.min_free_bytes)
+                if self.storage_error:
+                    storage_probe(self.root)
+            except OSError as error:
+                self.storage_error = str(error)
+                return False
+            self.storage_error = None
+            return True
 
     def record_path(self, job_id):
         try:
@@ -76,15 +148,26 @@ class WorkerState:
     def get(self, job_id):
         with self.lock:
             path = self.record_path(job_id)
-            if not path.is_file():
-                raise HTTPException(404, "Unknown job")
-            return json.loads(path.read_text())
+            if job_id in self.records:
+                record = dict(self.records[job_id])
+                if job_id in self.dirty:
+                    record["persistence_pending"] = True
+                    if record["status"] in {"succeeded", "failed"}:
+                        record["status"] = "running"
+                return record
+            try:
+                return json.loads(path.read_text())
+            except FileNotFoundError:
+                raise HTTPException(404, "Unknown job") from None
+            except OSError as error:
+                raise HTTPException(503, "Job storage is temporarily unavailable") from error
 
     def update(self, job_id, **values):
         with self.lock:
-            record = self.get(job_id)
+            record = dict(self.records[job_id]) if job_id in self.records else self.get(job_id)
             record.update(values)
-            atomic_json(self.record_path(job_id), record)
+            self.records[job_id] = record
+            self.persist(record)
             return record
 
     def submit(self, request):
@@ -93,8 +176,8 @@ class WorkerState:
                 raise HTTPException(503, f"Worker is {self.phase}")
             if self.pending.full():
                 raise HTTPException(429, "Worker queue is full", headers={"Retry-After": "10"})
-            if shutil.disk_usage(self.root).free < self.min_free_bytes:
-                raise HTTPException(507, "Output filesystem has insufficient free space")
+            if self.dirty or self.storage_error:
+                raise HTTPException(507, "Output storage is paused; retry after recovery")
             job_id = str(uuid4())
             record = {
                 "id": job_id, "status": "queued", "created_at": time.time(),
@@ -102,21 +185,49 @@ class WorkerState:
                 "status_url": f"/v1/jobs/{job_id}",
                 "video_url": f"/v1/jobs/{job_id}/video",
             }
-            atomic_json(self.record_path(job_id), record)
+            try:
+                self.storage = check_space(self.root, self.min_free_bytes)
+                atomic_json(self.record_path(job_id), record)
+            except OSError as error:
+                self.storage_error = str(error)
+                raise HTTPException(507, "Output storage unavailable; request was not accepted") from error
+            self.records[job_id] = record
             self.pending.put_nowait(record)
             return record
+
+    def next_command(self):
+        with self.lock:
+            if not self.recover_storage():
+                return {"idle": True}
+            if self.held is None:
+                try:
+                    self.held = self.pending.get_nowait()
+                except queue.Empty:
+                    return {"idle": True}
+                self.update(self.held["id"], status="running", started_at=time.time())
+                if self.dirty:
+                    return {"idle": True}
+            command, self.held = self.held, None
+            self.active = command["id"]
+            return command
 
     def health(self):
         with self.lock:
             return {
-                **self.metadata, "status": self.phase, "active_job": self.active,
-                "queued": self.pending.qsize(), "queue_capacity": self.pending.maxsize,
+                **self.metadata, "status": ("storage_paused" if self.phase == "ready" and
+                                            (self.storage_error or self.dirty) else self.phase),
+                "active_job": self.active,
+                "queued": self.pending.qsize() + int(self.held is not None), "queue_capacity": self.pending.maxsize,
                 "completed_since_start": self.completed,
+                "storage": {**self.storage, "error": self.storage_error, "pending_writes": len(self.dirty)},
             }
 
     def fail_pending(self):
         with self.lock:
             self.phase = "failed"
+            if self.held:
+                self.update(self.held["id"], status="failed", error="inference worker failed", finished_at=time.time())
+                self.held = None
             if self.active:
                 self.update(self.active, status="failed", error="inference worker failed", finished_at=time.time())
                 self.active = None
@@ -268,6 +379,10 @@ def main():
 
         engine.transformer.register_forward_pre_hook(count_forward)
 
+        def broadcast(values):
+            if world_size > 1:
+                dist.broadcast_object_list(values, src=0, group=control)
+
         def execute(prompt, duration, seed, path):
             torch.cuda.reset_peak_memory_stats(device)
             forwards[0] = 0
@@ -279,12 +394,8 @@ def main():
             if forwards[0] != 4:
                 raise RuntimeError(f"Expected four transformer forwards, got {forwards[0]}")
             pipeline_s = media.elapsed_s if media is not None else None
-            if rank == 0:
-                temporary = path.with_name(f".{path.stem}.partial.mp4")
-                media.save(temporary, encoder_threads=args.encoder_threads)
-                # Validate both video and audio stream metadata before publishing.
-                profile = inspect_media(temporary, duration)
-                temporary.replace(path)
+            output = publish_media(media, path, duration, args.encoder_threads, inspect_media,
+                                   rank=rank, broadcast=broadcast)
             if world_size > 1:
                 dist.barrier()
             elapsed = time.perf_counter() - started
@@ -299,11 +410,10 @@ def main():
                 ranks = [None] * world_size
                 dist.all_gather_object(ranks, rank_result, group=control)
             if rank == 0:
-                return {"pipeline_s": pipeline_s, "processing_s": elapsed, "media": profile,
+                return {"pipeline_s": pipeline_s, "processing_s": elapsed, **output,
                         "transformer_forwards": forwards[0], "memory": [item["memory"] for item in ranks],
                         "attention": [item["attention"] for item in ranks],
-                        "used_gate_fallback": any(item["attention"] and item["attention"]["gate_fallback_calls"] for item in ranks),
-                        "bytes": path.stat().st_size}
+                        "used_gate_fallback": any(item["attention"] and item["attention"]["gate_fallback_calls"] for item in ranks)}
 
         prompt = read_prompt(args.warmup_prompt_file)
         warmups = []
@@ -312,37 +422,56 @@ def main():
         for duration in (5, 10):
             for repeat in range(2):
                 path = args.output_dir / f"warmup-{duration}s-{repeat}.mp4"
-                result = execute(prompt, duration, 42, path)
+                while True:
+                    available = [state.recover_storage() if rank == 0 else None]
+                    broadcast(available)
+                    if not available[0]:
+                        time.sleep(5)
+                        continue
+                    try:
+                        result = execute(prompt, duration, 42, path)
+                        break
+                    except OutputStorageError as error:
+                        if rank == 0:
+                            state.storage_error = str(error)
+                        time.sleep(5)
                 if rank == 0:
                     warmups.append({"duration": duration, "repeat": repeat, **result})
         if rank == 0:
             state.phase = "ready"
             ready = {**state.health(), "endpoint": f"http://{args.host}:{args.port}", "warmups": warmups}
             if args.ready_file:
-                args.ready_file.parent.mkdir(parents=True, exist_ok=True)
-                atomic_json(args.ready_file, ready)
-            print("H3_WORKER_READY " + json.dumps(ready), flush=True)
+                try:
+                    args.ready_file.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_json(args.ready_file, ready)
+                except OSError as error:
+                    quiet_print(f"READY_FILE_WRITE_FAILED {error!r}; use /healthz")
+            quiet_print("H3_WORKER_READY " + json.dumps(ready))
 
         while True:
             command = None
             if rank == 0:
                 if not server_thread.is_alive():
                     raise RuntimeError("HTTP server stopped")
-                try:
-                    command = state.pending.get(timeout=20)
-                    with state.lock:
-                        state.active = command["id"]
-                        state.update(command["id"], status="running", started_at=time.time())
-                except queue.Empty:
-                    command = {"idle": True}
+                command = state.next_command()
             if world_size > 1:
                 commands = [command]
                 dist.broadcast_object_list(commands, src=0, group=control)
                 command = commands[0]
             if command.get("idle"):
+                time.sleep(1)
                 continue
             path = args.output_dir / f"{command['id']}.mp4"
-            result = execute(command["prompt"], command["duration"], command["seed"], path)
+            try:
+                result = execute(command["prompt"], command["duration"], command["seed"], path)
+            except OutputStorageError as error:
+                if rank == 0:
+                    with state.lock:
+                        state.storage_error = str(error)
+                        state.update(command["id"], status="failed", error="output storage failure",
+                                     finished_at=time.time(), storage_error=str(error))
+                        state.active = None
+                continue
             if rank == 0:
                 with state.lock:
                     state.update(command["id"], status="succeeded", finished_at=time.time(), **result)
@@ -354,7 +483,8 @@ def main():
         raise
     finally:
         if rank == 0 and args.ready_file:
-            args.ready_file.unlink(missing_ok=True)
+            with suppress(OSError):
+                args.ready_file.unlink(missing_ok=True)
         if server is not None:
             server.should_exit = True
         if server_thread is not None:
