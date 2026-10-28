@@ -5,20 +5,21 @@ FastH3 adapter** service. It covers `serve.py`, `serve_node.py`, `gateway.py`, a
 the launchers in this directory. It does not use the separate SGLang deployment
 instructions at the repository root.
 
-**Last recorded operational state: 2026-10-28, four H200 workers serving.** The
+**Last recorded operational state: 2026-10-28, sixteen H200 workers serving.** The
 gateway and workers run the 2026-10-28 code: caller job IDs, `error_code`,
-`video_sha256`, and the 2026-10-27 storage hardening. One eight-GPU allocation on
-H200-0002 (Slurm 3891, `deployment/h200-0002-20261028/`) serves four two-GPU
-workers at `10.2.201.2:18080–18083`: 8 GPUs, 4 generation slots, 32 queue slots.
-Before admission each worker passed a 5-second and a 10-second fallback request
-directly; then four requests through the gateway covered all four workers, with
-checksums, repeated keys, 409 conflicts, and a no-rerender replay all verified.
-The other H200 nodes stopped on 2026-10-26 remain stopped and excluded. A
-two-worker H100 launch on GMI node `gmicloud-loki-gpu-004` (Slurm 3435) failed
-while loading the model: every rank holds the whole pipeline, about 129 GiB, and
-an H100 has 80 GB (see [H100 workers](#h100-workers-on-another-cluster)). Do not
-interpret this document or a stale registry as an instruction to restart or stop
-workers.
+`video_sha256`, and the 2026-10-27 storage hardening. Four eight-GPU allocations
+each serve four two-GPU workers on ports 18080–18083: H200-0002 (Slurm 3891),
+0005 (3892), 0006 (3893), and 0023 (3894). That is 32 GPUs, 16 generation slots,
+and 128 queue slots. Each worker passed a 5-second and a 10-second fallback
+request directly before admission; then requests through the gateway covered
+every worker, with checksums, repeated keys, 409 conflicts, and no-rerender
+replays verified. Evidence is in `deployment/h200-0002-20261028/` and
+`deployment/scale-0005-0006-0023-20261028/`. H200-0048 remains stopped and
+excluded. A two-worker H100 launch on GMI node `gmicloud-loki-gpu-004`
+(Slurm 3435) failed while loading the model: every rank holds the whole pipeline,
+about 129 GiB, and an H100 has 80 GB (see
+[H100 workers](#h100-workers-on-another-cluster)). Do not interpret this document
+or a stale registry as an instruction to restart or stop workers.
 
 ## Fixed caller contract
 
@@ -33,8 +34,9 @@ workers.
 | Poll / download | `GET /v1/jobs/{id}` / `GET /v1/jobs/{id}/video`; success includes `video_sha256` |
 | Media | 1344×768, 24 FPS, stereo audio, four transformer forwards |
 
-The base URL, bearer token, API paths, and existing job IDs survive worker pool
-changes. Preserve the gateway's `jobs/`, `videos/`, `uncertain/`, `pool.json`, and
+The caller-facing reference, with a tested example client, is [API.md](API.md);
+keep it in step with this contract. The base URL, bearer token, API paths, and
+existing job IDs survive worker pool changes. Preserve the gateway's `jobs/`, `videos/`, `uncertain/`, `pool.json`, and
 `endpoint.json`. Worker ports are internal; retaining their existing ranges is
 still useful when replacing an allocation on the same host. **Never move the
 gateway onto a GPU Slurm allocation.**

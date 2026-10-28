@@ -21,18 +21,21 @@ To retain separate LoRA branch arithmetic, use `--lora-mode separate`, or
 
 ## Resident H200 service
 
+**Calling the service from another program? Use the [API reference](API.md):**
+endpoints, job fields, retry rules, and a tested example client.
+
 For the fixed gateway contract, storage safeguards, H100/H200 configuration, and
 the complete deployment/drain procedure, use the dedicated
 [deployment design and runbook](DEPLOYMENT.md).
 
-**Last recorded state (2026-10-28): four H200 workers on 0002 serve through the
-gateway** (Slurm 3891, 8 GPUs, 4 generation slots, 32 queue slots). The gateway
-and workers accept caller job IDs (`Idempotency-Key`), report `error_code` and
-`video_sha256`, and include the 2026-10-27 storage hardening. Start callers at
-about four concurrent jobs. A two-worker H100 launch on `gmicloud-loki-gpu-004`
-failed with GPU out-of-memory during model loading; the other H200 nodes stopped
-on 2026-10-26 remain stopped. The 32-GPU capacity and allocation IDs below
-describe the earlier fleet, not a current reservation.
+**Last recorded state (2026-10-28): sixteen H200 workers on 0002, 0005, 0006,
+and 0023 serve through the gateway** (Slurm 3891–3894; 32 GPUs, 16 generation
+slots, 128 queue slots). The gateway and workers accept caller job IDs
+(`Idempotency-Key`), report `error_code` and `video_sha256`, and include the
+2026-10-27 storage hardening. Start callers at about 16 concurrent jobs and raise
+toward 20 while watching latency and rejections. A two-worker H100 launch on
+`gmicloud-loki-gpu-004` failed with GPU out-of-memory during model loading;
+H200-0048 remains stopped. The allocation IDs below describe the earlier fleet.
 
 ### Access the deployed H200 service
 
@@ -294,6 +297,16 @@ Every request was repeated with its key (same job) and with changed inputs (409)
 a replay after completion returned the stored video without rendering again.
 Evidence is in `deployment/h200-0002-20261028/` and `deployment/redeploy-20261028/`
 on the cluster.
+
+Later on 2026-10-28, 0005, 0006, and 0023 were added the same way (Slurm
+3892–3894), each excluded until validated. 0005 had never run H3, so
+`deploy_node.sh` staged and verified its environment and weights from
+`deployment/staging/`; 0006 and 0023 kept their 8,571 and 8,548 earlier completed
+jobs. All twelve new workers were ready on their first attempt and passed direct
+validation (**24/24**: 5-second 12.7–13.1 s, 10-second fallback 51.1–52.7 s).
+Then **16/16** requests through the gateway reached all sixteen workers, with
+matching checksums and the same key checks. Evidence is in
+`deployment/scale-0005-0006-0023-20261028/`.
 
 Shared storage remains necessary for gateway job persistence and video archives.
 If registry publication stays unavailable for more than 120 seconds, automatic
