@@ -2,6 +2,7 @@
 import asyncio
 import collections
 import errno
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -28,15 +29,20 @@ class Fleet:
         self.calls = []
         self.jobs = {}
         self.errors = {}
+        self.lost = set()  # Accept the next POST, then lose its response.
+        self.down = set()  # Refuse every connection.
+        self.legacy = set()  # Predates job ID support.
         self.media = b"example-mp4"
         self.expected_bytes = len(self.media)
 
     async def handle(self, request):
         endpoint = str(request.url).split("/v1/")[0].removesuffix("/healthz")
         self.calls.append((request.method, endpoint, request.url.path))
+        if endpoint in self.down:
+            raise httpx.ConnectError("connection refused")
         if request.url.path == "/healthz":
-            return httpx.Response(200, json={"status": "ready", "gpus": 2, "queued": 0,
-                                             "queue_capacity": 8, "active_job": None})
+            return httpx.Response(200, json={"status": "ready", "gpus": 2, "queued": 0, "queue_capacity": 8,
+                                             "active_job": None, "idempotency_key": endpoint not in self.legacy})
         assert request.headers["Authorization"] == AUTH["Authorization"]
         if request.method == "POST":
             error = self.errors.get(endpoint)
@@ -45,12 +51,18 @@ class Fleet:
             if error:
                 return httpx.Response(error)
             await asyncio.sleep(0.005)
-            identifier = str(uuid4())
+            identifier = request.headers["Idempotency-Key"]
             value = {"id": identifier, "status": "queued", **json.loads(request.content)}
-            self.jobs[identifier] = {"endpoint": endpoint, "value": value}
-            return httpx.Response(202, json=value)
+            job = self.jobs.setdefault(identifier, {"endpoint": endpoint, "value": value})
+            assert job["endpoint"] == endpoint, "A job ID must never be generated on a second worker"
+            if endpoint in self.lost:
+                self.lost.discard(endpoint)
+                raise httpx.ReadTimeout("response lost after acceptance")
+            return httpx.Response(202, json=job["value"])
         identifier = request.url.path.split("/")[3]
-        job = self.jobs[identifier]
+        job = self.jobs.get(identifier)
+        if job is None:
+            return httpx.Response(404, json={"detail": "Unknown job"})
         assert job["endpoint"] == endpoint, "Job must stay on the accepting worker"
         if request.url.path.endswith("/video"):
             return httpx.Response(200, content=self.media)
@@ -125,7 +137,7 @@ def test_pool_discovery_tracks_added_removed_disabled_and_stale_workers(tmp_path
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("status", [429, 503, 507])
+@pytest.mark.parametrize("status", [429, 503, 507, httpx.ConnectError("connection refused")])
 def test_explicit_rejection_can_use_another_worker(tmp_path, status):
     async def run():
         fleet = Fleet()
@@ -174,6 +186,123 @@ def test_ambiguous_post_is_never_retried_on_another_worker(tmp_path):
     asyncio.run(run())
 
 
+def test_idempotency_key_returns_one_job_for_repeats_and_conflicts(tmp_path):
+    async def run():
+        fleet = Fleet()
+        router = make_gateway(tmp_path, fleet)
+        await router.refresh_pool()
+        key = str(uuid4())
+        request = gateway.GenerateRequest(prompt="same attempt", seed=7)
+        values = await asyncio.gather(*(router.submit(request, key) for _ in range(3)))
+        assert {value["id"] for value in values} == {key}
+        assert (await router.submit(request, key))["id"] == key
+        with pytest.raises(HTTPException) as conflict:
+            await router.submit(gateway.GenerateRequest(prompt="same attempt", seed=8), key)
+        assert conflict.value.status_code == 409
+        assert len([call for call in fleet.calls if call[0] == "POST"]) == 1
+        await router.client.aclose()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_lost_acceptance_is_recovered_from_its_worker_without_a_second_post(tmp_path, restart):
+    async def run():
+        fleet = Fleet()
+        fleet.lost.add(URLS[0])
+        router = make_gateway(tmp_path, fleet)
+        await router.refresh_pool()
+        key = str(uuid4())
+        request = gateway.GenerateRequest(prompt="response lost")
+        with pytest.raises(HTTPException) as error:
+            await router.submit(request, key)
+        assert error.value.status_code == 502
+        if restart:
+            await router.client.aclose()
+            router = make_gateway(tmp_path, fleet)
+            await router.refresh_pool()
+        assert (await router.submit(request, key))["id"] == key
+        assert router.load(key)["worker"] == URLS[0]
+        assert len([call for call in fleet.calls if call[0] == "POST"]) == 1
+        assert not list((router.root / "uncertain").glob("*.json"))
+        await router.refresh_job(key)
+        job = router.public(router.load(key))
+        assert job["status"] == "succeeded"
+        assert job["video_sha256"] == hashlib.sha256(fleet.media).hexdigest()
+        assert job["video_bytes"] == len(fleet.media)
+        await router.client.aclose()
+    asyncio.run(run())
+
+
+def test_unaccepted_ambiguous_submission_is_dispatched_again(tmp_path):
+    async def run():
+        fleet = Fleet()
+        fleet.errors[URLS[0]] = httpx.ReadTimeout("request lost before acceptance")
+        router = make_gateway(tmp_path, fleet)
+        await router.refresh_pool()
+        key = str(uuid4())
+        request = gateway.GenerateRequest(prompt="never accepted")
+        with pytest.raises(HTTPException):
+            await router.submit(request, key)
+        del fleet.errors[URLS[0]]
+        assert (await router.submit(request, key))["id"] == key  # Its worker reports 404.
+        assert len(fleet.jobs) == 1
+        assert len([call for call in fleet.calls if call[0] == "POST"]) == 2
+        await router.client.aclose()
+    asyncio.run(run())
+
+
+def test_unreachable_worker_turns_unfinished_jobs_into_worker_lost(tmp_path):
+    async def run():
+        fleet = Fleet()
+        router = make_gateway(tmp_path, fleet)
+        router.worker_lost_seconds = 0
+        await router.refresh_pool()
+        identifier = (await router.submit(gateway.GenerateRequest(prompt="worker vanishes")))["id"]
+        fleet.down.add(router.load(identifier)["worker"])
+        await router.refresh_job(identifier)
+        assert identifier in router.pending  # The first failure only starts the clock.
+        await asyncio.sleep(0.01)
+        await router.refresh_job(identifier)
+        job = router.public(router.load(identifier))
+        assert job["status"] == "failed" and job["error_code"] == "worker_lost"
+        assert identifier not in router.pending
+        await router.client.aclose()
+    asyncio.run(run())
+
+
+def test_ambiguous_submission_on_a_lost_worker_resolves_to_worker_lost(tmp_path):
+    async def run():
+        fleet = Fleet()
+        fleet.lost.add(URLS[0])
+        router = make_gateway(tmp_path, fleet)
+        await router.refresh_pool()
+        key = str(uuid4())
+        request = gateway.GenerateRequest(prompt="worker vanished after accepting")
+        with pytest.raises(HTTPException):
+            await router.submit(request, key)
+        fleet.down.add(URLS[0])
+        with pytest.raises(HTTPException) as unknown:
+            await router.submit(request, key)
+        assert unknown.value.status_code == 502  # Too early to declare the worker lost.
+        router.worker_lost_seconds = 0
+        job = await router.submit(request, key)
+        assert job["id"] == key and job["status"] == "failed" and job["error_code"] == "worker_lost"
+        assert len([call for call in fleet.calls if call[0] == "POST"]) == 1
+        await router.client.aclose()
+    asyncio.run(run())
+
+
+def test_workers_without_job_id_support_receive_no_jobs(tmp_path):
+    async def run():
+        fleet = Fleet()
+        fleet.legacy.add(URLS[0])
+        router = make_gateway(tmp_path, fleet)
+        await router.refresh_pool()
+        assert set(router.ready) == set(URLS[1:])
+        await router.client.aclose()
+    asyncio.run(run())
+
+
 def test_success_is_not_published_until_video_is_cached_completely(tmp_path):
     async def run():
         fleet = Fleet()
@@ -217,6 +346,22 @@ def test_http_contract_auth_and_persistence_without_workers(tmp_path):
         assert client.post("/v1/videos", json={"prompt": "new"}, headers=AUTH).status_code == 503
         assert client.get(job["video_url"], headers=AUTH).content == fleet.media
         assert client.get(job["status_url"], headers=AUTH).json()["status"] == "succeeded"
+
+
+def test_http_idempotency_key_contract(tmp_path):
+    router = make_gateway(tmp_path, Fleet())
+    key = str(uuid4())
+    keyed = {**AUTH, "Idempotency-Key": key}
+    with TestClient(gateway.create_app(router)) as client:
+        assert client.get("/healthz").json()["idempotency_key"] is True
+        for bad in ("not-a-uuid", key.upper()):
+            response = client.post("/v1/videos", json={"prompt": "x"}, headers={**AUTH, "Idempotency-Key": bad})
+            assert response.status_code == 400
+        first = client.post("/v1/videos", json={"prompt": "x"}, headers=keyed)
+        repeat = client.post("/v1/videos", json={"prompt": "x"}, headers=keyed)
+        assert first.status_code == repeat.status_code == 202
+        assert first.json()["id"] == repeat.json()["id"] == key
+        assert client.post("/v1/videos", json={"prompt": "y"}, headers=keyed).status_code == 409
 
 
 def test_disk_pressure_prevents_new_backend_submission(tmp_path):

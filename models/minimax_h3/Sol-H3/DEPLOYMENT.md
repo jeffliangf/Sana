@@ -5,14 +5,20 @@ FastH3 adapter** service. It covers `serve.py`, `serve_node.py`, `gateway.py`, a
 the launchers in this directory. It does not use the separate SGLang deployment
 instructions at the repository root.
 
-**Last recorded operational state: 2026-10-26, intentionally stopped.** All H3
-allocations on H200-0002, 0006, 0023, and 0048 were drained and cancelled. The
-gateway stayed up with zero workers and retained completed downloads. The H100
-attempt had already been cancelled. Do not interpret this document, a stale
-registry, or `workers_ready: 0` as an instruction to restart them. The storage
-hardening described here is a local code change dated 2026-10-27; it has not been
-rolled out or GPU-tested in that change. Nodes will be supplied for the next
-explicitly requested deployment.
+**Last recorded operational state: 2026-10-28, four H200 workers serving.** The
+gateway and workers run the 2026-10-28 code: caller job IDs, `error_code`,
+`video_sha256`, and the 2026-10-27 storage hardening. One eight-GPU allocation on
+H200-0002 (Slurm 3891, `deployment/h200-0002-20261028/`) serves four two-GPU
+workers at `10.2.201.2:18080–18083`: 8 GPUs, 4 generation slots, 32 queue slots.
+Before admission each worker passed a 5-second and a 10-second fallback request
+directly; then four requests through the gateway covered all four workers, with
+checksums, repeated keys, 409 conflicts, and a no-rerender replay all verified.
+The other H200 nodes stopped on 2026-10-26 remain stopped and excluded. A
+two-worker H100 launch on GMI node `gmicloud-loki-gpu-004` (Slurm 3435) failed
+while loading the model: every rank holds the whole pipeline, about 129 GiB, and
+an H100 has 80 GB (see [H100 workers](#h100-workers-on-another-cluster)). Do not
+interpret this document or a stale registry as an instruction to restart or stop
+workers.
 
 ## Fixed caller contract
 
@@ -23,7 +29,8 @@ explicitly requested deployment.
 | Deployment root on that cluster | `/home/jeff/sol-h3-h200` |
 | Bearer token | Existing `deployment/token`; keep private and preserve it |
 | Submit | `POST /v1/videos`, JSON `prompt`, `duration` (5 or 10), `seed` |
-| Poll / download | `GET /v1/jobs/{id}` / `GET /v1/jobs/{id}/video` |
+| Caller job ID | Optional `Idempotency-Key: <lowercase UUID>` header; it becomes the job ID |
+| Poll / download | `GET /v1/jobs/{id}` / `GET /v1/jobs/{id}/video`; success includes `video_sha256` |
 | Media | 1344×768, 24 FPS, stereo audio, four transformer forwards |
 
 The base URL, bearer token, API paths, and existing job IDs survive worker pool
@@ -77,20 +84,53 @@ with an empty worker pool, provided their storage is readable.
 
 | Result | Caller behavior |
 |---|---|
-| 202 | Save the returned ID and poll it; do not repeat the POST |
+| 202 | Save the returned ID and poll it. With a key, repeating the same POST returns this job in its current state |
+| 400 | `Idempotency-Key` is not a lowercase canonical UUID |
+| 409 | The key was already used with a different prompt, duration, or seed; nothing new started |
 | 429 | Request rejected before acceptance; retry with backoff and jitter |
 | 503 | No worker currently available or service not ready; back off |
 | 507 on POST | Storage rejected admission before acceptance; wait for recovery |
 | 502 with `detail.id` / `detail.status_url` | Worker accepted, but gateway could not persist the route; poll that ID, **do not resubmit** |
-| Other ambiguous 502 or POST timeout | Acceptance may have happened; preserve request/recovery state and reconcile `uncertain/`, **do not automatically repeat** |
-| Terminal `failed` job | Save the error; decide explicitly whether to submit a new job |
+| Other 502, POST timeout, or lost response | With a key: repeat the same POST and key; it is never generated twice. Without a key: do not repeat automatically; reconcile `uncertain/` |
+| Terminal `failed` job | Read `error_code`; to regenerate, submit again with a **new** key |
 
-There is no cross-worker idempotency key or exactly-once transaction. If the
-gateway process dies after worker acceptance while both job-record and journal
-writes are failing, it can lose the accepted ID. The pre-POST attempt record
-helps reconciliation but cannot reconstruct a response that was never saved.
-Likewise, worker restart marks interrupted jobs failed instead of replaying GPU
-work. Do not promise zero failed requests or transparent recovery from node loss.
+### Caller job IDs
+
+A caller that sends `Idempotency-Key` chooses the job ID: the gateway uses the
+key as the job ID and passes it to the worker in the same header. There is no
+separate request table and no new endpoint; `GET /v1/jobs/{key}` is the lookup.
+Requests without a key get a random ID and behave as before. Gateway `/healthz`
+reports `idempotency_key: true`, so a client can detect support.
+
+- **Repeat.** Same key and inputs return the existing job, including a failed
+  one. Different inputs return 409. Concurrent repeats share one dispatch in the
+  single gateway process.
+- **Ambiguous outcome.** Before each POST the gateway writes
+  `uncertain/<id>.json` naming the chosen worker. A repeat asks only that worker
+  for the ID: found means adopt it; 404 means it was never accepted, so dispatch
+  once more; no answer returns 502 again. A refused connection or connect timeout
+  means nothing was sent, so the gateway tries the next worker at once.
+- **Workers.** A worker returns its saved job for a repeated ID even when its
+  queue is full, it is still loading, or the job failed. The gateway dispatches
+  only to workers whose `/healthz` reports `idempotency_key: true`, so a worker on
+  older code is never sent work; upgrade workers with the gateway.
+- **Failure codes.** Failed jobs carry `error_code`: `worker_restarted`,
+  `inference_failed`, or `storage_failure` from the worker, and `worker_lost`
+  from the gateway when a job's worker has been unreachable for 10 minutes (or
+  an ambiguous submission is at least 10 minutes old and its worker still does not
+  answer). Every code permits one explicit regeneration with a new key. A late
+  result from a lost worker is never archived.
+- **Results.** Successful status includes `video_sha256` and `video_bytes` of the
+  archived MP4. Downloads can be repeated; nothing expires.
+
+Not provided: a separate request lookup, cancellation, a regeneration endpoint,
+or a second gateway. Deduplication lives in the gateway's `jobs/` and
+`uncertain/` and in each worker's output directory; deleting them forgets those
+IDs. The one token is the only caller scope. If the gateway process dies after
+worker acceptance while both job-record and journal writes are failing, it can
+still lose a keyless accepted ID. Worker restart still marks interrupted jobs
+failed instead of replaying GPU work. Do not promise zero failed requests or
+transparent recovery from node loss.
 
 ## Storage isolation and safeguards
 
@@ -156,6 +196,11 @@ These paths handle reported I/O errors. A filesystem call that hangs indefinitel
 can still block its process. The gateway host, its persistent storage, and network
 remain shared dependencies; there is no second gateway or replicated job database.
 
+A gateway restart reads every `jobs/*.json` before it answers. On 2026-10-28,
+33,521 records on the shared MooseFS `/home` took about seven minutes; the socket
+kept the address, but status and download requests waited until the scan ended.
+Schedule gateway restarts accordingly.
+
 ### Capacity, retention, and incident response
 
 Budget for model + adapter + environment + caches + both worker and gateway video
@@ -217,10 +262,11 @@ a port means reusing its local output directory, which is necessary for old job
 records; never delete it as part of a code update.
 
 H100 and H200 use the Hopper kernel path in this runtime. That does not establish
-the memory margin, speed, or reliability of the four-GPU H100 service. **H100
-four-GPU deployment is configurable but still requires live validation.** Keep
-the four-step adapter, numerical gate, and dense fallback; do not relax tolerances
-to make a deployment pass.
+the memory margin, speed, or reliability of the four-GPU H100 service. **The
+current runtime does not fit on 80 GB H100s** (2026-10-28, see
+[below](#h100-workers-on-another-cluster)); the H100 settings remain for a future
+model-placement change. Keep the four-step adapter, numerical gate, and dense
+fallback; do not relax tolerances to make a deployment pass.
 
 The historical H200 environment tar contains absolute interpreter/shebang paths
 for `/raid/jeff/sol-h3-venv` and shared Python. It is not a portable environment for
@@ -304,21 +350,68 @@ ownership or availability.
 
 The gateway must reach each worker, and the worker must retain the same bearer
 token. A registry on another cluster's `/home` is not automatically visible to the
-H200 gateway. Use a private routed connection when available, otherwise a managed
-SSH tunnel from the **gateway host** to the H100 host/login. For example, after
-provisioning SSH access and choosing unused gateway-local ports:
+H200 gateway. The H100 nodes are on the GMI cluster, whose login host is
+`utopai-m1` (where `sbatch` runs); its deployment root is `/home/jeff/sol-h3-h100`
+with a copy of the same `deployment/token`.
+
+GMI node addresses are public, so workers bind to loopback
+(`H3_BIND_HOST=127.0.0.1`). The gateway host holds no credentials for the GMI
+cluster, so the allocation opens the tunnel in reverse with the existing key:
+gateway-host `127.0.0.1:28084`/`28085` → node `127.0.0.1:18080`/`18081`.
+The tunnel runs in a restart loop inside the allocation and ends with it:
 
 ```bash
-ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
-  -L 127.0.0.1:28084:127.0.0.1:18080 \
-  -L 127.0.0.1:28085:127.0.0.1:18081 jeff@SUPPLIED_H100_HOST
+ssh -i ~/.ssh/gmi -p 44222 -N -o BatchMode=yes -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -R 127.0.0.1:28084:127.0.0.1:18080 -R 127.0.0.1:28085:127.0.0.1:18081 jeff@157.66.255.187
 ```
 
-If a jump host is needed, use the site's authorized SSH configuration/`-J`.
-Destination loopback in that example is the H100 host, where the worker binds.
-Use distinct gateway-local tunnel ports for every host, and supervise tunnels
-with a user service before production traffic. Tunnel installation is not part
-of `deploy_node.sh` and has not been performed by this change.
+Use distinct gateway-local ports for every additional node. If a network drop
+leaves the old session holding a port, the loop keeps failing with "remote port
+forwarding failed"; stop that stale `sshd: jeff` session on the gateway host
+(`ss -ltnp | grep 2808`) and the loop rebinds.
+
+The 2026-10-28 deployment (`deployment/h100-004-20261028/` on the GMI cluster)
+prepared the node this way:
+
+- **Environment.** `build_venv.sh` built a Python 3.12.15 environment on the login
+  host at the node's path, `/var/tmp/jeff-sol-h3/sol-h3-venv`, from the H200
+  workers' exact package list. The login host has no `nvcc`, so the
+  `cudnn-frontend` source build was replaced by the identical compiled package
+  from the H200 environment. The resulting freeze matches H200. The archive
+  `sol-h3-venv-h100.tar` and its SHA-256 sit beside the script.
+- **Weights.** Downloaded from Hugging Face at the pinned model/adapter revisions
+  into `deployment/staging/` and verified against the H200 manifest checksums.
+  `deploy_node.sh` copies and re-verifies them on the node.
+- **Launch.** `launch.sh` runs a node preflight (GPU family, idle GPUs, free
+  ports, 250 GiB on `/var/tmp`, gateway SSH reachability), verifies and unpacks
+  the environment if absent, starts the tunnel loop, then runs `deploy_node.sh`:
+
+```bash
+sbatch --partition=all --nodes=1 --ntasks=1 --cpus-per-task=160 --mem=1600G \
+  --gres=gpu:nvidia_h100_80gb_hbm3:8 --constraint=h100 --time=0 --requeue \
+  --job-name=h3-api-h100-004 --nodelist=gmicloud-loki-gpu-004 \
+  --chdir=/home/jeff/sol-h3-h100/deployment/h100-004-20261028 \
+  --output=/home/jeff/sol-h3-h100/deployment/h100-004-20261028/node-004-%j.log \
+  /home/jeff/sol-h3-h100/deployment/h100-004-20261028/launch.sh
+```
+
+Submit it from a shell without an activated virtual environment, because
+`sbatch` exports the caller's environment. `/var/tmp/jeff-sol-h3` holds the
+environment, weights, caches, logs, and job outputs on node NVMe; it persists
+across allocations but should not be assumed to survive node reimaging.
+
+**Result: the model does not fit.** Preflight, environment, weight copy, and the
+tunnel all worked, but both workers ran out of GPU memory in
+`MiniMaxH3Inference.__init__` (`self.pipe.to(self.device)`) on all three
+attempts; the supervisor disabled them and released the allocation after 16
+minutes. Every rank holds the full pipeline (62 GiB text encoder plus 62 GiB
+transformer in BF16, plus VAEs; an H200 rank peaked at 129 GiB allocated), and
+context parallelism splits activations, not weights, so four GPUs per worker do
+not help. An H100 worker needs the text encoder kept off the GPU between prompts,
+or weights sharded across ranks; neither is implemented. The environment
+archive, verified weights, wrapper, `outcome.json`, and node-local copies on
+gpu-004 remain for a retry.
 
 Merge these gateway-reachable origins into `pool.json`'s `additional_workers`
 while retaining automatic H200 discovery and current exclusions:
@@ -371,6 +464,9 @@ bash -n models/minimax_h3/Sol-H3/deploy_node.sh \
 
 The tests inject ENOSPC/EIO/quota/read-only failures, exercise admission versus
 post-acceptance recovery, archive retries, registry isolation, bounded discovery
-grace, explicit pauses, and disjoint H100/H200 launch groups. A CPU broadcast
+grace, explicit pauses, and disjoint H100/H200 launch groups. They also cover
+repeated, concurrent, and conflicting keys; a lost acceptance response before and
+after a gateway restart; refused connections; worker loss; and exclusion of
+workers without job ID support (73 cases on 2026-10-28). A CPU broadcast
 stand-in tests output-error coordination; it does not replace the live distributed
 GPU validation in the redeployment procedure.

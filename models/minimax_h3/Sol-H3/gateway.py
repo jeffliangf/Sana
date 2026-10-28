@@ -20,7 +20,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
-from serve import GenerateRequest, atomic_json
+from serve import GenerateRequest, atomic_json, caller_job_id
 from service_storage import check_space, storage_probe
 
 LOG = logging.getLogger("h3.gateway")
@@ -48,7 +48,7 @@ def job_id(value):
 
 class Gateway:
     def __init__(self, registry, state_dir, token, *, pool_file=None, client=None,
-                 min_free_gib=20, refresh_seconds=2):
+                 min_free_gib=20, refresh_seconds=2, worker_lost_seconds=600):
         if len(token) < 32:
             raise ValueError("Bearer token must contain at least 32 characters")
         self.registry, self.root = Path(registry), Path(state_dir)
@@ -61,6 +61,8 @@ class Gateway:
                                                  limits=httpx.Limits(max_connections=64))
         self.min_free_bytes = min_free_gib * 2**30
         self.refresh_seconds = refresh_seconds
+        self.worker_lost_seconds = worker_lost_seconds
+        self.claims = {}
         self.ready = {}
         self.discovered = []
         self.updated_at = 0.0
@@ -168,7 +170,8 @@ class Gateway:
                 response = await self.client.get(endpoint + "/healthz", timeout=2)
                 response.raise_for_status()
                 health = response.json()
-                if health.get("status") == "ready" and health["queue_capacity"] > 0:
+                # Older workers ignore the job ID header, so they would break deduplication.
+                if health.get("status") == "ready" and health["queue_capacity"] > 0 and health.get("idempotency_key"):
                     return endpoint, health
             except (httpx.HTTPError, ValueError, KeyError, TypeError):
                 pass
@@ -184,7 +187,7 @@ class Gateway:
         ready = self.ready if time.time() - self.updated_at < 15 else {}
         storage_ready = not self.storage_error and not self.unpersisted
         return {"status": "storage_paused" if not storage_ready else ("ready" if ready else "unavailable"),
-                "service": "Sol-H3 gateway",
+                "service": "Sol-H3 gateway", "idempotency_key": True,
                 "workers_ready": len(ready), "workers_discovered": len(self.discovered),
                 "gpus": sum(value.get("gpus", 0) for value in ready.values()),
                 "queued": sum(value.get("queued", 0) for value in ready.values()),
@@ -205,8 +208,16 @@ class Gateway:
         except OSError as error:
             raise HTTPException(503, "Job storage is temporarily unavailable") from error
 
+    def find(self, identifier):
+        try:
+            return self.load(identifier)
+        except HTTPException as error:
+            if error.status_code != 404:
+                raise
+        return None
+
     def save(self, record):
-        value = {k: v for k, v in record.items() if k != "persistence_pending"}
+        value = {k: v for k, v in record.items() if k not in {"persistence_pending", "unreachable_since"}}
         atomic_json(self.root / "jobs" / f"{record['job']['id']}.json", value)
 
     def persist(self, record):
@@ -236,15 +247,77 @@ class Gateway:
                 value["status"] = "running"
         if value["status"] == "succeeded" and not record.get("video_cached"):
             value["status"] = "running"  # Publish success only after the video is durable here.
+        if value["status"] == "succeeded":
+            value.update(video_sha256=record.get("video_sha256"), video_bytes=record.get("video_bytes"))
         return value
 
-    async def submit(self, body):
+    async def submit(self, body, key=None):
+        """Accept a request, or return the job already created for this key.
+
+        The Idempotency-Key is the job ID on both the gateway and the worker, so
+        a repeated POST finds the original job without a separate lookup table.
+        Requests without a key get a random ID through the same path.
+        """
+        identifier = key or str(uuid4())
+        while identifier in self.claims:  # Concurrent repeats share one dispatch.
+            await self.claims[identifier].wait()
+        self.claims[identifier] = asyncio.Event()
+        try:
+            request = body.model_dump()
+            record = self.find(identifier) or await self.recover(identifier, request)
+            if record is None:
+                return await self.dispatch(identifier, request)
+            if any(record["job"].get(name) != value for name, value in request.items()):
+                raise HTTPException(409, "Idempotency-Key was already used with different inputs")
+            return self.public(record)
+        finally:
+            self.claims.pop(identifier).set()
+
+    async def recover(self, identifier, request):
+        """Resolve an earlier ambiguous submission on the only worker that could hold it."""
+        journal = self.root / "uncertain" / f"{identifier}.json"
+        try:
+            attempt = json.loads(journal.read_text())
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as error:
+            raise HTTPException(503, "Submission journal is temporarily unavailable") from error
+        if attempt.get("status") == "accepted":  # Normally loaded at startup; never dispatch it again.
+            self.pending[identifier] = record = {**attempt["record"], "persistence_pending": True}
+            self.unpersisted.add(identifier)
+            return record
+        if attempt["request"] != request:
+            raise HTTPException(409, "Idempotency-Key was already used with different inputs")
+        try:
+            response = await self.client.get(attempt["worker"] + f"/v1/jobs/{identifier}",
+                                             headers={"Authorization": f"Bearer {self.token}"}, timeout=10)
+            if response.status_code == 404:
+                with suppress(OSError):
+                    journal.unlink(missing_ok=True)
+                return None  # That worker never accepted it, so a new dispatch is safe.
+            response.raise_for_status()
+            value = response.json()
+            if value["id"] != identifier or value["status"] not in {"queued", "running", "succeeded", "failed"}:
+                raise ValueError("Unexpected worker status response")
+        except (httpx.HTTPError, ValueError, KeyError) as error:
+            if time.time() - attempt["submitted_at"] < self.worker_lost_seconds:
+                raise HTTPException(502, "Submission outcome is still unknown; repeat with the same Idempotency-Key later") from error
+            value = {"id": identifier, "status": "failed", **request, "error": "worker lost",
+                     "error_code": "worker_lost", "finished_at": time.time()}
+        record = {"worker": attempt["worker"], "job": value, "video_cached": False,
+                  "gateway_submitted_at": attempt["submitted_at"], "attempt_id": identifier}
+        self.pending[identifier] = record
+        self.persist(record)  # On failure, maintenance keeps retrying the write.
+        return record
+
+    async def dispatch(self, identifier, request):
         if not self.storage_available():
             raise HTTPException(507, "Gateway storage unavailable; request was not accepted")
         if time.time() - self.updated_at > 5:
             await self.refresh_pool()
         tried = set()
         rejections = set()
+        attempt_path = self.root / "uncertain" / f"{identifier}.json"
         while True:
             async with self.selection:
                 candidates = [url for url, h in self.ready.items() if url not in tried
@@ -264,34 +337,33 @@ class Gateway:
                 self.sequence += 1
                 self.last_selected[endpoint] = self.sequence
             tried.add(endpoint)
-            attempt_path = self.root / "uncertain" / f"{uuid4()}.json"
             try:
                 try:
-                    atomic_json(attempt_path, {"worker": endpoint, "request": body.model_dump(),
+                    atomic_json(attempt_path, {"worker": endpoint, "request": request,
                                                "submitted_at": time.time(), "status": "submitting"})
                 except OSError as error:
                     self.storage_error = str(error)
                     raise HTTPException(507, "Gateway could not journal request; no worker accepted it") from error
-                response = await self.client.post(endpoint + "/v1/videos", json=body.model_dump(),
-                                                  headers={"Authorization": f"Bearer {self.token}"}, timeout=30)
-                if response.status_code in {429, 503, 507}:
-                    rejections.add(response.status_code)
+                try:
+                    response = await self.client.post(endpoint + "/v1/videos", json=request, timeout=30, headers={
+                        "Authorization": f"Bearer {self.token}", "Idempotency-Key": identifier})
+                except (httpx.ConnectError, httpx.ConnectTimeout):
+                    response = None  # The request never reached this worker.
+                if response is None or response.status_code in {429, 503, 507}:
+                    rejections.add(503 if response is None else response.status_code)
                     with suppress(OSError):
                         attempt_path.unlink(missing_ok=True)
-                    continue  # Explicit rejection: no job was accepted, so another worker is safe.
+                    continue  # No job was accepted, so another worker is safe.
                 if 400 <= response.status_code < 500:
                     with suppress(OSError):
                         attempt_path.unlink(missing_ok=True)
                     raise HTTPException(response.status_code, "Worker rejected request")
                 response.raise_for_status()
                 value = response.json()
-                identifier = str(UUID(value["id"]))
-                if identifier != value["id"]:
-                    raise ValueError("Worker returned a noncanonical job ID")
-                if value.get("status") not in {"queued", "running", "succeeded"}:
+                if value["id"] != identifier or value.get("status") not in {"queued", "running", "succeeded", "failed"}:
                     raise ValueError("Unexpected worker admission response")
                 record = {"worker": endpoint, "job": value, "video_cached": False,
-                          "gateway_submitted_at": time.time(), "attempt_id": attempt_path.stem}
+                          "gateway_submitted_at": time.time(), "attempt_id": identifier}
                 # Keep tracking a known acceptance even if shared storage fails
                 # between the worker acknowledgement and writing its route.
                 self.pending[identifier] = record
@@ -302,8 +374,8 @@ class Gateway:
                                               "id": identifier, "status_url": f"/v1/jobs/{identifier}"})
                 return self.public(record)
             except (httpx.HTTPError, ValueError, KeyError) as error:
-                # A timeout can occur after acceptance. Never turn it into a duplicate POST.
-                raise HTTPException(502, "Worker submission outcome is uncertain; do not resubmit automatically") from error
+                # A timeout can occur after acceptance. Only a repeat of this job ID is safe.
+                raise HTTPException(502, "Worker submission outcome is uncertain; repeat only with the same Idempotency-Key") from error
             finally:
                 self.inflight[endpoint] -= 1
 
@@ -326,6 +398,7 @@ class Gateway:
                 if record["job"]["status"] == "succeeded" and not record.get("video_cached"):
                     await self.archive(record)
                 record.pop("last_error", None)
+                record.pop("unreachable_since", None)
                 record["updated_at"] = time.time()
                 if not self.persist(record):
                     return
@@ -333,11 +406,16 @@ class Gateway:
                     self.pending.pop(identifier, None)
                     self.completed += int(record.get("video_cached", False))
             except (httpx.HTTPError, OSError, ValueError, KeyError) as error:
-                record["last_error"] = str(error)
-                record["updated_at"] = time.time()
+                now = time.time()
+                record.update(last_error=str(error), updated_at=now)
                 if isinstance(error, OSError):
                     self.storage_error = str(error)
-                self.persist(record)
+                elif now - record.setdefault("unreachable_since", now) > self.worker_lost_seconds:
+                    # Otherwise a vanished worker is polled forever. The caller can
+                    # regenerate under a new job ID; a late result is never archived.
+                    record["job"].update(status="failed", error="worker lost", error_code="worker_lost", finished_at=now)
+                if self.persist(record) and record["job"]["status"] == "failed":
+                    self.pending.pop(identifier, None)
                 LOG.warning("Job %s remains pending: %s", identifier, error)
 
     async def archive(self, record):
@@ -432,8 +510,8 @@ def create_app(gateway):
         return JSONResponse(value, status_code=200 if value["status"] == "ready" else 503)
 
     @app.post("/v1/videos", status_code=202, dependencies=[Depends(authorize)])
-    async def submit(body: GenerateRequest):
-        return await gateway.submit(body)
+    async def submit(body: GenerateRequest, idempotency_key: str | None = Header(default=None)):
+        return await gateway.submit(body, caller_job_id(idempotency_key))
 
     @app.get("/v1/jobs/{identifier}", dependencies=[Depends(authorize)])
     async def status(identifier: str):

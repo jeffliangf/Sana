@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 from pathlib import Path
 import sys
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
@@ -41,6 +42,25 @@ def test_auth_readiness_validation_and_queue_limit(tmp_path):
     assert client.get(job["status_url"], headers=AUTH).json()["status"] == "queued"
     assert client.get(job["video_url"], headers=AUTH).status_code == 409
     assert client.get("/v1/jobs/not-a-uuid", headers=AUTH).status_code == 404
+
+
+def test_job_id_header_returns_the_saved_job_across_full_queues_and_restarts(tmp_path):
+    state, client = make_client(tmp_path, capacity=1)
+    state.phase = "ready"
+    payload = {"prompt": "A bird sings.", "duration": 5, "seed": 0}
+    keyed = {**AUTH, "Idempotency-Key": str(uuid4())}
+    assert client.get("/healthz").json()["idempotency_key"] is True
+    first = client.post("/v1/videos", json=payload, headers=keyed)
+    repeat = client.post("/v1/videos", json=payload, headers=keyed)  # Queue is now full.
+    assert first.status_code == repeat.status_code == 202
+    assert first.json()["id"] == repeat.json()["id"] == keyed["Idempotency-Key"]
+    assert state.pending.qsize() == 1
+    assert client.post("/v1/videos", json={**payload, "seed": 1}, headers=keyed).status_code == 409
+    assert client.post("/v1/videos", json=payload, headers={**AUTH, "Idempotency-Key": "bad"}).status_code == 400
+    _, restarted = make_client(tmp_path)  # Still loading, so only an existing job can be returned.
+    again = restarted.post("/v1/videos", json=payload, headers=keyed)
+    assert again.status_code == 202
+    assert again.json()["status"] == "failed" and again.json()["error_code"] == "worker_restarted"
 
 
 def test_completed_media_and_interrupted_jobs_survive_restart(tmp_path):

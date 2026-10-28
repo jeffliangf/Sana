@@ -25,10 +25,14 @@ For the fixed gateway contract, storage safeguards, H100/H200 configuration, and
 the complete deployment/drain procedure, use the dedicated
 [deployment design and runbook](DEPLOYMENT.md).
 
-**Last recorded state (2026-10-26): all four H200 nodes were intentionally drained
-and stopped.** The gateway was retained for existing downloads. The capacity and
-allocation IDs below describe the last active fleet, not a current reservation.
-The 2026-10-27 hardening changes are local and have not been deployed.
+**Last recorded state (2026-10-28): four H200 workers on 0002 serve through the
+gateway** (Slurm 3891, 8 GPUs, 4 generation slots, 32 queue slots). The gateway
+and workers accept caller job IDs (`Idempotency-Key`), report `error_code` and
+`video_sha256`, and include the 2026-10-27 storage hardening. Start callers at
+about four concurrent jobs. A two-worker H100 launch on `gmicloud-loki-gpu-004`
+failed with GPU out-of-memory during model loading; the other H200 nodes stopped
+on 2026-10-26 remain stopped. The 32-GPU capacity and allocation IDs below
+describe the earlier fleet, not a current reservation.
 
 ### Access the deployed H200 service
 
@@ -90,23 +94,27 @@ python3 - <<'PY'
 import json
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 
 base = "http://10.2.201.187:18080"
 token = Path("/home/jeff/sol-h3-h200/deployment/token").read_text().strip()
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-def request(path, body=None):
+def request(path, body=None, key=None):
     data = None if body is None else json.dumps(body).encode()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    if key:
+        headers["Idempotency-Key"] = key
     with opener.open(urllib.request.Request(base + path, data=data, headers=headers), timeout=60) as response:
         return response.read()
 
+key = str(uuid.uuid4())  # Save it first: repeating this POST with the same key is safe.
 job = json.loads(request("/v1/videos", {
     "prompt": "A red fox walks through a sunlit forest. Birds chirp and leaves rustle.",
     "duration": 10,
     "seed": 42,
-}))
+}, key))
 print("Job:", job["id"])
 deadline = time.monotonic() + 600
 while time.monotonic() < deadline:
@@ -129,8 +137,17 @@ HTTP 401 means the token is missing/incorrect, 422 means invalid parameters,
 429 means the queues are full, 503 means no worker is ready, and 507 means
 insufficient output storage. A worker's 429, 503, or 507 response rejects the
 request before acceptance, so the gateway can safely try another worker.
-An ambiguous submission failure returns 502; inspect recovery state before
-resubmitting, because a worker may already have accepted the request.
+
+The optional `Idempotency-Key` header (a lowercase UUID) becomes the job ID.
+After a 502, a timeout, or a lost response, repeat the same POST with the same
+key: it returns the original job if one was accepted and never renders a second
+video. The same key with a different prompt, duration, or seed returns 409; a
+malformed key returns 400. Without a key, a 502 still means a worker may have
+accepted the request, so do not resubmit automatically. A failed job reports
+`error_code` (`worker_restarted`, `inference_failed`, `storage_failure`, or
+`worker_lost`); regenerate it with a new key. Successful jobs report
+`video_sha256` and `video_bytes` of the stored MP4, which can be downloaded again
+at any time. See [caller job IDs](DEPLOYMENT.md#caller-job-ids).
 The token is not needed for `/healthz`.
 
 For verl, see the **Self-hosted H3 on H200** section of
@@ -266,6 +283,18 @@ one completed video was recovered and 18 requests are now explicitly failed;
 `pending-before.json` and `pending-after.json` preserve their recovery records.
 Interrupted jobs were not automatically resubmitted.
 
+On 2026-10-28 the gateway was updated in place (same socket, token, and job
+archive) and 0002 returned as one eight-GPU allocation, Slurm 3891, on ports
+18080–18083 with their 8,401 earlier completed jobs preserved. All four workers
+became ready on their first attempt. Direct validation passed **8/8**: each worker
+ran the 5-second demo prompt (12.9 s processing) and the 10-second prompt that
+needs the numerical fallback (51.1–51.7 s, peak 129.3 GiB per GPU). Through the
+gateway, **4/4** requests covered all four workers with matching `video_sha256`.
+Every request was repeated with its key (same job) and with changed inputs (409);
+a replay after completion returned the stored video without rendering again.
+Evidence is in `deployment/h200-0002-20261028/` and `deployment/redeploy-20261028/`
+on the cluster.
+
 Shared storage remains necessary for gateway job persistence and video archives.
 If registry publication stays unavailable for more than 120 seconds, automatic
 discovery stops routing new work to those stale entries until publication resumes.
@@ -296,8 +325,8 @@ then 200 when ready. Other endpoints require `Authorization: Bearer <token>`:
 
 | Method / path | Behavior |
 |---|---|
-| `POST /v1/videos` | Accept `{"prompt":"…","duration":5,"seed":42}`; return 202 with a job ID and relative status/video URLs |
-| `GET /v1/jobs/{id}` | Return `queued`, `running`, `succeeded`, or `failed`, with timings after completion |
+| `POST /v1/videos` | Accept `{"prompt":"…","duration":5,"seed":42}`; return 202 with a job ID and relative status/video URLs. An `Idempotency-Key` UUID becomes the job ID, and repeating it returns that job |
+| `GET /v1/jobs/{id}` | Return `queued`, `running`, `succeeded`, or `failed` (with `error_code`), with timings after completion |
 | `GET /v1/jobs/{id}/video` | Download the completed MP4; return 409 while unfinished |
 
 Each worker handles one generation at a time and queues up to eight waiting
@@ -336,8 +365,9 @@ checkpoints, caches, and outputs. It expects a private `deployment/token` and ca
 initialize a fresh node from a checksummed `deployment/staging` snapshot. The
 staged venv is tied to `/raid/jeff/sol-h3-venv`. Other paths and H100 nodes require
 a prepared environment; `H3_VENV` and `H3_CHECKPOINT_ROOT` select it and the weights.
-`H3_GPU_TYPE=H100` defaults to four GPUs per worker; live H100 validation is still
-required. See [the runbook](DEPLOYMENT.md#parameterize-the-next-fleet) for all settings.
+`H3_GPU_TYPE=H100` defaults to four GPUs per worker, but on 2026-10-28 the model
+did not fit in 80 GB H100s: every rank holds the whole pipeline (about 129 GiB).
+See [the runbook](DEPLOYMENT.md#parameterize-the-next-fleet) for all settings.
 
 ```bash
 sbatch --partition=all --nodes=1 --ntasks=1 --cpus-per-task=160 --mem=1600G \

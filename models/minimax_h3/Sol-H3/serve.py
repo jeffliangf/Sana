@@ -43,6 +43,16 @@ class GenerateRequest(BaseModel):
         return value.strip()
 
 
+def caller_job_id(value):
+    """An Idempotency-Key is used directly as the job ID, so it must be a canonical UUID."""
+    if value is None:
+        return None
+    with suppress(ValueError):
+        if str(UUID(value)) == value:
+            return value
+    raise HTTPException(400, "Idempotency-Key must be a lowercase canonical UUID")
+
+
 class OutputStorageError(OSError):
     """Rank-zero output I/O failed after all ranks finished inference."""
 
@@ -105,7 +115,8 @@ class WorkerState:
         for path in self.root.glob("*.json"):
             record = json.loads(path.read_text())
             if record.get("status") in {"queued", "running"}:
-                record.update(status="failed", error="worker restarted", finished_at=time.time())
+                record.update(status="failed", error="worker restarted", error_code="worker_restarted",
+                              finished_at=time.time())
                 self.persist(record)
 
     def persist(self, record):
@@ -170,15 +181,27 @@ class WorkerState:
             self.persist(record)
             return record
 
-    def submit(self, request):
+    def submit(self, request, job_id=None):
         with self.lock:
+            if job_id is not None:
+                # A repeated ID returns the original job in any state, so a lost
+                # response can be retried without generating a second video.
+                try:
+                    record = self.get(job_id)
+                except HTTPException as error:
+                    if error.status_code != 404:
+                        raise
+                else:
+                    if any(record.get(name) != value for name, value in request.model_dump().items()):
+                        raise HTTPException(409, "Job ID was already used with different inputs")
+                    return record
             if self.phase != "ready":
                 raise HTTPException(503, f"Worker is {self.phase}")
             if self.pending.full():
                 raise HTTPException(429, "Worker queue is full", headers={"Retry-After": "10"})
             if self.dirty or self.storage_error:
                 raise HTTPException(507, "Output storage is paused; retry after recovery")
-            job_id = str(uuid4())
+            job_id = job_id or str(uuid4())
             record = {
                 "id": job_id, "status": "queued", "created_at": time.time(),
                 **request.model_dump(),
@@ -216,7 +239,7 @@ class WorkerState:
             return {
                 **self.metadata, "status": ("storage_paused" if self.phase == "ready" and
                                             (self.storage_error or self.dirty) else self.phase),
-                "active_job": self.active,
+                "active_job": self.active, "idempotency_key": True,
                 "queued": self.pending.qsize() + int(self.held is not None), "queue_capacity": self.pending.maxsize,
                 "completed_since_start": self.completed,
                 "storage": {**self.storage, "error": self.storage_error, "pending_writes": len(self.dirty)},
@@ -225,18 +248,19 @@ class WorkerState:
     def fail_pending(self):
         with self.lock:
             self.phase = "failed"
+            failure = {"status": "failed", "error": "inference worker failed", "error_code": "inference_failed"}
             if self.held:
-                self.update(self.held["id"], status="failed", error="inference worker failed", finished_at=time.time())
+                self.update(self.held["id"], **failure, finished_at=time.time())
                 self.held = None
             if self.active:
-                self.update(self.active, status="failed", error="inference worker failed", finished_at=time.time())
+                self.update(self.active, **failure, finished_at=time.time())
                 self.active = None
             while True:
                 try:
                     record = self.pending.get_nowait()
                 except queue.Empty:
                     break
-                self.update(record["id"], status="failed", error="inference worker failed", finished_at=time.time())
+                self.update(record["id"], **failure, finished_at=time.time())
 
 
 def create_app(state, token):
@@ -267,8 +291,8 @@ def create_app(state, token):
         return JSONResponse(status, status_code=200 if status["status"] == "ready" else 503)
 
     @app.post("/v1/videos", status_code=202, dependencies=[Depends(authorize)])
-    def submit(request: GenerateRequest):
-        return state.submit(request)
+    def submit(request: GenerateRequest, idempotency_key: str | None = Header(default=None)):
+        return state.submit(request, caller_job_id(idempotency_key))
 
     @app.get("/v1/jobs/{job_id}", dependencies=[Depends(authorize)])
     def status(job_id: str):
@@ -469,7 +493,7 @@ def main():
                     with state.lock:
                         state.storage_error = str(error)
                         state.update(command["id"], status="failed", error="output storage failure",
-                                     finished_at=time.time(), storage_error=str(error))
+                                     error_code="storage_failure", finished_at=time.time(), storage_error=str(error))
                         state.active = None
                 continue
             if rank == 0:
