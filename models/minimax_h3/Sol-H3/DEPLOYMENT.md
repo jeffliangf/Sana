@@ -73,10 +73,31 @@ gateway chooses a healthy worker using observed queue depth, accepted jobs, and
 submissions in progress. This is a bounded worker queue, not a durable global
 queue for an arbitrary batch of 400 requests. With `W` healthy workers, there
 are `W` generation slots and up to `8 × W` waiting slots. A useful initial caller
-limit is `W`, increasing toward `1.25 × W` after measuring queueing and latency.
-The former 16-worker pool used **20 external concurrent jobs**, counting the
-whole submit → poll → download lifecycle across callers. Recalculate after
-scaling; this is not a guarantee against rejection or failure.
+limit is `W` for latency-sensitive callers. Batch callers should keep about
+`2 × W` jobs in flight, as the measurements below show. The former 16-worker pool
+used **20 external concurrent jobs**, counting the whole submit → poll → download
+lifecycle across callers. Recalculate after scaling; this is not a guarantee
+against rejection or failure.
+
+**Measured utilization, Oct 29 to Nov 2 (16 workers).** Workers were generating
+46% of the time, or 63% in the hours when callers had 12 or more jobs in flight.
+Worker queues were empty 82% of the time, and every idle gap was a worker waiting
+for its next request; a job already queued started with no gap. Callers rarely
+had more than about 16 jobs in flight. Each worker therefore sat idle while its
+caller polled, downloaded and submitted the next job, which took a median of 8 s.
+
+With about `2 × W` jobs in flight (32 for 16 workers), every worker has its next
+job queued. The cost is up to one generation, about 40 s, of queueing per job.
+
+Time per job varies too. A 10-second video's pipeline takes:
+- 29 s when its worker process has already run that prompt length, the same as
+  the benchmark;
+- 38 s for a length new to the process, because the Sol kernels compile per
+  length (43% of jobs);
+- 42–47 s with the dense fallback (40% of jobs).
+
+The analysis scripts are `util.py`, `newshape.py` and `gaps.py` in
+`deployment/stability-review-20261102/`.
 
 A job stays on the worker that accepted it, including while that worker is
 excluded from new dispatch. The gateway copies and checks the MP4 before
