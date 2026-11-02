@@ -359,6 +359,12 @@ def main():
     device = torch.device("cuda", local_rank)
     if args.expect_gpu.lower() not in torch.cuda.get_device_name(device).lower():
         raise ValueError(f"Expected {args.expect_gpu}, found {torch.cuda.get_device_name(device)}")
+    # Optional cap on PyTorch's pool for the serving phase, as a fraction of GPU memory (see DEPLOYMENT.md). Loading
+    # needs more memory than serving, so the cap is applied after warmup; it keeps room outside the pool for kernels
+    # loaded for new prompt lengths.
+    serving_fraction = float(os.environ.get("H3_SERVING_MEMORY_FRACTION") or 0)
+    if not 0 <= serving_fraction < 1:
+        raise ValueError("H3_SERVING_MEMORY_FRACTION must be at least 0 and below 1")
     if args.attention_backend != "dense":
         os.environ["SOL_ATTN_STRICT"] = "1"
         os.environ["SOL_ATTN_CORRECTNESS_GATE"] = "1"
@@ -461,6 +467,13 @@ def main():
                         time.sleep(5)
                 if rank == 0:
                     warmups.append({"duration": duration, "repeat": repeat, **result})
+        if serving_fraction:
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()  # return the load-time high-water mark
+            torch.cuda.set_per_process_memory_fraction(serving_fraction, device)
+            free, total = torch.cuda.mem_get_info(device)
+            quiet_print(f"SERVING_MEMORY_CAP rank={rank} cap_gib={serving_fraction * total / 2**30:.1f} "
+                        f"reserved_gib={torch.cuda.memory_reserved(device) / 2**30:.1f} free_gib={free / 2**30:.1f}")
         if rank == 0:
             state.phase = "ready"
             ready = {**state.health(), "endpoint": f"http://{args.host}:{args.port}", "warmups": warmups}

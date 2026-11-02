@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the Sol-H3 worker watchdog every hour
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target

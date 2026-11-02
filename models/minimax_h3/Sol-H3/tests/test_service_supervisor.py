@@ -15,12 +15,12 @@ supervisor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(supervisor)
 
 
-def child(index, attempt=0, dead=False):
+def child(index, attempt=0, dead=False, failures=0):
     process = Mock()
     process.poll.return_value = 1 if dead else None
-    return {"index": index, "process": process, "attempt": attempt, "port": 18080 + index,
+    return {"index": index, "process": process, "attempt": attempt, "failures": failures, "port": 18080 + index,
             "log": f"worker-{index}.log", "endpoint": f"http://localhost:{18080 + index}",
-            "started": supervisor.time.monotonic(), "ready_seen": False}
+            "started": supervisor.time.monotonic(), "ready_seen": False, "ready_at": None}
 
 
 def test_three_failures_disable_only_one_pair(tmp_path):
@@ -28,10 +28,10 @@ def test_three_failures_disable_only_one_pair(tmp_path):
     children = [child(0, dead=True), healthy]
     opener = Mock()
     opener.open.side_effect = lambda *args, **kwargs: io.StringIO('{"status":"ready"}')
-    start = Mock(side_effect=lambda index, attempt: child(index, attempt, dead=True))
+    start = Mock(side_effect=lambda index, attempt, failures: child(index, attempt, dead=True, failures=failures))
     for _ in range(3):
         states = supervisor.refresh_workers(children, start, opener, tmp_path)
-    assert [call.args for call in start.call_args_list] == [(0, 1), (0, 2)]
+    assert [call.args for call in start.call_args_list] == [(0, 1, 1), (0, 2, 2)]
     assert children[0]["disabled"]
     assert children[1] is healthy
     healthy["process"].wait.assert_not_called()
@@ -41,8 +41,33 @@ def test_three_failures_disable_only_one_pair(tmp_path):
     assert start.call_count == 2
 
 
+def test_crash_after_a_healthy_run_restarts_with_a_fresh_count(tmp_path, monkeypatch):
+    """The 2026-11-02 outage: workers crash after 15-59 h of serving; that must never use up their starts."""
+    worker = child(0, attempt=7, dead=True, failures=2)
+    worker.update(ready_seen=True, ready_at=100.0)
+    monkeypatch.setattr(supervisor.time, "monotonic", lambda: 100.0 + supervisor.HEALTHY_RUN_SECONDS)
+    start = Mock(side_effect=lambda index, attempt, failures: child(index, attempt, failures=failures))
+    opener = Mock()
+    opener.open.side_effect = lambda *args, **kwargs: io.StringIO('{"status":"loading"}')
+    children = [worker]
+    states = supervisor.refresh_workers(children, start, opener, tmp_path)
+    assert [call.args for call in start.call_args_list] == [(0, 8, 1)]
+    assert not states[0].get("disabled") and supervisor.node_status(states) == "starting"
+    assert "ready_at" not in states[0] and "process" not in states[0]
+
+
+def test_ready_time_is_recorded_once(tmp_path, monkeypatch):
+    worker = child(0)
+    opener = Mock()
+    opener.open.side_effect = lambda *args, **kwargs: io.StringIO('{"status":"ready"}')
+    for now in (50.0, 60.0):
+        monkeypatch.setattr(supervisor.time, "monotonic", lambda: now)
+        supervisor.refresh_workers([worker], Mock(), opener, tmp_path)
+    assert worker["ready_seen"] and worker["ready_at"] == 50.0
+
+
 def test_all_exhausted_workers_release_node(tmp_path):
-    children = [child(index, attempt=2, dead=True) for index in range(4)]
+    children = [child(index, attempt=2, dead=True, failures=2) for index in range(4)]
     start, opener = Mock(), Mock()
     states = supervisor.refresh_workers(children, start, opener, tmp_path)
     assert supervisor.node_status(states) == "failed"
@@ -66,16 +91,21 @@ def test_full_local_log_volume_disables_only_the_worker_being_restarted(tmp_path
 
 @pytest.mark.parametrize("was_ready", [False, True])
 def test_startup_deadline_never_kills_previously_ready_worker(tmp_path, monkeypatch, was_ready):
-    worker = child(0, attempt=2)
+    worker = child(0, attempt=2, failures=2)
     worker.update(started=0, ready_seen=was_ready)
     monkeypatch.setattr(supervisor.time, "monotonic", lambda: 2000)
-    stop = Mock()
+    stop = Mock(side_effect=lambda stopped: stopped["process"].poll.configure_mock(return_value=-15))
     monkeypatch.setattr(supervisor, "stop_child", stop)
     opener = Mock()
     opener.open.side_effect = OSError("transient health timeout")
-    states = supervisor.refresh_workers([worker], Mock(), opener, tmp_path)
+    start = Mock()
+    states = supervisor.refresh_workers([worker], start, opener, tmp_path)
     assert stop.call_count == (0 if was_ready else 1)
+    assert supervisor.node_status(states) == ("degraded" if was_ready else "starting")
+    # The next pass counts the timed-out start; it was the third failed start in a row.
+    states = supervisor.refresh_workers([worker], start, opener, tmp_path)
     assert supervisor.node_status(states) == ("degraded" if was_ready else "failed")
+    start.assert_not_called()
 
 
 def test_additional_allocation_preserves_original_registry_and_worker_ports(tmp_path):
@@ -114,7 +144,8 @@ def test_shared_storage_failure_preserves_workers_and_recovers(tmp_path, monkeyp
     monkeypatch.setattr(supervisor.socket, "gethostname", lambda: "gpu-node")
     monkeypatch.setattr(supervisor.socket, "gethostbyname", lambda _: "10.0.0.2")
     monkeypatch.setattr(supervisor.os, "sched_getaffinity", lambda _: set(range(64)))
-    monkeypatch.setattr(supervisor.subprocess, "check_output", lambda *args, **kwargs: f"NVIDIA {gpu_type}\n" * device_count)
+    monkeypatch.setattr(supervisor.subprocess, "check_output", lambda *args, **kwargs: "".join(
+        f"{index}, GPU-{index:08d}-test, NVIDIA {gpu_type}\n" for index in range(device_count)))
     popen = Mock(side_effect=lambda *args, **kwargs: Mock(pid=100, poll=Mock(return_value=None)))
     monkeypatch.setattr(supervisor.subprocess, "Popen", popen)
     stopped = Mock()
@@ -162,7 +193,8 @@ def test_shared_storage_failure_preserves_workers_and_recovers(tmp_path, monkeyp
         assigned.extend(devices)
         assert Path(command[command.index("--ready-file") + 1]).is_relative_to(local)
         assert Path(call.kwargs["stdout"].name).is_relative_to(local)
-    assert sorted(assigned) == list(map(str, range(device_count)))
+    # Workers get GPU UUIDs, which CUDA does not renumber when another GPU faults.
+    assert sorted(assigned) == [f"GPU-{index:08d}-test" for index in range(device_count)]
 
 
 @pytest.mark.parametrize("devices,family,size", [(["0", "0"], "H200", 2), (["0", "1"], "H100", 4),

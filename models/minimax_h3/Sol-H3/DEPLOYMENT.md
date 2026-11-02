@@ -235,6 +235,73 @@ ownership and active jobs. Removing an open log does not necessarily release its
 space. A deliberate archive migration needs backups, a read-only/drained cutover,
 and verification of old job IDs and hashes before retiring the previous copy.
 
+### Worker crashes, restarts, and the watchdog
+
+**Known crash.** H200 workers crash in attention after a process has seen about
+570 distinct prompt lengths (550–675). The error is either cuDNN SDPA
+(`mha_graph.execute(...).is_good()`) or the Sol CUTLASS kernel
+(`CUDA_LAUNCH_INVALID_CONFIG`). From Oct 29 to Nov 2 that took 15–59 hours per process. Each
+crash fails the worker's running and queued jobs (`worker_restarted`, or
+`worker_lost` after 600 s); callers regenerate with a new key. PyTorch's pool
+stays flat, so the likely cause is kernels loaded outside the pool for each new
+length on the GPU with the least free memory. The analysis and copied logs are in
+`deployment/stability-review-20261102/`.
+
+**Restart rule.** `serve_node.py` restarts a worker after every crash:
+- A crash after at least 30 minutes of readiness starts a fresh count.
+- A worker that fails three starts in a row is disabled; its siblings keep running.
+- If every worker on the node is disabled, the supervisor exits with status 1 and
+  the allocation ends. Slurm does not requeue it.
+
+Until Nov 2 the three starts counted over the allocation's whole life. That
+ended all four H200 allocations on Nov 2 between 09:51 and 13:41 UTC.
+
+**GPU selection.** Workers get their pair by UUID. After a GPU faulted on 0023,
+CUDA skipped it and renumbered every later GPU, while `nvidia-smi` indices did
+not change.
+
+**Serving memory cap (trial).** Submitting a node job with
+`H3_SERVING_MEMORY_FRACTION=0.95` changes how its workers use memory after warmup:
+- Each worker releases PyTorch's cached memory and caps the pool at 95% of the
+  GPU, about 132.8 GiB.
+- That is 3.5 GiB above the 129.3 GiB request peak.
+- It leaves about 5 GiB outside the pool for kernels, compared with 0.6–1.0 GiB
+  before.
+
+The cap must come after warmup. Loading needs more than serving, because about
+24 GB of weights are freed during the first warmup. On Nov 2 a cap set at launch
+(`PYTORCH_ALLOC_CONF=...,per_process_memory_fraction:0.95`) failed every worker in
+`module.to()`.
+
+0002 has run the trial since Nov 2. Extend it to other nodes only if 0002's
+workers pass about 600 distinct lengths with no out-of-memory failure and
+unchanged processing time.
+
+**Watchdog.** The watchdog is a backstop on the gateway host. `watchdog/` holds the
+code and units; the live copy is in `deployment/watchdog/`.
+- What it does: once an hour `h3-watchdog.timer` probes every worker. It restarts
+  a worker the supervisor has disabled, as an `srun --overlap` step in the same
+  job, but only when the worker's GPUs are healthy and idle. The restarted step
+  runs under `systemd --user` as `h3-worker-<node>-<port>`.
+- What it never does: stop a worker that answers, or submit or cancel Slurm jobs.
+- To keep it away from a worker, list the worker in `excluded_workers`.
+- Shared `/home`: `~/.config/systemd/user` is on shared `/home`, so the unit has
+  `ConditionHost=` and the script takes a host-local lock in `/run/user/<uid>`.
+  On Nov 2 a lock on shared storage, held by another host's copy of the timer,
+  silently blocked every run from 06:00 to 17:06.
+- Install, check and pause:
+
+  ```bash
+  cp watchdog/watchdog.py watchdog/run-worker.sh /home/jeff/sol-h3-h200/deployment/watchdog/
+  cp watchdog/h3-watchdog.{service,timer} ~/.config/systemd/user/
+  systemctl --user daemon-reload && systemctl --user enable --now h3-watchdog.timer
+  python3 deployment/watchdog/watchdog.py --dry-run   # report only; a healthy run ends with "summary:"
+  systemctl --user stop h3-watchdog.timer             # pause
+  ```
+
+Neither the supervisor nor the watchdog sends alerts. Check the watchdog log
+and node registries, not just the gateway's `workers_ready`.
+
 ## Parameterize the next fleet
 
 Record the supplied hostnames and addresses before submitting any job. Include
@@ -246,7 +313,8 @@ The following defaults are implemented; they do not select available nodes:
 |---|---|
 | `H3_GPU_TYPE` | `H200`; set `H100` explicitly for H100 nodes |
 | `H3_GPUS_PER_WORKER` | 2 on H200, 4 on H100; accepted values 2 or 4, divisible into the allocation |
-| `CUDA_VISIBLE_DEVICES` | Slurm's assigned GPUs; never replace with a node-wide list |
+| `CUDA_VISIBLE_DEVICES` | Slurm's assigned GPUs; never replace with a node-wide list. The supervisor passes each worker its pair's UUIDs |
+| `H3_SERVING_MEMORY_FRACTION` | Unset (off). A value such as `0.95` caps PyTorch's pool after warmup (see [Worker crashes](#worker-crashes-restarts-and-the-watchdog)) |
 | `H3_BASE_PORT` | 18080; one consecutive port per worker |
 | `H3_DEPLOY_ROOT` | `/home/jeff/sol-h3-h200`; code, token, registry on the worker's cluster |
 | `H3_LOCAL_ROOT` | `/raid/jeff`; override after checking the destination mount |
@@ -288,9 +356,9 @@ ownership or availability.
 
 1. Inspect the actual gateway endpoint pin, service/socket status, pool settings,
    pending jobs, and deployment inventory. Snapshot them under a new dated
-   `deployment/redeploy-.../` directory. The Oct 26 stop evidence is in
-   `deployment/stop-20261026/`, and `deployment/jobs.json` records `desired_state:
-   stopped`. It is an operator inventory, not an automatic restart controller.
+   `deployment/redeploy-.../` directory. `deployment/jobs.json` records the
+   desired state and the current job IDs. It is an operator inventory, not an
+   automatic restart controller.
 2. Allocate only the supplied, scheduler-available GPUs. Reserve nonoverlapping
    internal ports and outputs; verify the GPU family, CPU/RAM capacity, and
    writable storage. Add prospective worker origins to `excluded_workers` before

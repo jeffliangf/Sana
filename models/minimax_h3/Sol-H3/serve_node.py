@@ -50,26 +50,38 @@ def stop_child(child):
         process.wait()
 
 
+# A worker that crashes after serving for a while is restarted without limit. Only a worker that fails
+# MAX_FAILED_STARTS times in a row, each time before HEALTHY_RUN_SECONDS of readiness, is quarantined.
+# H200 workers crash after roughly 570 distinct prompt lengths (15-59 h); a lifetime limit of three
+# attempts ended every allocation on 2026-11-02.
+HEALTHY_RUN_SECONDS = 30 * 60
+MAX_FAILED_STARTS = 3
+
+
 def refresh_workers(children, start, opener, registry):
-    """Quarantine an exhausted worker while leaving healthy GPU pairs running."""
+    """Restart crashed workers and quarantine only a worker that keeps failing, leaving healthy pairs running."""
     states = []
     for index, child in enumerate(children):
-        if child["process"].poll() is not None:
+        if child["process"].poll() is not None and not child.get("disabled"):
             with suppress(OSError):
                 (registry / f"{child['port']}.ready.json").unlink(missing_ok=True)
-            if child["attempt"] >= 2:
-                if not child.get("disabled"):
-                    quiet_print(f"DISABLED worker={index} after three failures; see {child['log']}")
+            ready_at = child.get("ready_at")
+            served = ready_at is not None and time.monotonic() - ready_at >= HEALTHY_RUN_SECONDS
+            child["failures"] = failures = 1 if served else child.get("failures", 0) + 1
+            if failures >= MAX_FAILED_STARTS:
+                quiet_print(f"DISABLED worker={index} after {failures} failed starts in a row; see {child['log']}")
                 child["disabled"] = True
-            elif not child.get("disabled"):
+            else:
                 try:
-                    children[index] = child = start(index, child["attempt"] + 1)
+                    # "attempt" numbers every start of this worker, so each start keeps its own log.
+                    children[index] = child = start(index, child["attempt"] + 1, failures)
                 except OSError as error:
                     child["disabled"] = True
                     child["restart_error"] = str(error)
                     quiet_print(f"RESTART_FAILED worker={index} error={error!r}; siblings remain running")
         if child.get("disabled"):
-            health = {"status": "failed", "error": child.get("restart_error", "worker exhausted three attempts")}
+            health = {"status": "failed",
+                      "error": child.get("restart_error", f"worker failed {MAX_FAILED_STARTS} starts in a row")}
         else:
             try:
                 with opener.open(child["endpoint"] + "/healthz", timeout=2) as response:
@@ -83,15 +95,17 @@ def refresh_workers(children, start, opener, registry):
                 health = {"status": "unreachable"}
             if health.get("status") == "ready":
                 child["ready_seen"] = True
+                if child.get("ready_at") is None:
+                    child["ready_at"] = time.monotonic()
             if not child["ready_seen"] and time.monotonic() - child["started"] > 1800:
                 quiet_print(f"STARTUP_TIMEOUT worker={index}; see {child['log']}")
                 stop_child(child)
                 with suppress(OSError):
                     (registry / f"{child['port']}.ready.json").unlink(missing_ok=True)
-                child["disabled"] = child["attempt"] >= 2
-                health = {"status": "failed" if child["disabled"] else "restarting",
-                          "error": "worker was not ready after 30 minutes"}
-        states.append({key: value for key, value in child.items() if key not in {"process", "started"}} | {"health": health})
+                # The next pass sees the stopped process and counts this failed start.
+                health = {"status": "restarting", "error": "worker was not ready after 30 minutes"}
+        states.append({key: value for key, value in child.items() if key not in {"process", "started", "ready_at"}}
+                      | {"health": health})
     return states
 
 
@@ -149,9 +163,17 @@ def main():
         raise ValueError(f"Expected at least 32 allocated logical CPUs, got {len(cpus)}")
     import fastapi
     import uvicorn
-    names = subprocess.check_output(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], text=True).splitlines()
-    if len(names) < len(devices) or any(gpu_type not in name for name in names):
+    inventory = [[field.strip() for field in line.split(",")] for line in subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=index,uuid,name", "--format=csv,noheader"], text=True).splitlines() if line.strip()]
+    if len(inventory) < len(devices) or any(len(row) != 3 or gpu_type not in row[2] for row in inventory):
         raise ValueError(f"The node allocation must contain {gpu_type} GPUs")
+    # Workers select GPUs by UUID. After a GPU faults, CUDA skips it and renumbers every later GPU, so a numeric
+    # CUDA_VISIBLE_DEVICES would put a restarted worker on the wrong pair (0023, 2026-11-01); nvidia-smi indices
+    # and UUIDs do not shift.
+    uuids = {index: uuid for index, uuid, _ in inventory}
+    if any(device not in uuids and not device.startswith("GPU-") for device in devices):
+        raise ValueError(f"Cannot resolve the UUIDs of GPUs {devices} from nvidia-smi {sorted(uuids)}")
+    visible = [[device if device.startswith("GPU-") else uuids[device] for device in group] for group in groups]
     quiet_print(json.dumps({"node": hostname, "address": address, "job_id": job_id, "cpus": cpus,
                       "gpu_type": gpu_type, "gpus_per_worker": group_size,
                       "devices": devices, "ports": ports, "registry": str(registry), "runtime": str(runtime),
@@ -167,7 +189,7 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
-    def start(index, attempt):
+    def start(index, attempt, failures=0):
         port = ports[index]
         group = groups[index]
         assigned_cpus = cpus[index * len(cpus) // workers:(index + 1) * len(cpus) // workers]
@@ -176,7 +198,7 @@ def main():
             ready_file.unlink(missing_ok=True)
         log_path = runtime / f"{job_id}-{port}-attempt{attempt}.log"
         log = log_path.open("a")
-        env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(group)}
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(visible[index])}
         checkpoints = Path(os.environ.get("H3_CHECKPOINT_ROOT", str(local / "sol-h3-checkpoints")))
         command = ["taskset", "--cpu-list", ",".join(map(str, assigned_cpus)),
                    str(Path(sys.executable).with_name("torchrun")), "--standalone", "--nnodes=1", f"--nproc_per_node={group_size}",
@@ -192,10 +214,11 @@ def main():
                                        start_new_session=True)
         finally:
             log.close()
-        quiet_print(f"START worker={index} port={port} GPUs={group} pid={process.pid} attempt={attempt}")
-        return {"process": process, "attempt": attempt, "started": time.monotonic(), "index": index,
-                "port": port, "gpus": group, "endpoint": f"http://{address}:{port}", "log": str(log_path),
-                "ready_seen": False}
+        quiet_print(f"START worker={index} port={port} GPUs={group} pid={process.pid} attempt={attempt} "
+                    f"failures_in_a_row={failures}")
+        return {"process": process, "attempt": attempt, "failures": failures, "started": time.monotonic(),
+                "index": index, "port": port, "gpus": group, "endpoint": f"http://{address}:{port}",
+                "log": str(log_path), "ready_seen": False, "ready_at": None}
 
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     states = []
@@ -210,7 +233,7 @@ def main():
                                                 "updated_at": time.time(), "status": status,
                                                 "workers": states})
             if status == "failed":
-                raise RuntimeError("All workers exhausted their retries; releasing node allocation")
+                raise RuntimeError(f"Every worker failed {MAX_FAILED_STARTS} starts in a row; releasing node allocation")
             for _ in range(10):
                 if stopping:
                     break

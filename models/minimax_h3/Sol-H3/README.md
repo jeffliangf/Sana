@@ -308,6 +308,24 @@ Then **16/16** requests through the gateway reached all sixteen workers, with
 matching checksums and the same key checks. Evidence is in
 `deployment/scale-0005-0006-0023-20261028/`.
 
+From Oct 29 to Nov 2 the H200 workers crashed 48 times in attention: 40 in cuDNN
+SDPA and 8 in the Sol CUTLASS kernel. Each crash came after the worker process
+had seen about 570 distinct prompt lengths (550–675), whether it had been up 15
+hours or 59. Each crash failed the job it was running. The supervisor then allowed
+only three starts per allocation, so on Nov 2 all four allocations ended between
+09:51 and 13:41 UTC. Of 69,750 accepted jobs, 76 failed (0.11%).
+
+`serve_node.py` now restarts every crash and pins GPU pairs by UUID. On Nov 1 a GPU
+fault on 0023 had made CUDA renumber its remaining GPUs. The fleet returned the
+same day as Slurm 3910 (0002) and 3904–3906 (0005, 0006, 0023), on the same ports
+and gateway URL, and passed validation:
+- **24/24** direct requests on 0005, 0006 and 0023;
+- **8/8** on 0002;
+- **16/16** through the gateway, reaching every worker.
+
+0002 also trials `H3_SERVING_MEMORY_FRACTION=0.95` (see `DEPLOYMENT.md`). Evidence
+is in `deployment/stability-review-20261102/` and `deployment/redeploy-20261102/`.
+
 Shared storage remains necessary for gateway job persistence and video archives.
 If registry publication stays unavailable for more than 120 seconds, automatic
 discovery stops routing new work to those stale entries until publication resumes.
@@ -369,10 +387,11 @@ counters when reporting latency. `/healthz` exposes `gate_failure_policy`.
 worker per H200 GPU pair (2/4/6/8 allocated GPUs), consecutive ports
 starting at `H3_BASE_PORT` (default 18080), eight CPU encoder threads per
 worker, and separate CPU affinities. They bind to the node's internal IP and
-supervise each process group with up to two restarts. An exhausted worker is
-disabled while healthy siblings continue; the node registry reports `degraded`.
-If every worker exhausts its retries, the supervisor exits and releases the
-allocation. The launcher defaults to
+pin each worker to its GPU pair by UUID. The supervisor restarts a crashed
+worker every time. A crash after at least 30 minutes of readiness starts a fresh
+count; a worker that fails three starts in a row is disabled while healthy
+siblings continue, and the node registry reports `degraded`. If every worker is
+disabled, the supervisor exits and releases the allocation. The launcher defaults to
 `/home/jeff/sol-h3-h200` for shared code/registry and `/raid/jeff` for environments,
 checkpoints, caches, and outputs. It expects a private `deployment/token` and can
 initialize a fresh node from a checksummed `deployment/staging` snapshot. The
