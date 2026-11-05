@@ -5,25 +5,22 @@ FastH3 adapter** service. It covers `serve.py`, `serve_node.py`, `gateway.py`, a
 the launchers in this directory. It does not use the separate SGLang deployment
 instructions at the repository root.
 
-**State on 2026-11-05.** No production workers are running and the gateway still
-runs the 2026-10-28 code.
-- All eight H200 allocations (Slurm 3904–3906 and 3910–3914) were cancelled on
-  2026-11-04 at 22:57 UTC; evidence is in `deployment/stop-32-workers-20261104T225735Z/`.
-- The gateway's `pool.json` is `{"workers": []}`: paused, so new submissions get 503
-  while completed jobs stay downloadable. `deployment/jobs.json` lists no allocations
-  (`desired_state: stopped`).
-- On 2026-11-05 stale configuration (old pool entries, inventory, stopped registries,
-  watchdog backups) and the first deployment's files moved to
-  `deployment/archive-20261105-stale/`.
-- The gateway code was installed on 2026-10-28: caller job IDs, `error_code`,
-  `video_sha256`, and the storage hardening.
-- The code in this directory adds the SGLang request form, the round-based VAE
-  decode, and the H200 serving memory cap by default. It passed validation on eight
-  test workers behind a separate test gateway on 2026-11-05
-  ([README](README.md#validation-of-the-sglang-request-form)) and is not yet deployed.
-- Separate `h3-base-fl2va` allocations from another project run on 0002, 0005, 0006,
-  and 0023. Since 2026-11-05 they hold all eight GPUs on each of those nodes. They are
-  not part of this service; leave them alone.
+**State on 2026-11-05.** Sixteen two-GPU H200 workers serve both request forms
+through the gateway. The gateway and the workers run the code in this directory
+(commit `3718c71`).
+- Slurm 3949–3952 hold all eight GPUs on 0003, 0035, 0048, and 0067, with four
+  workers each on ports 18080–18083. They were admitted at 02:40 UTC after
+  validation; evidence is in `deployment/rollout-api-v2-20261105/`.
+  `deployment/jobs.json` lists them (`desired_state: running`).
+- Workers cap PyTorch's pool at 95% of the GPU after warmup (132.8 GiB), the H200
+  default.
+- `pool.json` is `{"excluded_workers": []}`: registry discovery, nothing excluded.
+- The watchdog timer runs hourly for these four nodes.
+- The previous fleet, 32 workers on eight nodes, was stopped on 2026-11-04 at
+  22:57 UTC (`deployment/stop-32-workers-20261104T225735Z/`). Its stale
+  configuration is in `deployment/archive-20261105-stale/`.
+- Separate `h3-base-fl2va` allocations from another project hold all eight GPUs on
+  0002, 0005, 0006, and 0023. They are not part of this service; leave them alone.
 - A two-worker H100 launch on GMI node `gmicloud-loki-gpu-004` (Slurm 3435) failed
   while loading the model. Every rank holds the whole pipeline, about 129 GiB, and an
   H100 has 80 GB (see [H100 workers](#h100-workers-on-another-cluster)).
@@ -57,7 +54,9 @@ gateway onto a GPU Slurm allocation.**
 address drift. Ordinary worker scaling requires neither running that installer
 nor restarting the gateway. Updating gateway code requires a service restart;
 keeping the socket open preserves the address but does not guarantee that an
-in-flight HTTP request survives a process restart.
+in-flight HTTP request survives a process restart. The new process reads every job
+record before it answers. With 175,000 records on 2026-11-05 that took 35 minutes,
+so restart only when the API can be unavailable that long.
 
 Clients outside the private network use their own SSH tunnel, as described in
 [the access guide](README.md#access-the-deployed-h200-service). Cluster access
@@ -335,9 +334,13 @@ code and units; the live copy is in `deployment/watchdog/`.
   runs under `systemd --user` as `h3-worker-<node>-<port>`.
 - What it never does: stop a worker that answers, or submit or cancel Slurm jobs.
 - To keep it away from a worker, list the worker in `excluded_workers`.
-- New nodes: add the node to `NODES` in `watchdog.py` and to the node pattern in
-  `run-worker.sh`; otherwise the watchdog ignores it. The node's job must be
-  named `h3-api-<node>-p18080`.
+- Nodes: `NODES` in `watchdog.py` and the node pattern in `run-worker.sh` list the
+  fleet's nodes (0003, 0035, 0048, and 0067 since 2026-11-05). The watchdog ignores
+  any other node. Each node's job must be named `h3-api-<node>-p18080`.
+- Restarted workers: `run-worker.sh` starts a worker with the same environment and
+  arguments as `serve_node.py`, including `H3_SERVING_MEMORY_FRACTION=0.95`. After
+  changing either file, compare them with `env_check.py` in
+  `deployment/rollout-api-v2-20261105/`.
 - Shared `/home`: `~/.config/systemd/user` is on shared `/home`, so the unit has
   `ConditionHost=` and the script takes a host-local lock in `/run/user/<uid>`.
   On Nov 2 a lock on shared storage, held by another host's copy of the timer,
@@ -464,6 +467,8 @@ ownership or availability.
 
    Validate four forwards, dimensions/FPS/audio, downloaded bytes/hashes, fallback
    counters, and no unexpected process restarts. Record timings after warmup.
+   `validate.py` in `deployment/rollout-api-v2-20261105/` runs these checks
+   (`workers` before admission, `gateway` after).
    For a change to the request contract or the decode, first rerun the test
    phases (`driver.py` in `deployment/api-v2-validation-20261105/`) on test workers
    behind a test gateway. H100 validation must include concurrent workers on the same node.

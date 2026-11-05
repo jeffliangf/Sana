@@ -34,16 +34,12 @@ image-to-video with stereo audio at 24 fps, in either request form:
 - The SGLang MiniMax-H3 form: `t2va` or `fl2va`, six aspect ratios or the first
   frame's own, 124–345 frames.
 
-**State on 2026-11-05.** The production workers are stopped and the gateway still
-runs the code installed on 2026-10-28.
-- All eight H200 allocations were cancelled on 2026-11-04 at 22:57 UTC.
-- The gateway's pool is paused (`"workers": []`), so new submissions get 503 while
-  completed jobs stay downloadable.
-- The code in this directory adds the SGLang request form, the round-based VAE
-  decode, and the H200 serving memory cap. It passed the validation below and is
-  not deployed yet.
-
-Check `/healthz` for live capacity.
+**State on 2026-11-05.** Since 02:40 UTC, 16 two-GPU H200 workers on 0003, 0035,
+0048, and 0067 (Slurm 3949–3952) have served both request forms through the
+gateway, with the 0.95 serving cap. The gateway and workers run the code in this
+directory. The rollout passed 64 direct and 16 gateway validation jobs, covering
+every worker, both tasks, and 124–345 frames
+(`deployment/rollout-api-v2-20261105/`). Check `/healthz` for live capacity.
 
 ### Access the deployed H200 service
 
@@ -114,7 +110,9 @@ User lingering keeps the service running after SSH logout and starts it at boot.
 The socket keeps the same listener across service restarts. The deployment script
 pins the address in `gateway/endpoint.json` and refuses an accidental address or
 port change on later updates. Update gateway code, then run
-`systemctl --user restart h3-gateway.service`; GPU workers continue running.
+`systemctl --user restart h3-gateway.service`; GPU workers continue running. The
+gateway answers again only after reading every job record: 35 minutes with 175,000
+records on 2026-11-05.
 This is one gateway host, so a host or network outage can still interrupt access.
 
 The gateway reads `deployment/*/node.json` and probes workers every two seconds.
@@ -302,6 +300,7 @@ Evidence is in `/home/jeff/sol-h3-h200/deployment/` on the cluster unless noted.
 | 2026-11-03 | 0003 and 0035 added: 24 workers | `scale-0003-0035-20261103/` |
 | 2026-11-04 | 0048 and 0067 added: 32 workers. Fleet stopped at 22:57 UTC | `scale-0048-0067-20261104/`, `stop-32-workers-20261104T225735Z/` |
 | 2026-11-05 | SGLang request form, round-based VAE decode, and the H200 memory cap by default, validated on test workers. Stale configuration archived | `api-v2-validation-20261105/`, `archive-20261105-stale/` |
+| 2026-11-05 | That code deployed: gateway updated in place, 16 workers on 0003, 0035, 0048, 0067. The watchdog restarts workers with the cap | `rollout-api-v2-20261105/` |
 
 ## Validation
 

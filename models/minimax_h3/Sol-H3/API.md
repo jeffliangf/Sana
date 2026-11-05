@@ -265,8 +265,8 @@ flowchart TD
 
 ## Example client
 
-This standard-library client ran against the 2026-11-05 test gateway for both a
-text-to-video and a first-frame request.
+This standard-library client ran against the production gateway on 2026-11-05 for
+both a text-to-video and a first-frame request.
 
 ```python
 """Generate one H3 video through the gateway: submit with a key, poll, download, verify."""
