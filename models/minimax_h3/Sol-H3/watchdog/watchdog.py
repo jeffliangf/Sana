@@ -41,8 +41,7 @@ GATEWAY_HOST = "VM-187-fukushimadc"
 ROOT = Path("/home/jeff/sol-h3-h200")
 HERE = Path(__file__).resolve().parent
 POOL = ROOT / "gateway/pool.json"
-NODES = {"0002": "10.2.201.2", "0003": "10.2.201.3", "0005": "10.2.201.5", "0006": "10.2.201.6",
-         "0023": "10.2.201.23", "0035": "10.2.201.35", "0048": "10.2.201.48", "0067": "10.2.201.67"}
+NODES = {"0003": "10.2.201.3", "0035": "10.2.201.35", "0048": "10.2.201.48", "0067": "10.2.201.67"}
 PORTS = (18080, 18081, 18082, 18083)
 CRASH_LOOP_COOLDOWN = 6 * 3600
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
