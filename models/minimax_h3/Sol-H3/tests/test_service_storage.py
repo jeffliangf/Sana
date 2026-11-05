@@ -117,7 +117,7 @@ def test_output_failure_is_broadcast_to_all_ranks_and_next_output_works(tmp_path
                     raise RuntimeError("encoder wrapped filesystem error") from error
             path.write_bytes(b"mp4")
         media = SimpleNamespace(save=save) if rank == 0 else None
-        call = lambda: serve.publish_media(media, tmp_path / "video.mp4", 5, 8, lambda *_: {"audio": True},
+        call = lambda: serve.publish_media(media, tmp_path / "video.mp4", serve.legacy_output(5), 8, lambda *_: {"audio": True},
                                            rank=rank, broadcast=broadcast)
         if failing:
             with pytest.raises(serve.OutputStorageError):
@@ -135,7 +135,7 @@ def test_nonstorage_encoder_failure_remains_fatal(tmp_path):
     media = SimpleNamespace(save=Mock(side_effect=RuntimeError("CUDA failure")))
     broadcast = Mock()
     with pytest.raises(RuntimeError, match="CUDA"):
-        serve.publish_media(media, tmp_path / "video.mp4", 5, 8, Mock(), rank=0, broadcast=broadcast)
+        serve.publish_media(media, tmp_path / "video.mp4", serve.legacy_output(5), 8, Mock(), rank=0, broadcast=broadcast)
     broadcast.assert_not_called()
 
 
@@ -154,9 +154,9 @@ def test_staging_capacity_includes_only_missing_artifacts(tmp_path):
     assert required_staging_bytes(venv, checkpoints, stage) == 0
 
 
-def test_legacy_slurm_entry_launches_prepared_h100_paths_without_staging(tmp_path):
-    # Slurm copies the submitted script to its spool. The compatibility entry
-    # must find the deployment through H3_DEPLOY_ROOT, not its own directory.
+def test_spooled_launcher_runs_prepared_h100_paths_without_staging(tmp_path):
+    # Slurm copies the submitted script to its spool. deploy_node.sh must find
+    # the deployment through H3_DEPLOY_ROOT, not its own directory.
     source = Path(__file__).resolve().parents[1]
     root, local = tmp_path / "shared", tmp_path / "node-local"
     code = root / "Sol-H3"
@@ -164,7 +164,7 @@ def test_legacy_slurm_entry_launches_prepared_h100_paths_without_staging(tmp_pat
     for name in ("deploy_node.sh", "storage_preflight.py", "service_storage.py"):
         shutil.copy2(source / name, code / name)
     spool = tmp_path / "slurm_script"
-    shutil.copy2(source / "deploy_h200_node.sh", spool)
+    shutil.copy2(source / "deploy_node.sh", spool)
     venv = local / "prepared-env"
     (venv / "bin").mkdir(parents=True)
     python = venv / "bin/python"

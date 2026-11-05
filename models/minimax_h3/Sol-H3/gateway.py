@@ -19,9 +19,14 @@ from uuid import UUID, uuid4
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
 
-from serve import GenerateRequest, atomic_json, caller_job_id
+from h3_request import (API_VERSION, MAX_BODY_BYTES, GenerateRequest, accepts, capabilities, same_request,
+                        sglang_status)
+from serve import atomic_json, caller_job_id, read_request_body
 from service_storage import check_space, storage_probe
+
+__all__ = ["Gateway", "GenerateRequest", "create_app"]
 
 LOG = logging.getLogger("h3.gateway")
 
@@ -186,8 +191,13 @@ class Gateway:
     def health(self):
         ready = self.ready if time.time() - self.updated_at < 15 else {}
         storage_ready = not self.storage_error and not self.unpersisted
+        # Advertise the SGLang-form contract only while upgraded workers can serve it.
+        upgraded = [h["api"] for h in ready.values()
+                    if isinstance(h.get("api"), dict) and h["api"].get("version", 0) >= API_VERSION]
+        api = ({**capabilities(max(a["num_frames"]["max"] for a in upgraded)), "workers": len(upgraded)}
+               if upgraded else {"version": 1, "tasks": ["t2va"], "workers": 0})
         return {"status": "storage_paused" if not storage_ready else ("ready" if ready else "unavailable"),
-                "service": "Sol-H3 gateway", "idempotency_key": True,
+                "service": "Sol-H3 gateway", "idempotency_key": True, "api": api,
                 "workers_ready": len(ready), "workers_discovered": len(self.discovered),
                 "gpus": sum(value.get("gpus", 0) for value in ready.values()),
                 "queued": sum(value.get("queued", 0) for value in ready.values()),
@@ -257,17 +267,19 @@ class Gateway:
         The Idempotency-Key is the job ID on both the gateway and the worker, so
         a repeated POST finds the original job without a separate lookup table.
         Requests without a key get a random ID through the same path.
+        ``body`` is a parsed request (or a legacy GenerateRequest).
         """
+        parsed = body if hasattr(body, "identity") else read_request_body(body.model_dump())
         identifier = key or str(uuid4())
         while identifier in self.claims:  # Concurrent repeats share one dispatch.
             await self.claims[identifier].wait()
         self.claims[identifier] = asyncio.Event()
         try:
-            request = body.model_dump()
+            request = parsed.identity
             record = self.find(identifier) or await self.recover(identifier, request)
             if record is None:
-                return await self.dispatch(identifier, request)
-            if any(record["job"].get(name) != value for name, value in request.items()):
+                return await self.dispatch(identifier, parsed)
+            if not same_request(record["job"], request):
                 raise HTTPException(409, "Idempotency-Key was already used with different inputs")
             return self.public(record)
         finally:
@@ -310,7 +322,7 @@ class Gateway:
         self.persist(record)  # On failure, maintenance keeps retrying the write.
         return record
 
-    async def dispatch(self, identifier, request):
+    async def dispatch(self, identifier, parsed):
         if not self.storage_available():
             raise HTTPException(507, "Gateway storage unavailable; request was not accepted")
         if time.time() - self.updated_at > 5:
@@ -318,12 +330,18 @@ class Gateway:
         tried = set()
         rejections = set()
         attempt_path = self.root / "uncertain" / f"{identifier}.json"
+        # The journal keeps the request identity (keyframes by SHA-256), never the base64 payload.
+        request = parsed.identity
         while True:
             async with self.selection:
-                candidates = [url for url, h in self.ready.items() if url not in tried
+                capable = {url: h for url, h in self.ready.items() if accepts(h.get("api"), parsed)}
+                candidates = [url for url, h in capable.items() if url not in tried
                               and h.get("queued", 0) < h["queue_capacity"]]
                 if not candidates:
-                    code = next(iter(rejections)) if len(rejections) == 1 else (429 if self.ready else 503)
+                    if self.ready and not capable:
+                        raise HTTPException(503, f"No ready worker accepts {parsed.task} with {parsed.num_frames} "
+                                                 "frames yet", headers={"Retry-After": "5"})
+                    code = next(iter(rejections)) if len(rejections) == 1 else (429 if capable else 503)
                     raise HTTPException(code, "No worker currently available", headers={"Retry-After": "5"})
 
                 def load(url):
@@ -345,8 +363,9 @@ class Gateway:
                     self.storage_error = str(error)
                     raise HTTPException(507, "Gateway could not journal request; no worker accepted it") from error
                 try:
-                    response = await self.client.post(endpoint + "/v1/videos", json=request, timeout=30, headers={
-                        "Authorization": f"Bearer {self.token}", "Idempotency-Key": identifier})
+                    response = await self.client.post(endpoint + "/v1/videos", json=parsed.payload, timeout=60,
+                                                      headers={"Authorization": f"Bearer {self.token}",
+                                                               "Idempotency-Key": identifier})
                 except (httpx.ConnectError, httpx.ConnectTimeout):
                     response = None  # The request never reached this worker.
                 if response is None or response.status_code in {429, 503, 507}:
@@ -357,7 +376,11 @@ class Gateway:
                 if 400 <= response.status_code < 500:
                     with suppress(OSError):
                         attempt_path.unlink(missing_ok=True)
-                    raise HTTPException(response.status_code, "Worker rejected request")
+                    try:
+                        detail = response.json().get("detail") or "Worker rejected request"
+                    except (ValueError, AttributeError):
+                        detail = "Worker rejected request"
+                    raise HTTPException(response.status_code, detail)
                 response.raise_for_status()
                 value = response.json()
                 if value["id"] != identifier or value.get("status") not in {"queued", "running", "succeeded", "failed"}:
@@ -500,7 +523,7 @@ def create_app(gateway):
                 return JSONResponse({"detail": "Invalid Content-Length"}, status_code=400)
             if length < 0:
                 return JSONResponse({"detail": "Content-Length required"}, status_code=411)
-            if length > 32768:
+            if length > MAX_BODY_BYTES:
                 return JSONResponse({"detail": "Request body too large"}, status_code=413)
         return await call_next(request)
 
@@ -510,15 +533,22 @@ def create_app(gateway):
         return JSONResponse(value, status_code=200 if value["status"] == "ready" else 503)
 
     @app.post("/v1/videos", status_code=202, dependencies=[Depends(authorize)])
-    async def submit(body: GenerateRequest, idempotency_key: str | None = Header(default=None)):
-        return await gateway.submit(body, caller_job_id(idempotency_key))
+    async def submit(request: Request, idempotency_key: str | None = Header(default=None)):
+        key = caller_job_id(idempotency_key)
+        try:
+            payload = await request.json()
+        except ValueError:
+            raise HTTPException(422, [{"loc": ["body"], "msg": "the request body must be valid JSON",
+                                       "type": "json_invalid"}]) from None
+        # Base64 keyframes are decoded and hashed here; keep that off the event loop.
+        parsed = await run_in_threadpool(read_request_body, payload)
+        return await gateway.submit(parsed, key)
 
     @app.get("/v1/jobs/{identifier}", dependencies=[Depends(authorize)])
     async def status(identifier: str):
         return gateway.public(gateway.load(identifier))
 
-    @app.get("/v1/jobs/{identifier}/video", dependencies=[Depends(authorize)])
-    async def video(identifier: str):
+    def video_file(identifier):
         record = gateway.load(identifier)
         if not record.get("video_cached") or record.get("persistence_pending"):
             raise HTTPException(409, "Video is not ready")
@@ -526,6 +556,20 @@ def create_app(gateway):
         if not path.is_file():
             raise HTTPException(410, "Video was removed")
         return FileResponse(path, media_type="video/mp4", filename=path.name)
+
+    @app.get("/v1/jobs/{identifier}/video", dependencies=[Depends(authorize)])
+    async def video(identifier: str):
+        return video_file(identifier)
+
+    # SGLang-compatible routes: the same job, with SGLang's "completed" for a finished video.
+    @app.get("/v1/videos/{identifier}", dependencies=[Depends(authorize)])
+    async def sglang_status_route(identifier: str):
+        value = gateway.public(gateway.load(identifier))
+        return {**value, "status": sglang_status(value["status"])}
+
+    @app.get("/v1/videos/{identifier}/content", dependencies=[Depends(authorize)])
+    async def sglang_content(identifier: str):
+        return video_file(identifier)
 
     return app
 

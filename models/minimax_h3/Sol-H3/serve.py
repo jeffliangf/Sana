@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""One resident, authenticated T2V worker per torchrun process group.
+"""One resident, authenticated T2V and first-frame I2V worker per torchrun process group.
+
+Requests use the original {prompt, duration, seed} form or the SGLang MiniMax-H3 form (see h3_request.py).
 
 Each worker owns its bounded request queue and output directory. All CUDA work
 runs on the main thread; rank zero's HTTP thread only validates and queues work.
@@ -19,28 +21,31 @@ import secrets
 import socket
 import threading
 import time
-from typing import Literal
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.concurrency import run_in_threadpool
 
-from service_storage import atomic_json, check_space, quiet_print, storage_probe
+from h3_request import (LEGACY_NUM_FRAMES, MAX_BODY_BYTES, MAX_NUM_FRAMES, VALID_NUM_FRAMES, GenerateRequest,
+                        RequestError, capabilities, inspect_image, output_profile, parse_request,
+                        resolve_canvas_size, same_request)
+from service_storage import atomic_bytes, atomic_json, check_space, quiet_print, storage_probe
+
+__all__ = ["GenerateRequest", "WorkerState", "create_app", "caller_job_id", "atomic_json"]
+LEGACY_CANVAS = resolve_canvas_size(16, 9)
 
 
-class GenerateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    prompt: str = Field(min_length=1, max_length=8000)
-    duration: Literal[5, 10] = 5
-    seed: int = Field(default=42, ge=0, le=2**63 - 1)
+def legacy_output(duration):
+    return output_profile(LEGACY_NUM_FRAMES[duration], LEGACY_CANVAS)
 
-    @field_validator("prompt")
-    @classmethod
-    def nonempty_prompt(cls, value):
-        if not value.strip():
-            raise ValueError("prompt must contain non-whitespace text")
-        return value.strip()
+
+def read_request_body(payload):
+    """Parse a decoded JSON body, mapping contract violations to HTTP errors."""
+    try:
+        return parse_request(payload)
+    except RequestError as error:
+        raise HTTPException(error.status_code, error.detail) from None
 
 
 def caller_job_id(value):
@@ -57,11 +62,12 @@ class OutputStorageError(OSError):
     """Rank-zero output I/O failed after all ranks finished inference."""
 
 
-def publish_media(media, path, duration, encoder_threads, inspect_media, *, rank, broadcast):
+def publish_media(media, path, expected, encoder_threads, inspect_media, *, rank, broadcast):
     """Tell every rank about output-storage failure before any GPU barrier.
 
     Encoder exceptions can wrap an OSError. Only known filesystem errors are
     recoverable here; CUDA, numerical, and malformed-media errors remain fatal.
+    ``expected`` is the job's output profile: width, height, and duration_seconds.
     """
     outcome = [None]
     profile = None
@@ -69,7 +75,7 @@ def publish_media(media, path, duration, encoder_threads, inspect_media, *, rank
         temporary = path.with_name(f".{path.stem}.partial.mp4")
         try:
             media.save(temporary, encoder_threads=encoder_threads)
-            profile = inspect_media(temporary, duration)
+            profile = inspect_media(temporary, expected["duration_seconds"], expected["width"], expected["height"])
             with temporary.open("rb") as source:
                 os.fsync(source.fileno())
                 size = os.fstat(source.fileno()).st_size
@@ -95,7 +101,7 @@ def publish_media(media, path, duration, encoder_threads, inspect_media, *, rank
 
 
 class WorkerState:
-    def __init__(self, output_dir, *, capacity=8, min_free_gib=20, metadata=None):
+    def __init__(self, output_dir, *, capacity=8, min_free_gib=20, metadata=None, max_num_frames=MAX_NUM_FRAMES):
         self.root = Path(output_dir)
         self.root.mkdir(parents=True, exist_ok=True)
         self.pending = queue.Queue(maxsize=capacity)
@@ -104,7 +110,8 @@ class WorkerState:
         self.active = None
         self.completed = 0
         self.min_free_bytes = min_free_gib * 2**30
-        self.metadata = metadata or {}
+        self.max_num_frames = max_num_frames
+        self.metadata = {**(metadata or {}), "api": capabilities(max_num_frames)}
         self.records = {}  # Accepted requests remain readable during an I/O outage.
         self.dirty = {}
         self.held = None
@@ -181,7 +188,28 @@ class WorkerState:
             self.persist(record)
             return record
 
+    def keyframe_path(self, job_id, index, kind):
+        return self.root / f"{job_id}.keyframe{index}.{kind}"
+
     def submit(self, request, job_id=None):
+        """Admit a validated request (a ParsedRequest, or a legacy GenerateRequest)."""
+        parsed = request if hasattr(request, "identity") else read_request_body(request.model_dump())
+        # Decode keyframes outside the lock: it is CPU work, and /healthz shares the lock.
+        sizes = []
+        for index, data in enumerate(parsed.images):
+            try:
+                info = inspect_image(data)
+            except ValueError as error:
+                raise HTTPException(422, [{"loc": ["body", "conditions", index, "uri"], "msg": str(error),
+                                           "type": "value_error"}]) from None
+            sizes.append((info["width"], info["height"]))
+        try:
+            output = parsed.resolve(sizes)
+        except RequestError as error:
+            raise HTTPException(error.status_code, error.detail) from None
+        if output["num_frames"] > self.max_num_frames:
+            raise HTTPException(422, f"This worker accepts at most {self.max_num_frames} frames")
+        identity = parsed.identity
         with self.lock:
             if job_id is not None:
                 # A repeated ID returns the original job in any state, so a lost
@@ -192,7 +220,7 @@ class WorkerState:
                     if error.status_code != 404:
                         raise
                 else:
-                    if any(record.get(name) != value for name, value in request.model_dump().items()):
+                    if not same_request(record, identity):
                         raise HTTPException(409, "Job ID was already used with different inputs")
                     return record
             if self.phase != "ready":
@@ -204,14 +232,26 @@ class WorkerState:
             job_id = job_id or str(uuid4())
             record = {
                 "id": job_id, "status": "queued", "created_at": time.time(),
-                **request.model_dump(),
+                **identity, "task": parsed.task, "output": output,
                 "status_url": f"/v1/jobs/{job_id}",
                 "video_url": f"/v1/jobs/{job_id}/video",
             }
+            if sizes:
+                record["condition_sizes"] = [{"width": width, "height": height} for width, height in sizes]
+            written = []
             try:
-                self.storage = check_space(self.root, self.min_free_bytes)
+                self.storage = check_space(self.root, self.min_free_bytes,
+                                           reserve_bytes=sum(len(data) for data in parsed.images))
+                # The keyframe must exist before the record that refers to it.
+                for index, (data, condition) in enumerate(zip(parsed.images, identity.get("conditions", ()))):
+                    path = self.keyframe_path(job_id, index, condition["format"])
+                    atomic_bytes(path, data)
+                    written.append(path)
                 atomic_json(self.record_path(job_id), record)
             except OSError as error:
+                for path in written:
+                    with suppress(OSError):
+                        path.unlink(missing_ok=True)
                 self.storage_error = str(error)
                 raise HTTPException(507, "Output storage unavailable; request was not accepted") from error
             self.records[job_id] = record
@@ -266,7 +306,7 @@ class WorkerState:
 def create_app(state, token):
     if len(token) < 32:
         raise ValueError("Use a random bearer token of at least 32 characters")
-    app = FastAPI(title="Sol-H3 T2V worker", docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="Sol-H3 worker", docs_url=None, redoc_url=None, openapi_url=None)
 
     def authorize(authorization: str = Header(default="")):
         if not secrets.compare_digest(authorization.encode(), f"Bearer {token}".encode()):
@@ -281,7 +321,7 @@ def create_app(state, token):
                 return JSONResponse({"detail": "Invalid Content-Length"}, status_code=400)
             if length < 0:
                 return JSONResponse({"detail": "Content-Length required"}, status_code=411)
-            if length > 32768:
+            if length > MAX_BODY_BYTES:
                 return JSONResponse({"detail": "Request body too large"}, status_code=413)
         return await call_next(request)
 
@@ -291,8 +331,16 @@ def create_app(state, token):
         return JSONResponse(status, status_code=200 if status["status"] == "ready" else 503)
 
     @app.post("/v1/videos", status_code=202, dependencies=[Depends(authorize)])
-    def submit(request: GenerateRequest, idempotency_key: str | None = Header(default=None)):
-        return state.submit(request, caller_job_id(idempotency_key))
+    async def submit(request: Request, idempotency_key: str | None = Header(default=None)):
+        job_id = caller_job_id(idempotency_key)
+        try:
+            payload = await request.json()
+        except ValueError:
+            raise HTTPException(422, [{"loc": ["body"], "msg": "the request body must be valid JSON",
+                                       "type": "json_invalid"}]) from None
+        # Decoding a base64 keyframe is CPU work; keep it off the event loop.
+        parsed = await run_in_threadpool(read_request_body, payload)
+        return await run_in_threadpool(state.submit, parsed, job_id)
 
     @app.get("/v1/jobs/{job_id}", dependencies=[Depends(authorize)])
     def status(job_id: str):
@@ -328,9 +376,13 @@ def parse_args(argv=None):
     parser.add_argument("--warmup-prompt-file", type=Path, required=True)
     parser.add_argument("--ready-file", type=Path)
     parser.add_argument("--expect-gpu", default="H200")
+    parser.add_argument("--max-num-frames", type=int, default=MAX_NUM_FRAMES,
+                        help="Largest output frame count this worker admits (a 17n+5 value, 124-345)")
     args = parser.parse_args(argv)
     if min(args.queue_capacity, args.encoder_threads, args.min_free_gib) < 1:
         parser.error("queue capacity, encoder threads, and free disk threshold must be positive")
+    if args.max_num_frames not in VALID_NUM_FRAMES:
+        parser.error(f"--max-num-frames must be one of {list(VALID_NUM_FRAMES)}")
     if not 1 <= args.port <= 65535:
         parser.error("invalid TCP port")
     return args
@@ -390,7 +442,8 @@ def main():
                                           "duration_seconds": [5, 10], "width": 1344, "height": 768,
                                           "fps": 24, "transformer_forwards": 4,
                                           "encoder_threads": args.encoder_threads,
-                                          "slurm_job_id": os.environ.get("SLURM_JOB_ID")})
+                                          "slurm_job_id": os.environ.get("SLURM_JOB_ID")},
+                                max_num_frames=args.max_num_frames)
             server = uvicorn.Server(uvicorn.Config(create_app(state, token), host=args.host, port=args.port,
                                                   access_log=False, log_level="info", limit_concurrency=64))
             server_thread = threading.Thread(target=server.run, name="http", daemon=True)
@@ -413,18 +466,29 @@ def main():
             if world_size > 1:
                 dist.broadcast_object_list(values, src=0, group=control)
 
-        def execute(prompt, duration, seed, path):
+        def job_from_record(record):
+            """What execute() needs from a queued record; legacy records carry only a duration."""
+            output = record.get("output") or legacy_output(record["duration"])
+            image = None
+            if record.get("conditions"):
+                condition = record["conditions"][0]
+                image = str(args.output_dir / f"{record['id']}.keyframe0.{condition['format']}")
+            return {"prompt": record["prompt"], "seed": record["seed"], "output": output, "image": image}
+
+        def execute(job, path):
             torch.cuda.reset_peak_memory_stats(device)
             forwards[0] = 0
             attention = engine.sparse_attention
             counters = ("sparse_calls", "dense_calls", "gate_fallback_calls", "gate_failures")
             before = {key: getattr(attention, key) for key in counters} if attention else {}
             started = time.perf_counter()
-            media = engine.generate(prompt, duration=duration, seed=seed)
+            expected = job["output"]
+            media = engine.generate(job["prompt"], num_frames=expected["num_frames"], height=expected["height"],
+                                    width=expected["width"], seed=job["seed"], image=job["image"])
             if forwards[0] != 4:
                 raise RuntimeError(f"Expected four transformer forwards, got {forwards[0]}")
             pipeline_s = media.elapsed_s if media is not None else None
-            output = publish_media(media, path, duration, args.encoder_threads, inspect_media,
+            output = publish_media(media, path, expected, args.encoder_threads, inspect_media,
                                    rank=rank, broadcast=broadcast)
             if world_size > 1:
                 dist.barrier()
@@ -459,7 +523,8 @@ def main():
                         time.sleep(5)
                         continue
                     try:
-                        result = execute(prompt, duration, 42, path)
+                        result = execute({"prompt": prompt, "seed": 42, "output": legacy_output(duration),
+                                          "image": None}, path)
                         break
                     except OutputStorageError as error:
                         if rank == 0:
@@ -500,7 +565,7 @@ def main():
                 continue
             path = args.output_dir / f"{command['id']}.mp4"
             try:
-                result = execute(command["prompt"], command["duration"], command["seed"], path)
+                result = execute(job_from_record(command), path)
             except OutputStorageError as error:
                 if rank == 0:
                     with state.lock:

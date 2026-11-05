@@ -21,6 +21,9 @@ HEIGHT = 768
 FPS = 24
 INFERENCE_STEPS = 5  # Five scheduler points execute four DiT forwards.
 DURATION_FRAMES = {5: 124, 10: 243, 15: 362}
+# Every 17n+5 length the video VAE decodes between the 5- and 15-second presets.
+VALID_NUM_FRAMES = frozenset(range(DURATION_FRAMES[5], DURATION_FRAMES[15] + 1, 17))
+CANVAS_MULTIPLE = 32
 ATTENTION_BACKENDS = {"dense", "sol", "sol_bsa"}
 TASKS = {"t2v", "i2v", "ref2va"}
 REFERENCE_IMAGE_RESIZE_MODES = {"match", "diffusers"}
@@ -74,7 +77,7 @@ class GeneratedMedia:
     audio: Any
     audio_sample_rate: int | None
     elapsed_s: float
-    duration: int
+    duration: float
     seed: int
 
     def save_async(self, output_path: str | Path, *, encoder_threads: int = 36):
@@ -298,6 +301,11 @@ class MiniMaxH3Inference:
             compile_mode="default",
             encode_parallel=task == "ref2va",
         )
+        if os.environ.get("H3_LEAN_VIDEO_DECODE", "1") == "1":
+            # Same values, fewer full-length float32 copies after the decode (long clips on H200).
+            from . import video_decode
+
+            video_decode.install()
         self._adaln_checked = False
 
     @property
@@ -328,16 +336,32 @@ class MiniMaxH3Inference:
         self,
         prompt: str,
         *,
-        duration: int,
+        duration: int | None = None,
         seed: int = 0,
         image: str | Path | Image.Image | None = None,
         references: list[Any] | None = None,
+        num_frames: int | None = None,
+        height: int | None = None,
+        width: int | None = None,
     ) -> GeneratedMedia | None:
-        """Generate one video. ``references`` is required only for Ref2VA."""
+        """Generate one video. ``references`` is required only for Ref2VA.
+
+        Give either a preset ``duration`` (5, 10, or 15 seconds) or ``num_frames`` (a
+        17n+5 count from 124 to 362). ``height`` and ``width`` default to 768x1344; a
+        first-frame ``image`` is stretched onto that canvas, as in MiniMax-H3 itself.
+        """
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt must be a non-empty string")
-        if duration not in DURATION_FRAMES:
-            raise ValueError("duration must be 5, 10, or 15 seconds")
+        if num_frames is None:
+            if duration not in DURATION_FRAMES:
+                raise ValueError("duration must be 5, 10, or 15 seconds")
+            num_frames = DURATION_FRAMES[duration]
+        elif num_frames not in VALID_NUM_FRAMES:
+            raise ValueError(f"num_frames must be a 17n+5 count from 124 to 362, got {num_frames}")
+        height = HEIGHT if height is None else int(height)
+        width = WIDTH if width is None else int(width)
+        if min(height, width) < CANVAS_MULTIPLE or height % CANVAS_MULTIPLE or width % CANVAS_MULTIPLE:
+            raise ValueError(f"height and width must be positive multiples of 32, got {height}x{width}")
         if self.task == "ref2va":
             if image is not None:
                 raise ValueError("image is a first-frame I2V input; use references for Ref2VA")
@@ -355,9 +379,9 @@ class MiniMaxH3Inference:
 
         request = {
             "prompt": prompt.strip(),
-            "height": HEIGHT,
-            "width": WIDTH,
-            "num_frames": DURATION_FRAMES[duration],
+            "height": height,
+            "width": width,
+            "num_frames": num_frames,
             "num_inference_steps": INFERENCE_STEPS,
             "generator": torch.Generator().manual_seed(int(seed)),
             "output_type": "pt",
@@ -387,7 +411,7 @@ class MiniMaxH3Inference:
             audio=None if audio is None else audio[0],
             audio_sample_rate=_state_value(state, "sampling_rate"),
             elapsed_s=elapsed,
-            duration=duration,
+            duration=duration if duration is not None else num_frames / FPS,
             seed=int(seed),
         )
 

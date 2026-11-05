@@ -101,5 +101,62 @@ def test_disk_pressure_and_body_limit(tmp_path):
     state.phase = "ready"
     state.min_free_bytes = 2**70
     assert client.post("/v1/videos", json={"prompt": "test"}, headers=AUTH).status_code == 507
-    assert client.post("/v1/videos", content=b"x" * 32769, headers=AUTH).status_code == 413
+    assert client.post("/v1/videos", content=b"x" * (service.MAX_BODY_BYTES + 1), headers=AUTH).status_code == 413
+    assert client.post("/v1/videos", content=b"not json", headers=AUTH).status_code == 422
     assert not list(tmp_path.glob("*.json"))
+
+
+def keyframe_request(width=1024, height=1536, seed=0, **target):
+    from PIL import Image
+    import base64
+    import io
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), (seed % 255, 90, 160)).save(buffer, "PNG")
+    uri = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    body = {"task": "fl2va", "prompt": "The still frame starts to move.", "seed": 5,
+            "conditions": [{"type": "image", "uri": uri, "role": "keyframe", "frame_index": 0}]}
+    return {**body, "target": target} if target else body, buffer.getvalue()
+
+
+def test_sglang_form_t2va_and_first_frame_jobs(tmp_path):
+    import pytest
+    pytest.importorskip("PIL")
+    state, client = make_client(tmp_path, capacity=4)
+    state.phase = "ready"
+    health = client.get("/healthz").json()
+    assert health["api"]["tasks"] == ["t2va", "fl2va"] and health["api"]["num_frames"]["max"] == 345
+    t2va = client.post("/v1/videos", json={"task": "t2va", "prompt": "A fox.",
+                                           "target": {"aspect_ratio": "9:16", "duration_seconds": 14.375}},
+                       headers=AUTH)
+    assert t2va.status_code == 202
+    assert t2va.json()["output"] == {"width": 768, "height": 1344, "num_frames": 345, "fps": 24,
+                                     "duration_seconds": 14.375}
+    body, image = keyframe_request()
+    key = str(uuid4())
+    first = client.post("/v1/videos", json=body, headers={**AUTH, "Idempotency-Key": key})
+    assert first.status_code == 202, first.text
+    job = first.json()
+    assert job["task"] == "fl2va" and job["output"]["width"] == 768 and job["output"]["height"] == 1152
+    assert job["condition_sizes"] == [{"width": 1024, "height": 1536}]
+    assert "uri" not in json_text(job)
+    assert (tmp_path / f"{key}.keyframe0.png").read_bytes() == image
+    repeat = client.post("/v1/videos", json=body, headers={**AUTH, "Idempotency-Key": key})
+    assert repeat.status_code == 202 and repeat.json()["id"] == key and state.pending.qsize() == 2
+    other, _ = keyframe_request(seed=9)
+    assert client.post("/v1/videos", json=other, headers={**AUTH, "Idempotency-Key": key}).status_code == 409
+    for invalid in ({**body, "num_inference_steps": 50}, {**body, "task": "ref2va"},
+                    keyframe_request(width=1600, height=200)[0]):
+        response = client.post("/v1/videos", json=invalid, headers=AUTH)
+        assert response.status_code == 422, response.text
+    capped = service.WorkerState(tmp_path / "capped", capacity=2, min_free_gib=0, max_num_frames=243)
+    capped.phase = "ready"
+    with TestClient(service.create_app(capped, TOKEN)) as small:
+        long = {"task": "t2va", "prompt": "x", "target": {"duration_seconds": 12}}
+        assert small.post("/v1/videos", json=long, headers=AUTH).status_code == 422
+        assert small.get("/healthz").json()["api"]["num_frames"]["max"] == 243
+
+
+def json_text(value):
+    import json
+    return json.dumps(value)

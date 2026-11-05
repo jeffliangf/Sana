@@ -32,6 +32,24 @@ def atomic_json(path, value):
                 temporary.unlink(missing_ok=True)
 
 
+def atomic_bytes(path, data):
+    """Write a complete binary file (such as a request keyframe) before it becomes visible."""
+    path = Path(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+                                         delete=False) as output:
+            temporary = Path(output.name)
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
+
+
 def check_space(path, min_free_bytes, *, reserve_bytes=0):
     """Check bytes and inodes; a subsequent write can still fail (quota/races)."""
     free = shutil.disk_usage(path).free

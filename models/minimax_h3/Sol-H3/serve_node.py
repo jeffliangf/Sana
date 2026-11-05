@@ -205,10 +205,13 @@ def main():
                    "serve.py", "--model", str(checkpoints / "MiniMax-H3"),
                    "--adapter", str(checkpoints / "FastH3-4-step-Preview-v1-LoRA/dense-datafree/adapter_model.safetensors"),
                    "--output-dir", str(local / f"sol-h3-service/{port}"), "--token-file", str(token_file),
-                   "--host", address, "--port", str(port), "--attention-backend", "sol",
+                   "--host", address, "--port", str(port),
+                   "--attention-backend", os.environ.get("H3_ATTENTION_BACKEND", "sol"),
                    "--warmup-prompt-file", str(root / "demo_prompt.json"), "--ready-file", str(ready_file),
                    "--queue-capacity", "8", "--encoder-threads", "8", "--gate-failure", "dense",
                    "--expect-gpu", gpu_type, "--min-free-gib", os.environ.get("H3_MIN_FREE_GIB", "20")]
+        if os.environ.get("H3_MAX_NUM_FRAMES"):
+            command += ["--max-num-frames", os.environ["H3_MAX_NUM_FRAMES"]]
         try:
             process = subprocess.Popen(command, cwd=root / "Sol-H3", env=env, stdout=log, stderr=subprocess.STDOUT,
                                        start_new_session=True)

@@ -21,21 +21,29 @@ To retain separate LoRA branch arithmetic, use `--lora-mode separate`, or
 
 ## Resident H200 service
 
-**Calling the service from another program? Use the [API reference](API.md):**
-endpoints, job fields, retry rules, and a tested example client.
+- **Calling the service:** the [API reference](API.md) covers both request forms,
+  job fields, retry rules, measured latency, and a tested example client.
+- **Operating it:** the [deployment design and runbook](DEPLOYMENT.md) covers the
+  gateway, workers, storage, the serving memory cap, scaling, validation, and drain.
 
-For the fixed gateway contract, storage safeguards, H100/H200 configuration, and
-the complete deployment/drain procedure, use the dedicated
-[deployment design and runbook](DEPLOYMENT.md).
+The model is **H3-Base FL2VA plus the four-step FastH3 adapter**. A stable CPU
+gateway routes requests to two-GPU H200 workers. Each worker generates one video
+at a time and queues up to eight more. Workers serve text-to-video and first-frame
+image-to-video with stereo audio at 24 fps, in either request form:
+- The original `{prompt, duration, seed}` form: 1344x768, 124 or 243 frames.
+- The SGLang MiniMax-H3 form: `t2va` or `fl2va`, six aspect ratios or the first
+  frame's own, 124–345 frames.
 
-**Last recorded state (2026-10-28): sixteen H200 workers on 0002, 0005, 0006,
-and 0023 serve through the gateway** (Slurm 3891–3894; 32 GPUs, 16 generation
-slots, 128 queue slots). The gateway and workers accept caller job IDs
-(`Idempotency-Key`), report `error_code` and `video_sha256`, and include the
-2026-10-27 storage hardening. Start callers at about 16 concurrent jobs and raise
-toward 20 while watching latency and rejections. A two-worker H100 launch on
-`gmicloud-loki-gpu-004` failed with GPU out-of-memory during model loading;
-H200-0048 remains stopped. The allocation IDs below describe the earlier fleet.
+**State on 2026-11-05.** The production workers are stopped and the gateway still
+runs the code installed on 2026-10-28.
+- All eight H200 allocations were cancelled on 2026-11-04 at 22:57 UTC.
+- The gateway's pool is paused (`"workers": []`), so new submissions get 503 while
+  completed jobs stay downloadable.
+- The code in this directory adds the SGLang request form, the round-based VAE
+  decode, and the H200 serving memory cap. It passed the validation below and is
+  not deployed yet.
+
+Check `/healthz` for live capacity.
 
 ### Access the deployed H200 service
 
@@ -55,15 +63,6 @@ private and require cluster network access or an SSH tunnel.
 | Shared service token file on the cluster | `/home/jeff/sol-h3-h200/deployment/token` |
 | Stable API base URL | **`http://10.2.201.187:18080`** |
 | Shared deployment code and logs | `/home/jeff/sol-h3-h200` |
-
-The last active allocation (2026-10-24 through the Oct 26 stop) was
-**32 H200 GPUs / sixteen two-GPU workers**: eight GPUs each on 0002, 0006, 0023,
-and 0048. Clients do not need this worker list. That pool supported sixteen
-simultaneous generations and 128 waiting jobs, with an external batch concurrency
-of 20. Recalculate caller concurrency for the next fleet's healthy worker count.
-Check the gateway's `/healthz` for current capacity. Each worker uses two H200 GPUs and
-accepts 5- or 10-second text-to-video requests at 1344x768 / 24 fps with audio.
-The model is **H3-Base FL2VA plus the four-step FastH3 adapter**.
 
 Log in from this workstation, then query the private endpoint:
 
@@ -89,83 +88,15 @@ other compute hosts. Run forwarding on each client host or provide network routi
 Other people need authorized SSH access and the service bearer token; the listed
 key and private token file belong to Jeff's deployment account.
 
-This complete example runs on the cluster login host with only Python 3. It
-submits a request, waits for it, and downloads `h3-example.mp4`:
-
-```bash
-python3 - <<'PY'
-import json
-import time
-import urllib.request
-import uuid
-from pathlib import Path
-
-base = "http://10.2.201.187:18080"
-token = Path("/home/jeff/sol-h3-h200/deployment/token").read_text().strip()
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-def request(path, body=None, key=None):
-    data = None if body is None else json.dumps(body).encode()
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    if key:
-        headers["Idempotency-Key"] = key
-    with opener.open(urllib.request.Request(base + path, data=data, headers=headers), timeout=60) as response:
-        return response.read()
-
-key = str(uuid.uuid4())  # Save it first: repeating this POST with the same key is safe.
-job = json.loads(request("/v1/videos", {
-    "prompt": "A red fox walks through a sunlit forest. Birds chirp and leaves rustle.",
-    "duration": 10,
-    "seed": 42,
-}, key))
-print("Job:", job["id"])
-deadline = time.monotonic() + 600
-while time.monotonic() < deadline:
-    state = json.loads(request(job["status_url"]))
-    if state["status"] == "failed":
-        raise RuntimeError(state.get("error", "Generation failed"))
-    if state["status"] == "succeeded":
-        Path("h3-example.mp4").write_bytes(request(job["video_url"]))
-        print("Saved h3-example.mp4")
-        break
-    time.sleep(1)
-else:
-    raise TimeoutError(f"Still pending; resume polling {base}{job['status_url']}")
-PY
-```
-
-For a tunneled client, change `base` and use a protected local copy of the token
-file. Keep submission, status, and download requests on the gateway URL.
-HTTP 401 means the token is missing/incorrect, 422 means invalid parameters,
-429 means the queues are full, 503 means no worker is ready, and 507 means
-insufficient output storage. A worker's 429, 503, or 507 response rejects the
-request before acceptance, so the gateway can safely try another worker.
-
-The optional `Idempotency-Key` header (a lowercase UUID) becomes the job ID.
-After a 502, a timeout, or a lost response, repeat the same POST with the same
-key: it returns the original job if one was accepted and never renders a second
-video. The same key with a different prompt, duration, or seed returns 409; a
-malformed key returns 400. Without a key, a 502 still means a worker may have
-accepted the request, so do not resubmit automatically. A failed job reports
-`error_code` (`worker_restarted`, `inference_failed`, `storage_failure`, or
-`worker_lost`); regenerate it with a new key. Successful jobs report
-`video_sha256` and `video_bytes` of the stored MP4, which can be downloaded again
-at any time. See [caller job IDs](DEPLOYMENT.md#caller-job-ids).
-The token is not needed for `/healthz`.
+Callers use the [example client](API.md#example-client) and the rules in the
+API reference.
 
 For verl, see the **Self-hosted H3 on H200** section of
 `/home/jeff/verl/examples/prompt_rewrite/README.md`. Its new-run options are
 `--h3-backend self-hosted`, `--h3-endpoints http://10.2.201.187:18080`, and
 `--h3-token-file <shared token filename>`. The policy can continue calling
 `h3_max(prompt)`; the adapter performs submission, polling, download, and media
-validation against this service.
-
-Existing clients configured with individual worker URLs need a one-time switch
-to the gateway for **new** requests. Jobs submitted directly to a worker remain
-on that worker; the gateway only owns jobs submitted through it. Keep existing
-verl runs and saved job recovery files on their frozen endpoint configuration;
-prepare a new run to use the gateway. Future changes to the gateway's worker
-pool do not change the client's configuration or recovery identity.
+validation against this service. It sends the original request form.
 
 ### Operate the stable gateway
 
@@ -192,6 +123,9 @@ health response receive no new jobs. Heartbeats older than 120 seconds are repor
 stale during that bounded grace period. Explicit stops and exclusions take effect
 immediately. New allocations launched with `deploy_node.sh` join
 automatically when ready. Requests go to a worker with the shortest queue.
+Original-form requests can go to any ready worker. SGLang-form requests go only to
+workers whose `/healthz` reports `api.version` 2 and an `api.num_frames.max` that
+covers the request, so workers can be upgraded one at a time.
 Each accepted job is pinned to its original worker in `gateway/jobs/<id>.json`;
 completed videos are copied to shared `gateway/videos/<id>.mp4` before the
 gateway reports success. Those results remain downloadable after that worker
@@ -217,115 +151,6 @@ generation on another worker.
 but completed status and video downloads still work. Delete `pool.json` or write
 `{}` to restore automatic discovery. Pool changes require no gateway restart.
 
-Historical worker addresses (these Slurm jobs were cancelled on 2026-10-26):
-
-| Node | Worker addresses | Slurm jobs |
-|---|---|---|
-| 0002 | `10.2.201.2:18080–18083` | 3865 (18080–18081), 3867 (18082–18083) |
-| 0006 | `10.2.201.6:18080–18083` | 3863 |
-| 0023 | `10.2.201.23:18080–18083` | 3864 |
-| 0048 | `10.2.201.48:18080–18083` | 3866 (18080–18081), 3868 (18082–18083) |
-
-Each node had eight allocated GPUs and four workers. Nodes 0002 and 0048 used
-two separate four-GPU allocations, so adding capacity did not restart their
-original workers. Clients continue using the gateway URL.
-
-On 2026-10-22, gateway validation passed **12/12 live generations**: ten
-simultaneous 5-second requests covered every worker and survived a gateway
-restart while pending; two simultaneous 10-second requests used verl's actual
-client with the admitted pool reduced to two workers. Both client outputs passed
-media validation and resumed without resubmission. All twelve completed videos
-were downloaded and checksum-verified with the admitted pool temporarily empty.
-The full ten-worker pool was restored, with no GPU worker restarts or uncertain
-submissions. The SSH tunnel was also checked from the client workstation.
-Gateway/HTTP/supervisor tests passed 17 cases and the verl client passed 12 cases.
-Evidence is in `deployment/gateway-20261022/report.json` on the cluster and
-`runs/minimax_h3_h200_gateway_20261022/report.json` in this checkout.
-
-The 2026-10-23 expansion added four separately allocated GPUs on 0048, with
-64 CPU threads and 800 GiB of host memory reserved through Slurm. The new
-workers stayed excluded from gateway dispatch until both passed 5-second and
-10-second generation checks, including a previously failing prompt. Both then
-passed generation, polling, and authenticated download through the fixed
-gateway URL: **6/6 requests passed**, covering all four added GPUs. The gateway
-process, original allocations, and original worker attempts were unchanged.
-Evidence is in `deployment/scale-0048-20261023/` on the cluster and
-`runs/minimax_h3_h200_scale_0048_20261023/` in this checkout. The original pool
-completed another 63 requests during this expansion before the new workers
-were admitted. No client URL, token, or concurrency change is needed.
-
-A second expansion on 2026-10-23 added four more GPUs each on 0002 and 0048,
-using ports 18082–18083 and separate supervisor registries. Each added allocation
-reserves 64 CPU threads and 800 GiB of host memory. All four new workers passed
-5- and 10-second generation checks before admission, including a previously
-failing prompt, then each passed a 10-second request through the fixed gateway:
-**12/12 requests passed**, with authenticated downloads and no worker restarts.
-The gateway process and original allocations were unchanged. All original TCP
-listeners remained available, including 0048's separate loopback service, and
-all 25 historical completed videos on 0002's reused ports were preserved.
-HTTP, gateway, and supervisor tests passed **26 cases**. Evidence is in
-`deployment/scale-fill-0002-0048-20261023/` on the cluster and
-`runs/minimax_h3_h200_fill_0002_0048_20261023/` in this checkout.
-
-On 2026-10-24 at approximately 06:56 UTC, all six allocations failed after
-shared-storage writes returned `ENOSPC` or `EIO`. A failed registry heartbeat
-escaped the supervisor loop and triggered worker shutdown. The supervisor now
-retries failed registry writes on subsequent iterations while keeping workers
-running. Worker logs, readiness files, and supervisor logs use node-local disk.
-The regression suite passed **28 cases**, including both storage errors followed
-by recovery without worker restarts. Incident snapshots and request recovery
-records are in `deployment/storage-recovery-20261024/` on the cluster and
-`runs/minimax_h3_h200_storage_recovery_20261024/` in this checkout.
-
-The restart retained every worker port and the gateway process. **16/16 live
-requests passed** through the gateway, covering all 32 GPUs with authenticated,
-checksum-verified downloads. Eight 5-second requests used the demo prompt and
-eight 10-second requests exercised the numerical fallback. All 4,988 previously
-completed worker videos were present before restart. Of 19 pending gateway jobs,
-one completed video was recovered and 18 requests are now explicitly failed;
-`pending-before.json` and `pending-after.json` preserve their recovery records.
-Interrupted jobs were not automatically resubmitted.
-
-On 2026-10-28 the gateway was updated in place (same socket, token, and job
-archive) and 0002 returned as one eight-GPU allocation, Slurm 3891, on ports
-18080–18083 with their 8,401 earlier completed jobs preserved. All four workers
-became ready on their first attempt. Direct validation passed **8/8**: each worker
-ran the 5-second demo prompt (12.9 s processing) and the 10-second prompt that
-needs the numerical fallback (51.1–51.7 s, peak 129.3 GiB per GPU). Through the
-gateway, **4/4** requests covered all four workers with matching `video_sha256`.
-Every request was repeated with its key (same job) and with changed inputs (409);
-a replay after completion returned the stored video without rendering again.
-Evidence is in `deployment/h200-0002-20261028/` and `deployment/redeploy-20261028/`
-on the cluster.
-
-Later on 2026-10-28, 0005, 0006, and 0023 were added the same way (Slurm
-3892–3894), each excluded until validated. 0005 had never run H3, so
-`deploy_node.sh` staged and verified its environment and weights from
-`deployment/staging/`; 0006 and 0023 kept their 8,571 and 8,548 earlier completed
-jobs. All twelve new workers were ready on their first attempt and passed direct
-validation (**24/24**: 5-second 12.7–13.1 s, 10-second fallback 51.1–52.7 s).
-Then **16/16** requests through the gateway reached all sixteen workers, with
-matching checksums and the same key checks. Evidence is in
-`deployment/scale-0005-0006-0023-20261028/`.
-
-From Oct 29 to Nov 2 the H200 workers crashed 48 times in attention: 40 in cuDNN
-SDPA and 8 in the Sol CUTLASS kernel. Each crash came after the worker process
-had seen about 570 distinct prompt lengths (550–675), whether it had been up 15
-hours or 59. Each crash failed the job it was running. The supervisor then allowed
-only three starts per allocation, so on Nov 2 all four allocations ended between
-09:51 and 13:41 UTC. Of 69,750 accepted jobs, 76 failed (0.11%).
-
-`serve_node.py` now restarts every crash and pins GPU pairs by UUID. On Nov 1 a GPU
-fault on 0023 had made CUDA renumber its remaining GPUs. The fleet returned the
-same day as Slurm 3910 (0002) and 3904–3906 (0005, 0006, 0023), on the same ports
-and gateway URL, and passed validation:
-- **24/24** direct requests on 0005, 0006 and 0023;
-- **8/8** on 0002;
-- **16/16** through the gateway, reaching every worker.
-
-0002 also trials `H3_SERVING_MEMORY_FRACTION=0.95` (see `DEPLOYMENT.md`). Evidence
-is in `deployment/stability-review-20261102/` and `deployment/redeploy-20261102/`.
-
 Shared storage remains necessary for gateway job persistence and video archives.
 If registry publication stays unavailable for more than 120 seconds, automatic
 discovery stops routing new work to those stale entries until publication resumes.
@@ -335,8 +160,10 @@ local disk.
 ### Launch another service
 
 `serve.py` keeps one distributed worker loaded and serves authenticated, queued
-T2V requests. This service currently accepts the H200-tested **5- and 10-second**
-profiles only, at 1344x768 / 24 FPS with stereo audio. Install the optional HTTP
+text-to-video and first-frame image-to-video requests (`h3_request.py` holds the shared
+contract): the original `{prompt, duration, seed}` form at 1344x768, or the SGLang
+MiniMax-H3 form (`t2va`/`fl2va`, base64 first frame, six aspect ratios or the image's
+own, 124-345 frames at 24 FPS) with stereo audio. Install the optional HTTP
 dependencies with `pip install -r requirements-service.txt`.
 
 Create a private token file with at least 32 random characters, then launch inside
@@ -356,7 +183,7 @@ then 200 when ready. Other endpoints require `Authorization: Bearer <token>`:
 
 | Method / path | Behavior |
 |---|---|
-| `POST /v1/videos` | Accept `{"prompt":"…","duration":5,"seed":42}`; return 202 with a job ID and relative status/video URLs. An `Idempotency-Key` UUID becomes the job ID, and repeating it returns that job |
+| `POST /v1/videos` | Accept `{"prompt":"…","duration":5,"seed":42}` or the SGLang form (`task`, `conditions`, `target`); return 202 with a job ID and relative status/video URLs. An `Idempotency-Key` UUID becomes the job ID, and repeating it returns that job |
 | `GET /v1/jobs/{id}` | Return `queued`, `running`, `succeeded`, or `failed` (with `error_code`), with timings after completion |
 | `GET /v1/jobs/{id}/video` | Download the completed MP4; return 409 while unfinished |
 
@@ -382,8 +209,7 @@ counters (`sparse_calls`, `dense_calls`, `gate_fallback_calls`, `gate_failures`)
 plus the gate's measured errors. Dense fallback can be slower, so include those
 counters when reporting latency. `/healthz` exposes `gate_failure_policy`.
 
-`deploy_node.sh` and `serve_node.py` provide the Slurm node deployment, with
-`deploy_h200_node.sh` retaining the old entry point. Defaults are one independent
+`deploy_node.sh` and `serve_node.py` provide the Slurm node deployment. Defaults are one independent
 worker per H200 GPU pair (2/4/6/8 allocated GPUs), consecutive ports
 starting at `H3_BASE_PORT` (default 18080), eight CPU encoder threads per
 worker, and separate CPU affinities. They bind to the node's internal IP and
@@ -391,7 +217,8 @@ pin each worker to its GPU pair by UUID. The supervisor restarts a crashed
 worker every time. A crash after at least 30 minutes of readiness starts a fresh
 count; a worker that fails three starts in a row is disabled while healthy
 siblings continue, and the node registry reports `degraded`. If every worker is
-disabled, the supervisor exits and releases the allocation. The launcher defaults to
+disabled, the supervisor exits and releases the allocation. On H200 the launcher caps
+PyTorch's memory pool at 95% after warmup (`H3_SERVING_MEMORY_FRACTION`). It defaults to
 `/home/jeff/sol-h3-h200` for shared code/registry and `/raid/jeff` for environments,
 checkpoints, caches, and outputs. It expects a private `deployment/token` and can
 initialize a fresh node from a checksummed `deployment/staging` snapshot. The
@@ -404,7 +231,7 @@ See [the runbook](DEPLOYMENT.md#parameterize-the-next-fleet) for all settings.
 ```bash
 sbatch --partition=all --nodes=1 --ntasks=1 --cpus-per-task=160 --mem=1600G \
   --gres=gpu:nvidia_h200:8 --constraint=h200 --time=0 \
-  --nodelist=YOUR_NODE deploy_h200_node.sh
+  --nodelist=YOUR_NODE deploy_node.sh
 ```
 
 To add a separate four-GPU allocation on a node already serving ports
@@ -414,7 +241,7 @@ To add a separate four-GPU allocation on a node already serving ports
 sbatch --partition=all --nodes=1 --ntasks=1 --cpus-per-task=64 --mem=800G \
   --gres=gpu:nvidia_h200:4 --constraint=h200 --time=0 \
   --export=ALL,H3_BASE_PORT=18082 \
-  --nodelist=YOUR_NODE deploy_h200_node.sh
+  --nodelist=YOUR_NODE deploy_node.sh
 ```
 
 Confirm both ports are unused before launching. Exclude the new endpoints in
@@ -435,59 +262,46 @@ stops when free disk space falls below 20 GiB. The HTTP endpoints are intended f
 the private cluster network or an SSH tunnel. The gateway above provides routing
 across workers; use its fixed URL in training clients.
 
-The repair evidence and pre-restart request snapshots are on the cluster under
-`deployment/gate-repair-20261022/`. Existing MP4s remain in
-`/raid/jeff/sol-h3-service/<port>/` on their original node, including outputs
-belonging to currently offline ports. Recovery replays use fresh job IDs; they do
-not change a client's saved batch recovery ledger or automatically resume it.
+### Validation of the SGLang request form
 
-### Gate recovery validation
+On 2026-11-05 the SGLang request form was validated on eight test workers on 0048
+and 0067. They ran from an isolated test root and test gateway, not the production
+gateway. The form covers `t2va`, first-frame `fl2va`, six aspect ratios or the
+image's own, and 124–345 frames. Each phase passed with and without the 0.95
+serving cap:
+- 8 original-form requests;
+- 35 API contract checks;
+- 85 T2V cases covering every ratio and frame count;
+- 94 I2V cases, including 6 expected rejections;
+- 19 worst-case requests.
 
-The 2026-10-22 repair passed 19 regression tests and a two-H200 distributed check:
-one rank's rejection sends both ranks to an exact dense result, and a nonfinite
-dense reference remains fatal on both ranks. Four recovered failing requests
-completed on node 0006, then completed again on the same workers with zero
-restarts. All eight used the reported dense fallback.
+A warm-latency set of 96 requests also ran with the cap. Testing led to two fixes:
+- The VAE decode now runs in fixed rounds of tiles. It is bit-identical to the
+  per-clip decode, bounds decode memory, and needs one compiled shape. The old
+  decode ran out of memory above about 290 frames and recompiled for every new shape.
+- Original-form requests no longer fail on the new fields.
 
-The subsequent fleet replay completed **26/26 distinct previously failing
-requests** across all ten workers, also with zero restarts. At 06:41 UTC, all ten
-live health endpoints returned 200/ready. The separate
-`deployment/gate-repair-20261022/replay-map.json` maps each original job ID to its
-successful validation replacement so the batch client can reuse those videos.
-The client's recovery state was not modified.
+Uncapped, the worst case (8,000-character prompt, 345 frames, dense fallback)
+filled the GPU to 139.8 of 140.4 GiB. With `H3_SERVING_MEMORY_FRACTION=0.95` it
+peaked at 128.0 GiB allocated and 135.1 GiB in use, so `deploy_node.sh` now sets
+the cap on H200 by default. Evidence is in `deployment/api-v2-validation-20261105/`
+on the cluster.
 
-For those four **10-second clips**, the first replay took **50.85 s median** and
-the repeat took **44.71 s median** (44.68–45.97 s). These are service processing
-times through MP4 encoding, excluding model warmup, queueing, and downloads.
-Every authenticated download matched its recorded size. One recovered clip was
-fully decoded: 243 video frames and nonzero stereo audio. Detailed evidence is
-in `deployment/gate-repair-20261022/` on the cluster.
+### Deployment history
 
-### Initial sparse-attention validation (historical)
+Evidence is in `/home/jeff/sol-h3-h200/deployment/` on the cluster unless noted.
 
-The following timings predate the gate repair and cover requests whose sparse
-gates passed. They do not describe requests that now require dense fallback.
-
-On 2026-10-22, two eight-H200 nodes ran four two-GPU workers each. All **64 HTTP
-generation requests passed**: three simultaneous eight-request rounds per
-duration using the benchmark prompt, then one new prompt at each duration on
-every worker. Each worker completed two warmups per duration before measurement.
-
-| Nominal clip duration | Warm samples | Service processing median | Client completion median |
-|---|---:|---:|---:|
-| 5 s | 24 | 12.94 s | 13.08 s |
-| 10 s | 24 | 31.40 s | 31.53 s |
-
-Processing includes text encoding, four transformer forwards, video/audio decode,
-MP4 encoding, and stream metadata validation. Client time also includes HTTP
-submission and polling, but excludes downloading the MP4. Model loading and
-warmups are excluded. The first requests for the two new prompt lengths took
-25.31 s / 43.34 s median for 5 s / 10 s clips, including first-use compilation and
-correctness checks; they are excluded from the warm table. All ranks passed their
-sparse numerical gates and executed four transformer forwards. Four samples from
-the two nodes were fully decoded with nonzero image variation and audio energy.
-This validates the four-worker deployment on two nodes; a third node was queued
-because the other six registered H200 nodes had all eight GPUs allocated.
+| Date | Change | Evidence |
+|---|---|---|
+| 2026-10-22 | Stable gateway in front of two eight-H200 nodes (four two-GPU workers each). Numerical-gate repair with dense fallback | `gateway-20261022/`, `gate-repair-20261022/`, `verl-client-20261022/` |
+| 2026-10-23 | Workers added on 0048, then on 0002 and 0048 | `scale-0048-20261023/`, `scale-fill-0002-0048-20261023/` |
+| 2026-10-24 | Shared-storage `ENOSPC`/`EIO` stopped every allocation. The supervisor now survives failed heartbeats; logs moved to node-local disk | `storage-recovery-20261024/` |
+| 2026-10-26 | Fleet stopped | `stop-20261026/` |
+| 2026-10-28 | Gateway with caller job IDs, `error_code`, and `video_sha256`. Sixteen workers on 0002, 0005, 0006, 0023 | `redeploy-20261028/`, `h200-0002-20261028/`, `scale-0005-0006-0023-20261028/` |
+| 2026-11-02 | Workers crashed after about 570 distinct prompt lengths and ended every allocation. Unlimited restarts, GPU pinning by UUID, and a 0.95 serving memory cap trial on 0002 | `stability-review-20261102/`, `redeploy-20261102/` |
+| 2026-11-03 | 0003 and 0035 added: 24 workers | `scale-0003-0035-20261103/` |
+| 2026-11-04 | 0048 and 0067 added: 32 workers. Fleet stopped at 22:57 UTC | `scale-0048-0067-20261104/`, `stop-32-workers-20261104T225735Z/` |
+| 2026-11-05 | SGLang request form, round-based VAE decode, and the H200 memory cap by default, validated on test workers. Stale configuration archived | `api-v2-validation-20261105/`, `archive-20261105-stale/` |
 
 ## Validation
 
@@ -504,7 +318,9 @@ first-frame conditioning path, so its validation is a deployment compatibility r
 an upstream I2V training claim. Latency excludes checkpoint loading, warmup, and MP4 encoding.
 
 Kernel validation includes SM103 B300 through the SM100-family backend and the H200 SM90 T2V
-checks below. H200 I2V/Ref2VA and the reachable SM120 paths remain unvalidated.
+checks below. H200 first-frame I2V was validated on 2026-11-05 at 124–345 frames and every
+canvas shape, for function and memory but not output quality. H200 Ref2VA and the reachable
+SM120 paths remain unvalidated.
 
 ### T2V benchmarks
 

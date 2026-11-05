@@ -59,7 +59,8 @@ def write_json(path, value):
     temporary.replace(path)
 
 
-def inspect_media(path, duration):
+def inspect_media(path, duration, width=1344, height=768):
+    """Probe an output MP4 and require the expected canvas, 24 fps, 32-kHz stereo, and duration (±1 s)."""
     import av
 
     with av.open(str(path)) as container:
@@ -73,7 +74,7 @@ def inspect_media(path, duration):
             "channels": audio.codec_context.channels,
             "duration_s": container.duration / av.time_base if container.duration is not None else None,
         }
-    if (profile["width"], profile["height"], profile["fps"]) != (1344, 768, 24.0):
+    if (profile["width"], profile["height"], profile["fps"]) != (width, height, 24.0):
         raise RuntimeError(f"Unexpected video format: {profile}")
     if (profile["sample_rate"], profile["channels"]) != (32000, 2):
         raise RuntimeError(f"Unexpected audio format: {profile}")

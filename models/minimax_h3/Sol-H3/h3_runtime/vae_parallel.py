@@ -79,6 +79,11 @@ def install(vae, group=None, batched: bool | None = None, compile_mode: str | No
     if global_batch is None:
         global_batch = os.environ.get("H3_VAE_GLOBAL_BATCH", "1") == "1"
     global_gate_pending = os.environ.get("H3_VAE_GLOBAL_GATE", "0") == "1"
+    # Tiles each rank decodes per global-batch round: bounds decode memory for long clips and keeps
+    # one compiled decoder shape for every canvas and frame count.
+    decode_tiles = int(os.environ.get("H3_VAE_DECODE_TILES_PER_RANK", "48"))
+    if decode_tiles < 1:
+        raise ValueError("H3_VAE_DECODE_TILES_PER_RANK must be positive")
 
     undo = []
     if compile_mode:
@@ -249,24 +254,39 @@ def install(vae, group=None, batched: bool | None = None, compile_mode: str | No
             )
 
         logical_tiles = len(tile_inputs)
-        per_rank = (logical_tiles + world - 1) // world
-        padded = tile_inputs + [tile_inputs[-1]] * (per_rank * world - logical_tiles)
-        mine = padded[rank * per_rank : (rank + 1) * per_rank]
-        local_stack = vae.decoder(vae.post_quant_conv(torch.cat(mine, dim=0)))
-        flat = gather_tiles(local_stack, logical_tiles)
-
+        tiles_per_clip = len(coords)
         decoded_chunks = []
         overlap = None
-        tiles_per_clip = len(coords)
-        for chunk_index in range(num_chunks):
-            clip = stitch(
-                flat,
-                chunk_index * tiles_per_clip,
-                y_indices,
-                y_overlaps,
-                x_indices,
-                x_overlaps,
-            )
+
+        def clips():
+            """Yield stitched clips in order, decoding a fixed number of tiles per rank per round.
+
+            Every tile has the same shape, so a constant per-rank batch gives the compiled decoder
+            one input shape for every canvas and duration, and the decode buffers stay bounded:
+            only stitched frames accumulate, not every tile of the video at once.
+            """
+            pending = None
+            round_tiles = world * decode_tiles
+            for start in range(0, logical_tiles, round_tiles):
+                batch = tile_inputs[start : start + round_tiles]
+                real = len(batch)
+                batch = batch + [batch[-1]] * (round_tiles - real)
+                mine = batch[rank * decode_tiles : (rank + 1) * decode_tiles]
+                local_stack = vae.decoder(vae.post_quant_conv(torch.cat(mine, dim=0)))
+                gathered = gather_tiles(local_stack, real)
+                del local_stack
+                pending = gathered if pending is None else torch.cat([pending, gathered], dim=0)
+                del gathered
+                while pending is not None and pending.shape[0] >= tiles_per_clip:
+                    clip = stitch(pending, 0, y_indices, y_overlaps, x_indices, x_overlaps)
+                    pending = pending[tiles_per_clip:] if pending.shape[0] > tiles_per_clip else None
+                    yield clip
+            if pending is not None:
+                raise RuntimeError("VAE decode left unstitched tiles")
+
+        produced = 0
+        for chunk_index, clip in enumerate(clips()):
+            produced += 1
             for part in range(int(token_drop > 0) + 1):
                 frame_start = part * chunk_num_frames
                 chunk = clip[:, :, frame_start : frame_start + chunk_num_frames]
@@ -277,10 +297,13 @@ def install(vae, group=None, batched: bool | None = None, compile_mode: str | No
                     decoded_chunks.append(chunk)
                 else:
                     overlap = chunk
+        if produced != num_chunks:
+            raise RuntimeError(f"VAE decode produced {produced} of {num_chunks} clips")
         if overlap is not None:
             decoded_chunks.append(overlap)
 
         dec = torch.cat(decoded_chunks, dim=2)
+        del decoded_chunks
         if pad_tokens > 0:
             intra_tail = vae.config.clip_length % temporal_ratio
             num_tokens_before_pad = z.shape[2] - pad_tokens

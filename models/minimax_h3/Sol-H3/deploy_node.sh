@@ -5,6 +5,12 @@ umask 077
 export H3_DEPLOY_ROOT="${H3_DEPLOY_ROOT:-/home/jeff/sol-h3-h200}"
 export H3_LOCAL_ROOT="${H3_LOCAL_ROOT:-/raid/jeff}"
 export H3_GPU_TYPE="${H3_GPU_TYPE:-H200}"
+# Two-GPU H200 workers need the serving cap. Without it PyTorch's pool grew to fill the GPU
+# (139.8 of 140.4 GiB) on the longest requests, leaving no room for CUDA libraries; with 0.95
+# the worst case measured 128.0 GiB allocated and 135.1 GiB in use (2026-11-05). 0 disables it.
+if [[ "$H3_GPU_TYPE" == H200 ]]; then
+    export H3_SERVING_MEMORY_FRACTION="${H3_SERVING_MEMORY_FRACTION:-0.95}"
+fi
 : "${SLURM_JOB_ID:?Launch this service inside a Slurm allocation}"
 stage="$H3_DEPLOY_ROOT/deployment/staging"
 venv="${H3_VENV:-$H3_LOCAL_ROOT/sol-h3-venv}"

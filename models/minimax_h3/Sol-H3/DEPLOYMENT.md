@@ -5,21 +5,31 @@ FastH3 adapter** service. It covers `serve.py`, `serve_node.py`, `gateway.py`, a
 the launchers in this directory. It does not use the separate SGLang deployment
 instructions at the repository root.
 
-**Last recorded operational state: 2026-10-28, sixteen H200 workers serving.** The
-gateway and workers run the 2026-10-28 code: caller job IDs, `error_code`,
-`video_sha256`, and the 2026-10-27 storage hardening. Four eight-GPU allocations
-each serve four two-GPU workers on ports 18080–18083: H200-0002 (Slurm 3891),
-0005 (3892), 0006 (3893), and 0023 (3894). That is 32 GPUs, 16 generation slots,
-and 128 queue slots. Each worker passed a 5-second and a 10-second fallback
-request directly before admission; then requests through the gateway covered
-every worker, with checksums, repeated keys, 409 conflicts, and no-rerender
-replays verified. Evidence is in `deployment/h200-0002-20261028/` and
-`deployment/scale-0005-0006-0023-20261028/`. H200-0048 remains stopped and
-excluded. A two-worker H100 launch on GMI node `gmicloud-loki-gpu-004`
-(Slurm 3435) failed while loading the model: every rank holds the whole pipeline,
-about 129 GiB, and an H100 has 80 GB (see
-[H100 workers](#h100-workers-on-another-cluster)). Do not interpret this document
-or a stale registry as an instruction to restart or stop workers.
+**State on 2026-11-05.** No production workers are running and the gateway still
+runs the 2026-10-28 code.
+- All eight H200 allocations (Slurm 3904–3906 and 3910–3914) were cancelled on
+  2026-11-04 at 22:57 UTC; evidence is in `deployment/stop-32-workers-20261104T225735Z/`.
+- The gateway's `pool.json` is `{"workers": []}`: paused, so new submissions get 503
+  while completed jobs stay downloadable. `deployment/jobs.json` lists no allocations
+  (`desired_state: stopped`).
+- On 2026-11-05 stale configuration (old pool entries, inventory, stopped registries,
+  watchdog backups) and the first deployment's files moved to
+  `deployment/archive-20261105-stale/`.
+- The gateway code was installed on 2026-10-28: caller job IDs, `error_code`,
+  `video_sha256`, and the storage hardening.
+- The code in this directory adds the SGLang request form, the round-based VAE
+  decode, and the H200 serving memory cap by default. It passed validation on eight
+  test workers behind a separate test gateway on 2026-11-05
+  ([README](README.md#validation-of-the-sglang-request-form)) and is not yet deployed.
+- Separate `h3-base-fl2va` allocations from another project run on 0002, 0005, 0006,
+  and 0023. Since 2026-11-05 they hold all eight GPUs on each of those nodes. They are
+  not part of this service; leave them alone.
+- A two-worker H100 launch on GMI node `gmicloud-loki-gpu-004` (Slurm 3435) failed
+  while loading the model. Every rank holds the whole pipeline, about 129 GiB, and an
+  H100 has 80 GB (see [H100 workers](#h100-workers-on-another-cluster)).
+
+Do not interpret this document or a stale registry as an instruction to restart or
+stop workers.
 
 ## Fixed caller contract
 
@@ -29,10 +39,11 @@ or a stale registry as an instruction to restart or stop workers.
 | Gateway login | `ssh -i ~/.ssh/gmi -p 44222 jeff@157.66.255.187` |
 | Deployment root on that cluster | `/home/jeff/sol-h3-h200` |
 | Bearer token | Existing `deployment/token`; keep private and preserve it |
-| Submit | `POST /v1/videos`, JSON `prompt`, `duration` (5 or 10), `seed` |
+| Submit | `POST /v1/videos` with the original JSON `{prompt, duration (5 or 10), seed}`, or the SGLang form `{task (t2va or fl2va), prompt, conditions, target, seed}` ([API.md](API.md#sglang-form)) |
+| Request size | At most 28 MiB; a base64 first frame can be up to 20 MiB |
 | Caller job ID | Optional `Idempotency-Key: <lowercase UUID>` header; it becomes the job ID |
-| Poll / download | `GET /v1/jobs/{id}` / `GET /v1/jobs/{id}/video`; success includes `video_sha256` |
-| Media | 1344×768, 24 FPS, stereo audio, four transformer forwards |
+| Poll / download | `GET /v1/jobs/{id}` / `GET /v1/jobs/{id}/video`, or SGLang's `GET /v1/videos/{id}` (`completed`) / `GET /v1/videos/{id}/content`; success includes `video_sha256` |
+| Media | 24 FPS, stereo audio, four transformer forwards; 1344×768 by default, six aspect ratios or the first frame's own; 124–345 frames |
 
 The caller-facing reference, with a tested example client, is [API.md](API.md);
 keep it in step with this contract. The base URL, bearer token, API paths, and
@@ -74,30 +85,34 @@ submissions in progress. This is a bounded worker queue, not a durable global
 queue for an arbitrary batch of 400 requests. With `W` healthy workers, there
 are `W` generation slots and up to `8 × W` waiting slots. A useful initial caller
 limit is `W` for latency-sensitive callers. Batch callers should keep about
-`2 × W` jobs in flight, as the measurements below show. The former 16-worker pool
-used **20 external concurrent jobs**, counting the whole submit → poll → download
-lifecycle across callers. Recalculate after scaling; this is not a guarantee
-against rejection or failure.
+`2 × W` jobs in flight. Recalculate after scaling; this is not a guarantee against
+rejection or failure.
 
-**Measured utilization, Oct 29 to Nov 2 (16 workers).** Workers were generating
-46% of the time, or 63% in the hours when callers had 12 or more jobs in flight.
-Worker queues were empty 82% of the time, and every idle gap was a worker waiting
-for its next request; a job already queued started with no gap. Callers rarely
-had more than about 16 jobs in flight. Each worker therefore sat idle while its
-caller polled, downloaded and submitted the next job, which took a median of 8 s.
+**Why `2 × W`.** From Oct 29 to Nov 2, sixteen workers were generating 46% of the time
+(63% in busy hours). Every idle gap was a worker waiting while its caller polled,
+downloaded, and submitted the next job, a median of 8 s. With about `2 × W` jobs in
+flight, every worker has its next job queued, at the cost of up to one generation of
+queueing per job. The analysis scripts are `util.py`, `newshape.py`, and `gaps.py`
+in `deployment/stability-review-20261102/`.
 
-With about `2 × W` jobs in flight (32 for 16 workers), every worker has its next
-job queued. The cost is up to one generation, about 40 s, of queueing per job.
+**Time per job** depends on three things:
+- the clip's length and task;
+- whether the worker process has already compiled that prompt length;
+- whether the sparse attention's numerical check rejected that length.
 
-Time per job varies too. A 10-second video's pipeline takes:
-- 29 s when its worker process has already run that prompt length, the same as
-  the benchmark;
-- 38 s for a length new to the process, because the Sol kernels compile per
-  length (43% of jobs);
-- 42–47 s with the dense fallback (40% of jobs).
+Measured on 2026-11-05, as processing time per video on two-GPU workers with the
+serving cap:
 
-The analysis scripts are `util.py`, `newshape.py` and `gaps.py` in
-`deployment/stability-review-20261102/`.
+| Clip | Warm, sparse | Warm, dense fallback | First request of a new length |
+|---|---|---|---|
+| 124 frames, 5.2 s | T2V 13.5 s, I2V 15.2 s | 17–19 s | 26–28 s |
+| 243 frames, 10.1 s | T2V 32 s, I2V 34 s | 46–48 s | 42–53 s |
+| 345 frames, 14.4 s | T2V 52 s, I2V 56 s | 79–82 s | 65–90 s |
+
+The dense fallback ran for 6–25% of 5- and 10-second requests and for about half
+of 14-second ones. A rejected length stays dense for the life of the worker
+process. A 14.4-second clip occupies a worker about as long as four 5-second
+clips, so size concurrency by worker time.
 
 A job stays on the worker that accepted it, including while that worker is
 excluded from new dispatch. The gateway copies and checks the MP4 before
@@ -109,7 +124,8 @@ with an empty worker pool, provided their storage is readable.
 |---|---|
 | 202 | Save the returned ID and poll it. With a key, repeating the same POST returns this job in its current state |
 | 400 | `Idempotency-Key` is not a lowercase canonical UUID |
-| 409 | The key was already used with a different prompt, duration, or seed; nothing new started |
+| 409 | The key was already used with different inputs (prompt, seed, duration or target, task, or first frame); nothing new started |
+| 411, 413, 422 | No `Content-Length`, body over 28 MiB, or invalid or unsupported fields (including an undecodable first frame); fix the request |
 | 429 | Request rejected before acceptance; retry with backoff and jitter |
 | 503 | No worker currently available or service not ready; back off |
 | 507 on POST | Storage rejected admission before acceptance; wait for recovery |
@@ -126,7 +142,7 @@ Requests without a key get a random ID and behave as before. Gateway `/healthz`
 reports `idempotency_key: true`, so a client can detect support.
 
 - **Repeat.** Same key and inputs return the existing job, including a failed
-  one. Different inputs return 409. Concurrent repeats share one dispatch in the
+  one. Different inputs return 409; a first frame is compared by its SHA-256. Concurrent repeats share one dispatch in the
   single gateway process.
 - **Ambiguous outcome.** Before each POST the gateway writes
   `uncertain/<id>.json` naming the chosen worker. A repeat asks only that worker
@@ -137,6 +153,13 @@ reports `idempotency_key: true`, so a client can detect support.
   queue is full, it is still loading, or the job failed. The gateway dispatches
   only to workers whose `/healthz` reports `idempotency_key: true`, so a worker on
   older code is never sent work; upgrade workers with the gateway.
+- **SGLang form.** The gateway sends these requests only to workers whose
+  `/healthz` reports `api.version` 2 and an `api.num_frames.max` that covers the
+  request. With none ready it answers 503 with `Retry-After`. Original-form requests
+  can go to any ready worker, so workers can be upgraded one at a time.
+- **First frames.** The submission journal and job records keep each first frame
+  only as format, size, and SHA-256, never as base64. The worker stores the image
+  next to the job record, as `<id>.keyframe0.<ext>` in its output directory.
 - **Failure codes.** Failed jobs carry `error_code`: `worker_restarted`,
   `inference_failed`, or `storage_failure` from the worker, and `worker_lost`
   from the gateway when a job's worker has been unreachable for 10 minutes (or
@@ -265,7 +288,8 @@ and verification of old job IDs and hashes before retiring the previous copy.
 crash fails the worker's running and queued jobs (`worker_restarted`, or
 `worker_lost` after 600 s); callers regenerate with a new key. PyTorch's pool
 stays flat, so the likely cause is kernels loaded outside the pool for each new
-length on the GPU with the least free memory. The analysis and copied logs are in
+length on the GPU with the least free memory; the serving memory cap below leaves
+room for them. The analysis and copied logs are in
 `deployment/stability-review-20261102/`.
 
 **Restart rule.** `serve_node.py` restarts a worker after every crash:
@@ -281,22 +305,27 @@ ended all four H200 allocations on Nov 2 between 09:51 and 13:41 UTC.
 CUDA skipped it and renumbered every later GPU, while `nvidia-smi` indices did
 not change.
 
-**Serving memory cap (trial).** Submitting a node job with
-`H3_SERVING_MEMORY_FRACTION=0.95` changes how its workers use memory after warmup:
-- Each worker releases PyTorch's cached memory and caps the pool at 95% of the
-  GPU, about 132.8 GiB.
-- That is 3.5 GiB above the 129.3 GiB request peak.
-- It leaves about 5 GiB outside the pool for kernels, compared with 0.6–1.0 GiB
-  before.
+**Serving memory cap.** On H200, `deploy_node.sh` sets
+`H3_SERVING_MEMORY_FRACTION=0.95` by default (since 2026-11-05; `0` disables it).
+After warmup each worker releases PyTorch's cached memory and caps the pool at 95%
+of the GPU, 132.8 GiB.
+- **Why.** Uncapped, the pool grows until the GPU is full. The largest SGLang-form
+  requests (8,000-character prompt, 345 frames, 1856×576 canvas, dense fallback)
+  left 0.6 GiB free of 140.4 GiB. That leaves no room for kernels and libraries
+  outside the pool, which is the condition behind the crash above.
+- **Measured with the cap.** On 2026-11-05, 200 requests covered every task,
+  canvas, and length:
+  - at most 128.0 GiB allocated, with the pool at or below 132.8 GiB;
+  - at most 135.1 GiB in use per GPU, leaving at least 5.3 GiB outside the pool;
+  - no slowdown compared with the uncapped run.
+- **Trial.** 0002 ran with the cap from Nov 2. In the 50 hours to Nov 4 its four
+  workers each served 828–848 distinct prompt lengths without a restart. Uncapped
+  nodes crashed 41 times in the same period.
 
 The cap must come after warmup. Loading needs more than serving, because about
 24 GB of weights are freed during the first warmup. On Nov 2 a cap set at launch
 (`PYTORCH_ALLOC_CONF=...,per_process_memory_fraction:0.95`) failed every worker in
 `module.to()`.
-
-0002 has run the trial since Nov 2. Extend it to other nodes only if 0002's
-workers pass about 600 distinct lengths with no out-of-memory failure and
-unchanged processing time.
 
 **Watchdog.** The watchdog is a backstop on the gateway host. `watchdog/` holds the
 code and units; the live copy is in `deployment/watchdog/`.
@@ -306,6 +335,9 @@ code and units; the live copy is in `deployment/watchdog/`.
   runs under `systemd --user` as `h3-worker-<node>-<port>`.
 - What it never does: stop a worker that answers, or submit or cancel Slurm jobs.
 - To keep it away from a worker, list the worker in `excluded_workers`.
+- New nodes: add the node to `NODES` in `watchdog.py` and to the node pattern in
+  `run-worker.sh`; otherwise the watchdog ignores it. The node's job must be
+  named `h3-api-<node>-p18080`.
 - Shared `/home`: `~/.config/systemd/user` is on shared `/home`, so the unit has
   `ConditionHost=` and the script takes a host-local lock in `/run/user/<uid>`.
   On Nov 2 a lock on shared storage, held by another host's copy of the timer,
@@ -335,7 +367,7 @@ The following defaults are implemented; they do not select available nodes:
 | `H3_GPU_TYPE` | `H200`; set `H100` explicitly for H100 nodes |
 | `H3_GPUS_PER_WORKER` | 2 on H200, 4 on H100; accepted values 2 or 4, divisible into the allocation |
 | `CUDA_VISIBLE_DEVICES` | Slurm's assigned GPUs; never replace with a node-wide list. The supervisor passes each worker its pair's UUIDs |
-| `H3_SERVING_MEMORY_FRACTION` | Unset (off). A value such as `0.95` caps PyTorch's pool after warmup (see [Worker crashes](#worker-crashes-restarts-and-the-watchdog)) |
+| `H3_SERVING_MEMORY_FRACTION` | `0.95` on H200 (the `deploy_node.sh` default since 2026-11-05), unset elsewhere; `0` disables it. Caps PyTorch's pool after warmup (see [Worker crashes](#worker-crashes-restarts-and-the-watchdog)). Required with the SGLang request form on two-GPU H200 workers: the largest requests need 128.0 GiB, and an uncapped pool filled the GPU |
 | `H3_BASE_PORT` | 18080; one consecutive port per worker |
 | `H3_DEPLOY_ROOT` | `/home/jeff/sol-h3-h200`; code, token, registry on the worker's cluster |
 | `H3_LOCAL_ROOT` | `/raid/jeff`; override after checking the destination mount |
@@ -343,6 +375,8 @@ The following defaults are implemented; they do not select available nodes:
 | `H3_CHECKPOINT_ROOT` | `$H3_LOCAL_ROOT/sol-h3-checkpoints`; existing model/adapter layout |
 | `H3_BIND_HOST` | Node IP by default; `127.0.0.1` for SSH-forwarded workers |
 | `H3_MIN_FREE_GIB` | 20; node staging/output reserve. Gateway has its own `--min-free-gib` |
+| `H3_MAX_NUM_FRAMES` | Unset (345, the API maximum). A lower 17n+5 value caps what the worker admits and advertises; the gateway then routes longer requests elsewhere |
+| `H3_ATTENTION_BACKEND` | `sol`. `dense` runs dense attention only; used to measure the gate-fallback path's memory |
 
 An eight-GPU H200 allocation gives four workers; eight H100 GPUs give two
 four-GPU workers. They can coexist behind the same gateway. CPU affinities are
@@ -415,24 +449,35 @@ ownership or availability.
      --export=ALL --nodelist=SUPPLIED_H100_NODE "$H3_DEPLOY_ROOT/Sol-H3/deploy_node.sh"
    ```
 
-   `deploy_h200_node.sh` remains a compatibility wrapper for old commands. Capture
-   the returned job IDs and the expected endpoint-to-job mapping in the inventory.
+   Capture the returned job IDs and the expected endpoint-to-job mapping in the inventory.
    The launchers do not submit jobs themselves or automatically recreate cancelled
    jobs. A second allocation on the same H200 host can use base port 18082 when
    the first owns only 18080–18081; verify both ranges before submission.
 6. Wait for each worker's `/healthz` to report ready after two warmups at each
-   duration. Match `slurm_job_id`, GPU family, group size, gate policy, and assigned
-   GPU UUIDs against the plan. Exercise **every worker and every allocated GPU**
-   with 5-second and 10-second requests, including the previously gate-rejected
-   prompt. Validate four forwards, dimensions/FPS/audio, downloaded bytes/hashes,
-   fallback counters, and no unexpected process restarts. Record timings after
-   warmup. H100 validation must include concurrent workers on the same node.
+   original duration. Match these against the plan: `slurm_job_id`, GPU family,
+   group size, gate policy, `api` (version 2 and `num_frames.max`), and assigned
+   GPU UUIDs. Check each worker log for its `SERVING_MEMORY_CAP` line.
+   Exercise **every worker and every allocated GPU** with:
+   - original-form 5-second and 10-second requests, including the previously
+     gate-rejected prompt;
+   - SGLang-form requests at 345 frames, at least one of them with a first frame.
+
+   Validate four forwards, dimensions/FPS/audio, downloaded bytes/hashes, fallback
+   counters, and no unexpected process restarts. Record timings after warmup.
+   For a change to the request contract or the decode, first rerun the test
+   phases (`driver.py` in `deployment/api-v2-validation-20261105/`) on test workers
+   behind a test gateway. H100 validation must include concurrent workers on the same node.
 7. Remove only the validated endpoints from exclusions (or add them to an existing
    explicit `workers` allowlist). Do not clear a global pause or unrelated
    exclusions accidentally. Verify gateway capacity, then run a small authenticated
    batch through the **unchanged external URL**, checking route coverage and
-   downloads. Test an old completed job while its worker is excluded. Start caller
-   concurrency conservatively and increase using observed latency/rejections.
+   downloads. Under live traffic, caller jobs can fill the idle new workers before
+   the batch arrives, so the batch lands on older workers. Then check the caller
+   jobs on the new workers instead: `live_routes.py` in
+   `deployment/scale-0048-0067-20261104/` compares each job's SHA-256 on the
+   worker, in the gateway record, and in the archive. Test an old completed job
+   while its worker is excluded. Start caller concurrency conservatively and
+   increase using observed latency/rejections.
 8. Record the final worker set, Slurm IDs, ports, code/environment versions, GPU
    UUIDs, storage observations, and validation results. Update `desired_state` to
    running only for this explicitly requested, validated deployment.
@@ -545,12 +590,8 @@ With the gateway/service HTTP dependencies and pytest installed, run from the
 repository root (no GPU or Slurm allocation required):
 
 ```bash
-python -m pytest -q models/minimax_h3/Sol-H3/tests/test_service.py \
-  models/minimax_h3/Sol-H3/tests/test_gateway.py \
-  models/minimax_h3/Sol-H3/tests/test_service_supervisor.py \
-  models/minimax_h3/Sol-H3/tests/test_service_storage.py
-bash -n models/minimax_h3/Sol-H3/deploy_node.sh \
-  models/minimax_h3/Sol-H3/deploy_h200_node.sh
+python -m pytest -q models/minimax_h3/Sol-H3/tests/
+bash -n models/minimax_h3/Sol-H3/deploy_node.sh
 ```
 
 The tests inject ENOSPC/EIO/quota/read-only failures, exercise admission versus
@@ -558,6 +599,13 @@ post-acceptance recovery, archive retries, registry isolation, bounded discovery
 grace, explicit pauses, and disjoint H100/H200 launch groups. They also cover
 repeated, concurrent, and conflicting keys; a lost acceptance response before and
 after a gateway restart; refused connections; worker loss; and exclusion of
-workers without job ID support (73 cases on 2026-10-28). A CPU broadcast
+workers without job ID support. `test_request.py` covers the SGLang form:
+- tasks and canvases, checked against Diffusers' own function when it is installed;
+- every frame count;
+- base64 images and their limits;
+- rejected fields.
+
+The suite has 130 cases on 2026-11-05. The large GPU case in `test_lora_fusion.py`
+is skipped unless `H3_RUN_LARGE_GPU_TESTS=1`. A CPU broadcast
 stand-in tests output-error coordination; it does not replace the live distributed
 GPU validation in the redeployment procedure.

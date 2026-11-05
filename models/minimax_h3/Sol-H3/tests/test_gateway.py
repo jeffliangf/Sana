@@ -16,6 +16,8 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import h3_request  # noqa: E402
+
 spec = importlib.util.spec_from_file_location("h3_gateway_test", Path(__file__).resolve().parents[1] / "gateway.py")
 gateway = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gateway)
@@ -32,6 +34,8 @@ class Fleet:
         self.lost = set()  # Accept the next POST, then lose its response.
         self.down = set()  # Refuse every connection.
         self.legacy = set()  # Predates job ID support.
+        self.v1 = set()  # Predates the SGLang-form contract.
+        self.bodies = []
         self.media = b"example-mp4"
         self.expected_bytes = len(self.media)
 
@@ -41,18 +45,26 @@ class Fleet:
         if endpoint in self.down:
             raise httpx.ConnectError("connection refused")
         if request.url.path == "/healthz":
-            return httpx.Response(200, json={"status": "ready", "gpus": 2, "queued": 0, "queue_capacity": 8,
-                                             "active_job": None, "idempotency_key": endpoint not in self.legacy})
+            health = {"status": "ready", "gpus": 2, "queued": 0, "queue_capacity": 8,
+                      "active_job": None, "idempotency_key": endpoint not in self.legacy}
+            if endpoint not in self.v1:
+                health["api"] = h3_request.capabilities()
+            return httpx.Response(200, json=health)
         assert request.headers["Authorization"] == AUTH["Authorization"]
         if request.method == "POST":
             error = self.errors.get(endpoint)
             if isinstance(error, Exception):
                 raise error
+            if isinstance(error, httpx.Response):
+                return error
             if error:
                 return httpx.Response(error)
             await asyncio.sleep(0.005)
             identifier = request.headers["Idempotency-Key"]
-            value = {"id": identifier, "status": "queued", **json.loads(request.content)}
+            body = json.loads(request.content)
+            self.bodies.append(body)
+            parsed = h3_request.parse_request(body)  # A real worker stores the request identity.
+            value = {"id": identifier, "status": "queued", **parsed.identity, "task": parsed.task}
             job = self.jobs.setdefault(identifier, {"endpoint": endpoint, "value": value})
             assert job["endpoint"] == endpoint, "A job ID must never be generated on a second worker"
             if endpoint in self.lost:
@@ -328,7 +340,8 @@ def test_http_contract_auth_and_persistence_without_workers(tmp_path):
         assert client.get("/healthz").json()["gpus"] == 6
         assert client.post("/v1/videos", json={"prompt": "test"}).status_code == 401
         assert client.post("/v1/videos", json={"prompt": ""}, headers=AUTH).status_code == 422
-        assert client.post("/v1/videos", content=b"x" * 32769, headers=AUTH).status_code == 413
+        assert client.post("/v1/videos", content=b"x" * (h3_request.MAX_BODY_BYTES + 1),
+                           headers=AUTH).status_code == 413
         response = client.post("/v1/videos", json={"prompt": "test"}, headers=AUTH)
         assert response.status_code == 202
         job = response.json()
@@ -583,3 +596,103 @@ def test_malformed_registry_cannot_remove_healthy_siblings(tmp_path, bad):
         assert str(path) in router.registry_errors
         await router.client.aclose()
     asyncio.run(run())
+
+
+FAKE_PNG = b"\x89PNG\r\n\x1a\n" + b"keyframe-bytes"
+
+
+def sglang_body(task="fl2va", image=FAKE_PNG, **target):
+    body = {"task": task, "prompt": "The frame comes alive.", "seed": 3,
+            "target": {"short_edge": 768, "duration_seconds": 8.0, **target}}
+    if task == "fl2va":
+        body["conditions"] = [{"type": "image", "role": "keyframe", "frame_index": 0,
+                               "uri": "data:image/png;base64," + __import__("base64").b64encode(image).decode()}]
+    return body
+
+
+def test_sglang_form_is_forwarded_whole_but_journaled_without_base64(tmp_path, monkeypatch):
+    async def run():
+        fleet = Fleet()
+        router = make_gateway(tmp_path, fleet)
+        await router.refresh_pool()
+        journals = []
+        original = gateway.atomic_json
+        monkeypatch.setattr(gateway, "atomic_json", lambda path, value: (journals.append(json.dumps(value)),
+                                                                        original(path, value)))
+        key = str(uuid4())
+        parsed = h3_request.parse_request(sglang_body())
+        value = await router.submit(parsed, key)
+        assert value["id"] == key and value["task"] == "fl2va"
+        assert value["conditions"][0]["sha256"] == hashlib.sha256(FAKE_PNG).hexdigest()
+        assert fleet.bodies[-1]["conditions"][0]["uri"].startswith("data:image/png;base64,")
+        assert journals and not any("base64" in text for text in journals)
+        assert (await router.submit(h3_request.parse_request(sglang_body()), key))["id"] == key
+        with pytest.raises(HTTPException) as conflict:
+            await router.submit(h3_request.parse_request(sglang_body(image=FAKE_PNG + b"!")), key)
+        assert conflict.value.status_code == 409
+        assert len([call for call in fleet.calls if call[0] == "POST"]) == 1
+        await router.client.aclose()
+    asyncio.run(run())
+
+
+def test_sglang_form_goes_only_to_upgraded_workers(tmp_path):
+    async def run():
+        fleet = Fleet()
+        fleet.v1.update(URLS[:2])
+        router = make_gateway(tmp_path, fleet)
+        await router.refresh_pool()
+        for _ in range(3):
+            job = await router.submit(h3_request.parse_request(sglang_body(task="t2va")))
+            assert router.load(job["id"])["worker"] == URLS[2]
+        legacy = await router.submit(gateway.GenerateRequest(prompt="old form"))
+        assert router.load(legacy["id"])["worker"] in URLS
+        assert router.health()["api"]["workers"] == 1
+        fleet.v1.add(URLS[2])
+        await router.refresh_pool()
+        assert router.health()["api"] == {"version": 1, "tasks": ["t2va"], "workers": 0}
+        with pytest.raises(HTTPException) as error:
+            await router.submit(h3_request.parse_request(sglang_body(task="t2va")))
+        assert error.value.status_code == 503 and "t2va" in error.value.detail
+        await router.client.aclose()
+    asyncio.run(run())
+
+
+def test_worker_validation_detail_reaches_the_caller(tmp_path):
+    async def run():
+        fleet = Fleet()
+        detail = [{"loc": ["body", "conditions", 0, "uri"], "msg": "the image could not be decoded", "type": "value_error"}]
+        fleet.errors = {url: httpx.Response(422, json={"detail": detail}) for url in URLS}
+        router = make_gateway(tmp_path, fleet)
+        await router.refresh_pool()
+        with pytest.raises(HTTPException) as error:
+            await router.submit(h3_request.parse_request(sglang_body()))
+        assert error.value.status_code == 422 and error.value.detail == detail
+        assert len([call for call in fleet.calls if call[0] == "POST"]) == 1
+        assert not list((router.root / "uncertain").glob("*.json"))
+        await router.client.aclose()
+    asyncio.run(run())
+
+
+def test_http_sglang_routes_and_validation(tmp_path):
+    fleet = Fleet()
+    router = make_gateway(tmp_path, fleet)
+    with TestClient(gateway.create_app(router)) as client:
+        health = client.get("/healthz").json()
+        assert health["api"]["tasks"] == ["t2va", "fl2va"] and "width" not in health
+        for invalid in ({**sglang_body(), "num_inference_steps": 50}, {**sglang_body(), "task": "ref2va"},
+                        sglang_body(duration_seconds=14.4), sglang_body(aspect_ratio="2:1"),
+                        {**sglang_body(), "conditions": [{**sglang_body()["conditions"][0], "frame_index": -1}]}):
+            response = client.post("/v1/videos", json=invalid, headers=AUTH)
+            assert response.status_code == 422, response.text
+            assert "base64," not in response.text
+        response = client.post("/v1/videos", json=sglang_body(), headers=AUTH)
+        assert response.status_code == 202, response.text
+        job = response.json()
+        deadline = time.monotonic() + 5
+        while client.get(f"/v1/videos/{job['id']}", headers=AUTH).json()["status"] != "completed":
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        assert client.get(job["status_url"], headers=AUTH).json()["status"] == "succeeded"
+        assert client.get(f"/v1/videos/{job['id']}/content").status_code == 401
+        assert client.get(f"/v1/videos/{job['id']}/content", headers=AUTH).content == fleet.media
+        assert client.get(f"/v1/videos/{uuid4()}", headers=AUTH).status_code == 404

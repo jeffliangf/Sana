@@ -29,14 +29,18 @@ deployment configuration and actual browser-loop validation.
 
 ## SOL-H3
 
-For the already deployed H200 service, see the
-[access guide](Sol-H3/README.md#access-the-deployed-h200-service), including the
-SSH gateway, worker addresses, token location, tunnel setup, and a complete API example.
+For the self-hosted H200 service, see:
+- the [API reference](Sol-H3/API.md): the original and SGLang request forms, text-to-video
+  and first-frame image-to-video, job fields, and an example client;
+- the [access guide](Sol-H3/README.md#access-the-deployed-h200-service): gateway URL,
+  SSH tunnel, and token location.
 
 The standalone [`Sol-H3`](Sol-H3/) runtime covers distilled
-4-step T2V, first-frame I2V, and the MiniMax-H3 Ref2VA partition. It supports synchronized video
-and audio, 5/10/15-second outputs at 1344x768, Ulysses sequence parallelism over as many as eight
-GPUs, and SOL/BSA sparse attention. Ref2VA uses the fast reference-image sizing profile by default
+4-step T2V, first-frame I2V, and the MiniMax-H3 Ref2VA partition. It supports:
+- synchronized video and audio at 24 fps;
+- 124–362 frames (5–15 s), at 1344x768 by default or another MiniMax-H3 canvas;
+- Ulysses sequence parallelism over as many as eight GPUs;
+- SOL/BSA sparse attention. Ref2VA uses the fast reference-image sizing profile by default
 and retains an explicit Diffusers-compatible preprocessing mode.
 
 Validation on 8x NVIDIA B300 covers all three task paths:
