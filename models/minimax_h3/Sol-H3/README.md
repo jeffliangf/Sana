@@ -222,8 +222,12 @@ checkpoints, caches, and outputs. It expects a private `deployment/token` and ca
 initialize a fresh node from a checksummed `deployment/staging` snapshot. The
 staged venv is tied to `/raid/jeff/sol-h3-venv`. Other paths and H100 nodes require
 a prepared environment; `H3_VENV` and `H3_CHECKPOINT_ROOT` select it and the weights.
-`H3_GPU_TYPE=H100` defaults to four GPUs per worker, but on 2026-10-28 the model
-did not fit in 80 GB H100s: every rank holds the whole pipeline (about 129 GiB).
+`H3_GPU_TYPE=H100` defaults to four GPUs per worker with `H3_WEIGHT_SHARDING=1`: a
+whole pipeline (about 129 GiB) does not fit in an 80 GB H100, so the worker splits the
+text encoder's decoder layers and the DiT blocks across its four GPUs and gathers each
+block as it runs (`h3_runtime/weight_sharding.py`; outputs are bitwise those of
+replicated weights). A sharded H100 worker peaked at 46.9 GiB allocated per GPU on
+345-frame requests (2026-11-06).
 See [the runbook](DEPLOYMENT.md#parameterize-the-next-fleet) for all settings.
 
 ```bash

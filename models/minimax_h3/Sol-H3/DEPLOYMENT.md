@@ -5,7 +5,7 @@ FastH3 adapter** service. It covers `serve.py`, `serve_node.py`, `gateway.py`, a
 the launchers in this directory. It does not use the separate SGLang deployment
 instructions at the repository root.
 
-**State on 2026-11-05.** Sixteen two-GPU H200 workers serve both request forms
+**State on 2026-11-05 (H200) and 2026-11-06 (H100).** Sixteen two-GPU H200 workers serve both request forms
 through the gateway. The gateway and the workers run the code in this directory
 (commit `3718c71`).
 - Slurm 3949–3952 hold all eight GPUs on 0003, 0035, 0048, and 0067, with four
@@ -21,9 +21,17 @@ through the gateway. The gateway and the workers run the code in this directory
   configuration is in `deployment/archive-20261105-stale/`.
 - Separate `h3-base-fl2va` allocations from another project hold all eight GPUs on
   0002, 0005, 0006, and 0023. They are not part of this service; leave them alone.
-- A two-worker H100 launch on GMI node `gmicloud-loki-gpu-004` (Slurm 3435) failed
-  while loading the model. Every rank holds the whole pipeline, about 129 GiB, and an
-  H100 has 80 GB (see [H100 workers](#h100-workers-on-another-cluster)).
+- **H100, 2026-11-06.** Eight four-GPU H100 workers with sharded weights ran on GMI
+  nodes gpu-001/004/005/006. On that cluster's Slurm, whose job IDs restarted after a
+  rebuild, they were jobs 6, 5, 7 and 8. Each node ran two workers on loopback ports
+  18080–18081, launched from `deployment/h100-fleet-20261106/`.
+  - All eight passed direct validation (40 requests), then served a direct evaluation
+    run.
+  - **Stopped 2026-11-06 04:52 UTC at the user's request** (`scancel 5 6 7 8`); see the fleet README.
+  - They never joined the gateway pool: the gateway host's SSH key had changed and
+    was not confirmed (see [H100 workers](#h100-workers-on-another-cluster)).
+  - The 2026-10-28 attempt (Slurm 3435) had failed because whole-pipeline ranks do not
+    fit in 80 GB.
 
 Do not interpret this document or a stale registry as an instruction to restart or
 stop workers.
@@ -371,6 +379,7 @@ The following defaults are implemented; they do not select available nodes:
 | `H3_GPUS_PER_WORKER` | 2 on H200, 4 on H100; accepted values 2 or 4, divisible into the allocation |
 | `CUDA_VISIBLE_DEVICES` | Slurm's assigned GPUs; never replace with a node-wide list. The supervisor passes each worker its pair's UUIDs |
 | `H3_SERVING_MEMORY_FRACTION` | `0.95` on H200 (the `deploy_node.sh` default since 2026-11-05), unset elsewhere; `0` disables it. Caps PyTorch's pool after warmup (see [Worker crashes](#worker-crashes-restarts-and-the-watchdog)). Required with the SGLang request form on two-GPU H200 workers: the largest requests need 128.0 GiB, and an uncapped pool filled the GPU |
+| `H3_WEIGHT_SHARDING` | `1` on H100 (the `deploy_node.sh` default since 2026-11-06), unset elsewhere; `0` disables it. Splits the text encoder's decoder layers and the DiT blocks across the worker's GPUs and gathers each block just before it runs (`h3_runtime/weight_sharding.py`). Required on 80 GB GPUs, where one rank's whole pipeline (about 129 GiB) does not fit |
 | `H3_BASE_PORT` | 18080; one consecutive port per worker |
 | `H3_DEPLOY_ROOT` | `/home/jeff/sol-h3-h200`; code, token, registry on the worker's cluster |
 | `H3_LOCAL_ROOT` | `/raid/jeff`; override after checking the destination mount |
@@ -389,11 +398,17 @@ ports: the base port also selects a separate registry/runtime directory. Reusing
 a port means reusing its local output directory, which is necessary for old job
 records; never delete it as part of a code update.
 
-H100 and H200 use the Hopper kernel path in this runtime. That does not establish
-the memory margin, speed, or reliability of the four-GPU H100 service. **The
-current runtime does not fit on 80 GB H100s** (2026-10-28, see
-[below](#h100-workers-on-another-cluster)); the H100 settings remain for a future
-model-placement change. Keep the four-step adapter, numerical gate, and dense
+H100 and H200 use the Hopper kernel path in this runtime. Whole-pipeline ranks do
+not fit on 80 GB H100s (2026-10-28, see [below](#h100-workers-on-another-cluster)).
+With `H3_WEIGHT_SHARDING=1`, each GPU of a four-GPU H100 worker holds 20.6 GiB of
+block shards. Measured on 2026-11-06:
+- 61.4 GiB allocated on the first request, before the AdaLN precompute frees
+  `adaln_proj`;
+- at most 46.9 GiB allocated and 52.6 GiB reserved afterwards, including 345-frame
+  T2V and I2V requests.
+
+Two-GPU H100 workers would not fit 345-frame requests even with sharding, so keep
+four GPUs per worker on H100. Keep the four-step adapter, numerical gate, and dense
 fallback; do not relax tolerances to make a deployment pass.
 
 The historical H200 environment tar contains absolute interpreter/shebang paths
@@ -549,13 +564,66 @@ attempts; the supervisor disabled them and released the allocation after 16
 minutes. Every rank holds the full pipeline (62 GiB text encoder plus 62 GiB
 transformer in BF16, plus VAEs; an H200 rank peaked at 129 GiB allocated), and
 context parallelism splits activations, not weights, so four GPUs per worker do
-not help. An H100 worker needs the text encoder kept off the GPU between prompts,
-or weights sharded across ranks; neither is implemented. The environment
-archive, verified weights, wrapper, `outcome.json`, and node-local copies on
-gpu-004 remain for a retry.
+not help. The environment archive and verified weights from that attempt are still
+used. gpu-004 was reimaged before 2026-11-06, so its node-local copies are gone.
 
-Merge these gateway-reachable origins into `pool.json`'s `additional_workers`
-while retaining automatic H200 discovery and current exclusions:
+**2026-11-06: sharded four-GPU workers fit.** `H3_WEIGHT_SHARDING=1` (the H100 default)
+changes only how the weights are placed:
+- **Load.** The DiT loads whole for the LoRA merge and the installs; the text encoder
+  stays on the CPU until it is sharded.
+- **Sharding.** Each rank keeps 1/4 of every DiT block and text-encoder decoder layer.
+  A forward pre-hook all-gathers the next block on a separate NCCL group and stream.
+  The values are copied, never transformed: `tests/test_weight_sharding.py` checks
+  that the outputs equal the replicated ones bit for bit on 2 and 4 GPUs.
+- **Replicated parts.** `adaln_proj` stays whole until the AdaLN precompute frees
+  it. The VAEs, the token refiner and the text encoder's embeddings and vision tower
+  stay whole too.
+- **Dropped parts.** The text encoder keeps 51 of its 64 decoder layers and drops its
+  LM head. MiniMax-H3 reads `hidden_states[50]`, which is unchanged; the test checks
+  this too.
+
+The fleet ran from `deployment/h100-fleet-20261106/` on the GMI cluster:
+- `launch.sh` and `preflight.py` refuse a node outside `nodes.json`, a GPU with a
+  volatile uncorrected ECC error or a pending or failed row remap, a busy GPU or port,
+  and less than 250 GiB free on `/var/tmp`.
+- `validate.py` runs on the node as an `srun --overlap` step against both workers at
+  once.
+- A fresh node is ready 11 minutes after submission, including the 136 GB weight copy.
+
+Measured on gpu-004 with both workers running (processing time, through the MP4):
+
+| Request | Time |
+|---|---|
+| 5 s, warm | 8.4 s |
+| 10 s, warm | 18.3 s |
+| 10 s, gate-rejected prompt (dense) | 33.8 s |
+| 345-frame T2V / I2V, first use of the length | 42.2 s / 45.1 s |
+| 9:16 5 s, first use of the shape | 21–22 s |
+
+Each node's allocation owns its reverse tunnel. The tunnel starts only once
+`tunnels-enabled` exists in the fleet directory. The gateway host's SSH key changed
+between 2026-11-05 and 2026-11-06, so `known_hosts` must be updated before the
+tunnels can start. Gateway ports:
+
+| Node | Gateway port → node port |
+|---|---|
+| gpu-004 | 28084 → 18080, 28085 → 18081 |
+| gpu-001 | 28086 → 18080, 28087 → 18081 |
+| gpu-005 | 28088 → 18080, 28089 → 18081 |
+| gpu-006 | 28090 → 18080, 28091 → 18081 |
+
+To admit the workers:
+1. Run `pool_h100.py exclude` on the gateway host. It adds the eight origins to both
+   `additional_workers` and `excluded_workers`, keeping every other entry.
+2. Create `tunnels-enabled`.
+3. Validate each origin through its tunnel.
+4. Run `pool_h100.py admit <origin>...`.
+
+The H200 watchdog cannot reach the GMI cluster, so only `serve_node.py` restarts
+these workers.
+
+Merge gateway-reachable origins into `pool.json`'s `additional_workers` while
+retaining automatic H200 discovery and current exclusions:
 
 ```json
 {"additional_workers": ["http://127.0.0.1:28084", "http://127.0.0.1:28085"]}
