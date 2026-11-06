@@ -11,6 +11,11 @@ export H3_GPU_TYPE="${H3_GPU_TYPE:-H200}"
 if [[ "$H3_GPU_TYPE" == H200 ]]; then
     export H3_SERVING_MEMORY_FRACTION="${H3_SERVING_MEMORY_FRACTION:-0.95}"
 fi
+# One rank's whole pipeline (~129 GiB) does not fit on an 80 GB H100, so H100 workers split the text
+# encoder and DiT blocks across their GPUs (h3_runtime/weight_sharding.py). 0 disables it.
+if [[ "$H3_GPU_TYPE" == H100 ]]; then
+    export H3_WEIGHT_SHARDING="${H3_WEIGHT_SHARDING:-1}"
+fi
 : "${SLURM_JOB_ID:?Launch this service inside a Slurm allocation}"
 stage="$H3_DEPLOY_ROOT/deployment/staging"
 venv="${H3_VENV:-$H3_LOCAL_ROOT/sol-h3-venv}"

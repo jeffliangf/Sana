@@ -417,6 +417,11 @@ def main():
     serving_fraction = float(os.environ.get("H3_SERVING_MEMORY_FRACTION") or 0)
     if not 0 <= serving_fraction < 1:
         raise ValueError("H3_SERVING_MEMORY_FRACTION must be at least 0 and below 1")
+    # Split the text encoder and DiT blocks across the worker's GPUs; needed on 80 GB H100s (DEPLOYMENT.md).
+    weight_sharding = os.environ.get("H3_WEIGHT_SHARDING", "0")
+    if weight_sharding not in {"0", "1"}:
+        raise ValueError("H3_WEIGHT_SHARDING must be '0' or '1'")
+    weight_sharding = weight_sharding == "1"
     if args.attention_backend != "dense":
         os.environ["SOL_ATTN_STRICT"] = "1"
         os.environ["SOL_ATTN_CORRECTNESS_GATE"] = "1"
@@ -442,6 +447,7 @@ def main():
                                           "duration_seconds": [5, 10], "width": 1344, "height": 768,
                                           "fps": 24, "transformer_forwards": 4,
                                           "encoder_threads": args.encoder_threads,
+                                          "weight_sharding": weight_sharding,
                                           "slurm_job_id": os.environ.get("SLURM_JOB_ID")},
                                 max_num_frames=args.max_num_frames)
             server = uvicorn.Server(uvicorn.Config(create_app(state, token), host=args.host, port=args.port,
@@ -455,7 +461,8 @@ def main():
                 time.sleep(0.1)
 
         engine = MiniMaxH3Inference(args.model, args.adapter, attention_backend=args.attention_backend,
-                                    task="t2v", compute_quant="none", lora_mode="merged")
+                                    task="t2v", compute_quant="none", lora_mode="merged",
+                                    weight_sharding=weight_sharding)
 
         def count_forward(*unused):
             forwards[0] += 1

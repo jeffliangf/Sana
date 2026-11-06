@@ -126,6 +126,7 @@ class MiniMaxH3Inference:
         reference_image_resize_mode: str = "match",
         compute_quant: str = "none",
         lora_mode: str = "merged",
+        weight_sharding: bool = False,
     ) -> None:
         lora_mode = lora_mode.lower()
         if lora_mode not in {"merged", "separate", "fused"}:
@@ -174,6 +175,12 @@ class MiniMaxH3Inference:
             from .compute_quant import validate_platform
 
             validate_platform()
+        if weight_sharding and (
+            self.world_size == 1 or task == "ref2va" or lora_mode != "merged" or compute_quant != "none"
+        ):
+            raise ValueError(
+                "weight sharding supports multi-GPU T2V/I2V with a merged LoRA and BF16 compute only"
+            )
         self.task = task
         self.attention_backend = attention_backend
         self.reference_image_resize_mode = reference_image_resize_mode
@@ -224,7 +231,18 @@ class MiniMaxH3Inference:
                 f"failed to load {component} from {model_path!r}; "
                 f"make sure {component}/config.json and all checkpoint shards exist"
             )
-        self.pipe.to(self.device)
+        if weight_sharding:
+            # 80 GB GPUs (H100): the text encoder stays on the CPU until it is sharded at the end
+            # of __init__. Everything else goes to the GPU whole, because the LoRA merge needs the
+            # complete DiT there; its blocks are sharded once the merge and installs are done.
+            from .weight_sharding import truncate_text_encoder
+
+            truncate_text_encoder(self.pipe.text_encoder)
+            for name, component in self.pipe.components.items():
+                if name != "text_encoder" and isinstance(component, torch.nn.Module):
+                    component.to(self.device)
+        else:
+            self.pipe.to(self.device)
         self.pipe.scheduler.set_shift(12.0)
         self.pipe.audio_scheduler.set_shift(3.0)
 
@@ -306,6 +324,27 @@ class MiniMaxH3Inference:
             from . import video_decode
 
             video_decode.install()
+        self.weight_sharding = None
+        if weight_sharding:
+            from .weight_sharding import BlockSharding
+
+            # After the installs, so nothing reads the sharded weights outside a block's forward.
+            # `adaln_proj` stays whole: the AdaLN precompute evaluates and frees it on the first request.
+            self.weight_sharding = BlockSharding(self.device)
+            stats = self.weight_sharding.shard(
+                [self.transformer.transformer_blocks, self.pipe.text_encoder.model.language_model.layers],
+                exclude={0: ("adaln_proj",)},
+            )
+            self.pipe.text_encoder.to(self.device)
+            torch.cuda.empty_cache()
+            if self.rank == 0:
+                print(
+                    f"[h3.sharding] {stats['blocks']} blocks over {stats['world']} GPUs: "
+                    f"{stats['shard_gib']:.2f} GiB shard and {stats['buffers_gib']:.2f} GiB gather "
+                    f"buffers per GPU, {stats['released_gib']:.2f} GiB of whole blocks released; "
+                    f"{torch.cuda.memory_allocated(self.device) / 2**30:.2f} GiB allocated",
+                    flush=True,
+                )
         self._adaln_checked = False
 
     @property
