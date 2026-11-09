@@ -34,12 +34,26 @@ image-to-video with stereo audio at 24 fps, in either request form:
 - The SGLang MiniMax-H3 form: `t2va` or `fl2va`, six aspect ratios or the first
   frame's own, 124–345 frames.
 
-**State on 2026-11-05.** Since 02:40 UTC, 16 two-GPU H200 workers on 0003, 0035,
-0048, and 0067 (Slurm 3949–3952) have served both request forms through the
-gateway, with the 0.95 serving cap. The gateway and workers run the code in this
-directory. The rollout passed 64 direct and 16 gateway validation jobs, covering
-every worker, both tasks, and 124–345 frames
-(`deployment/rollout-api-v2-20261105/`). Check `/healthz` for live capacity.
+**State on 2026-11-08.** 32 two-GPU H200 workers run on all eight nodes:
+`dc02-gpu-{002,003,005,006,023,035,048,067}.internal.bigbeargpu.cloud`, Slurm jobs
+10–17, four workers per node on ports 18080–18083. All are admitted through the
+gateway with the 0.95 serving cap. The rebuilt cluster uses
+`/var/tmp/jeff-sol-h3` for node-local environments, weights, caches, and outputs;
+the shared deployment root and caller URL are unchanged. Direct validation
+passed 128 jobs and gateway validation passed 32, covering every worker.
+Evidence is in `deployment/fleet-32-dc02-20261107/`; the extended T2V/I2V and
+stress-test results are under `finish-20261108/test-suite/` there.
+Check `/healthz` for live capacity.
+
+The extended validation passed 35 API contract checks, 8 original-form jobs,
+85 T2V cases, 94 I2V cases (including 6 expected rejections), 19 worst-case cases,
+and 256 mixed requests with 64 concurrent clients. The client decoded 456 full
+videos and checked hashes, frame counts, geometry, FPS, audio, and four model
+forwards. The final audit found 32 ready workers, no worker restarts, and no GPU
+hardware errors. The hourly watchdog is enabled, recognizes all 32 workers, and
+uses the same launch configuration as the live fleet. User lingering keeps the
+gateway and watchdog running after SSH logout. Full evidence is in
+`deployment/fleet-32-dc02-20261107/finish-20261108/final-report.json`.
 
 ### Access the deployed H200 service
 
@@ -53,9 +67,10 @@ private and require cluster network access or an SSH tunnel.
 
 | Item | Value |
 |---|---|
-| Public SSH login / gateway | `157.66.255.187`, port **44222** (`VM-187-fukushimadc`) |
+| Public SSH login / gateway | `157.66.255.187`, port **44222** (`VM-187-Konsttech` since the rebuild) |
 | Existing deployment owner | `jeff` |
-| Jeff's key on this workstation | `/home/jeff/.ssh/gmi` |
+| Configured SSH alias on this workstation | `h200-login`, through `h200-relay` |
+| Jeff's login key on this workstation | `/home/jeff/.ssh/id_ed25519_h200_agent` |
 | Shared service token file on the cluster | `/home/jeff/sol-h3-h200/deployment/token` |
 | Stable API base URL | **`http://10.2.201.187:18080`** |
 | Shared deployment code and logs | `/home/jeff/sol-h3-h200` |
@@ -63,7 +78,7 @@ private and require cluster network access or an SSH tunnel.
 Log in from this workstation, then query the private endpoint:
 
 ```bash
-ssh -i ~/.ssh/gmi -p 44222 jeff@157.66.255.187
+ssh h200-login
 # On the cluster login host:
 curl --noproxy '*' --fail http://10.2.201.187:18080/healthz
 ```
@@ -72,17 +87,19 @@ To call it from another machine, run this tunnel on the **client machine** and
 keep the terminal open:
 
 ```bash
-ssh -i ~/.ssh/gmi -p 44222 -N \
+ssh -N \
   -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
-  -L 127.0.0.1:28080:10.2.201.187:18080 jeff@157.66.255.187
+  -L 127.0.0.1:28080:10.2.201.187:18080 h200-login
 ```
 
 Then use `http://127.0.0.1:28080` as the base URL on that machine. This single
 tunnel reaches the entire worker pool. A tunnel on a
 login host does not make that host's loopback address available to Ray actors on
 other compute hosts. Run forwarding on each client host or provide network routing.
-Other people need authorized SSH access and the service bearer token; the listed
-key and private token file belong to Jeff's deployment account.
+The aliases above are configured in this workstation's SSH config; another
+client needs its own authorized SSH route. Other people need authorized SSH
+access and the service bearer token; the listed key and private token file belong
+to Jeff's deployment account.
 
 Callers use the [example client](API.md#example-client) and the rules in the
 API reference.
@@ -305,6 +322,7 @@ Evidence is in `/home/jeff/sol-h3-h200/deployment/` on the cluster unless noted.
 | 2026-11-04 | 0048 and 0067 added: 32 workers. Fleet stopped at 22:57 UTC | `scale-0048-0067-20261104/`, `stop-32-workers-20261104T225735Z/` |
 | 2026-11-05 | SGLang request form, round-based VAE decode, and the H200 memory cap by default, validated on test workers. Stale configuration archived | `api-v2-validation-20261105/`, `archive-20261105-stale/` |
 | 2026-11-05 | That code deployed: gateway updated in place, 16 workers on 0003, 0035, 0048, 0067. The watchdog restarts workers with the cap | `rollout-api-v2-20261105/` |
+| 2026-11-07/08 | 32 workers on the rebuilt eight-node cluster; persistent gateway and watchdog restored. T2V/I2V matrix and 256-request concurrent stress run passed | `fleet-32-dc02-20261107/finish-20261108/` |
 
 ## Validation
 

@@ -1,7 +1,7 @@
 [Unit]
 Description=Sol-H3 worker watchdog: restart H200 workers that are down (see /home/jeff/sol-h3-h200/deployment/watchdog/README.md)
 # ~/.config/systemd/user is on the shared /home; run only on the gateway host.
-ConditionHost=VM-187-fukushimadc
+ConditionHost=VM-187-Konsttech
 
 [Service]
 Type=oneshot

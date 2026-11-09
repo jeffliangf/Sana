@@ -37,11 +37,14 @@ import time
 import urllib.error
 import urllib.request
 
-GATEWAY_HOST = "VM-187-fukushimadc"
+GATEWAY_HOST = "VM-187-Konsttech"  # VM-187-fukushimadc before the 2026-11-05 cluster rebuild
 ROOT = Path("/home/jeff/sol-h3-h200")
 HERE = Path(__file__).resolve().parent
 POOL = ROOT / "gateway/pool.json"
-NODES = {"0003": "10.2.201.3", "0035": "10.2.201.35", "0048": "10.2.201.48", "0067": "10.2.201.67"}
+NODES = {"002": "10.2.201.2", "003": "10.2.201.3", "005": "10.2.201.5", "006": "10.2.201.6",
+         "023": "10.2.201.23", "035": "10.2.201.35", "048": "10.2.201.48", "067": "10.2.201.67"}
+# Slurm node name, hostname and registry directory of a node since the rebuild (fukushimadc-02-hgx-0XXX before).
+NODE_HOST = "dc02-gpu-{}.internal.bigbeargpu.cloud"
 PORTS = (18080, 18081, 18082, 18083)
 CRASH_LOOP_COOLDOWN = 6 * 3600
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -76,7 +79,7 @@ def health(url):
 
 
 def registry(node):
-    path = ROOT / f"deployment/fukushimadc-02-hgx-{node}/node.json"
+    path = ROOT / f"deployment/{NODE_HOST.format(node)}/node.json"
     for _ in range(5):  # the MooseFS atomic replace can hide the file for a moment
         try:
             return json.loads(path.read_text())
@@ -184,7 +187,7 @@ def main():
     for line in command("squeue", "-h", "-u", "jeff", "-t", "RUNNING", "-o", "%i %j %N").splitlines():
         fields = line.split()
         for node in NODES:
-            if fields[1:3] == [f"h3-api-{node}-p18080", f"fukushimadc-02-hgx-{node}"]:
+            if fields[1:3] == [f"h3-api-{node}-p18080", NODE_HOST.format(node)]:
                 jobs[node] = fields[0]
     states = {node: registry(node) for node in NODES}
     workers = [(node, port, f"http://{address}:{port}") for node, address in NODES.items() for port in PORTS]

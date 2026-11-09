@@ -5,22 +5,35 @@ FastH3 adapter** service. It covers `serve.py`, `serve_node.py`, `gateway.py`, a
 the launchers in this directory. It does not use the separate SGLang deployment
 instructions at the repository root.
 
-**State on 2026-11-05 (H200) and 2026-11-06 (H100).** Sixteen two-GPU H200 workers serve both request forms
-through the gateway. The gateway and the workers run the code in this directory
-(commit `3718c71`).
-- Slurm 3949–3952 hold all eight GPUs on 0003, 0035, 0048, and 0067, with four
-  workers each on ports 18080–18083. They were admitted at 02:40 UTC after
-  validation; evidence is in `deployment/rollout-api-v2-20261105/`.
-  `deployment/jobs.json` lists them (`desired_state: running`).
+**State on 2026-11-08 (H200).** 32 two-GPU H200 workers serve both request forms
+through the gateway. The serving runtime remains the validated `3718c71` code;
+the watchdog now uses the rebuilt cluster's hostnames and local paths.
+- Slurm 10–17 hold all 64 GPUs on
+  `dc02-gpu-{002,003,005,006,023,035,048,067}.internal.bigbeargpu.cloud`, with four
+  workers each on ports 18080–18083. `deployment/jobs.json` records all eight
+  allocations as running and admitted. Evidence is in
+  `deployment/fleet-32-dc02-20261107/`, with the extended validation under
+  `finish-20261108/test-suite/`.
 - Workers cap PyTorch's pool at 95% of the GPU after warmup (132.8 GiB), the H200
   default.
 - `pool.json` is `{"excluded_workers": []}`: registry discovery, nothing excluded.
-- The watchdog timer runs hourly for these four nodes.
-- The previous fleet, 32 workers on eight nodes, was stopped on 2026-11-04 at
-  22:57 UTC (`deployment/stop-32-workers-20261104T225735Z/`). Its stale
-  configuration is in `deployment/archive-20261105-stale/`.
-- Separate `h3-base-fl2va` allocations from another project hold all eight GPUs on
-  0002, 0005, 0006, and 0023. They are not part of this service; leave them alone.
+- The gateway host is now `VM-187-Konsttech`. User lingering is enabled, and the
+  hourly watchdog covers all eight nodes. Its launch configuration was checked
+  against all 32 live workers.
+- `/raid` became root-owned during the rebuild. This fleet uses
+  `/var/tmp/jeff-sol-h3` on each node, with the relocated environment and verified
+  checkpoints. Its `launch.sh` sets `H3_BIND_HOST` to the node's `10.2.201.*`
+  address because the full hostname resolves to a USB link-local address.
+- The rebuild ended the previous 16-worker fleet (Slurm 3949–3952) and reset
+  Slurm job IDs. The old inventory is retained under `previous_inventory` in
+  `deployment/jobs.json`; do not use those old IDs for current operations.
+- Final verification passed 32 gateway jobs, 35 API contract checks, 8 legacy
+  jobs, 85 T2V cases, 94 I2V cases (6 expected rejections), 19 worst-case cases,
+  and 256 mixed requests at 64-client concurrency. All 64 GPUs were exercised;
+  no worker restarted or reported a GPU hardware error. Gateway health probes
+  stayed responsive, although instantaneous worker readiness dipped to 21 under
+  load before returning to 32. See `finish-20261108/final-report.json` in the
+  fleet evidence directory for the complete measurements and current GPU mapping.
 - **H100, 2026-11-06.** Eight four-GPU H100 workers with sharded weights ran on GMI
   nodes gpu-001/004/005/006. On that cluster's Slurm, whose job IDs restarted after a
   rebuild, they were jobs 6, 5, 7 and 8. Each node ran two workers on loopback ports
@@ -41,7 +54,7 @@ stop workers.
 | Item | Contract |
 |---|---|
 | External base URL | **`http://10.2.201.187:18080`** |
-| Gateway login | `ssh -i ~/.ssh/gmi -p 44222 jeff@157.66.255.187` |
+| Gateway login from this workstation | `ssh h200-login` (configured relay and login key; see README) |
 | Deployment root on that cluster | `/home/jeff/sol-h3-h200` |
 | Bearer token | Existing `deployment/token`; keep private and preserve it |
 | Submit | `POST /v1/videos` with the original JSON `{prompt, duration (5 or 10), seed}`, or the SGLang form `{task (t2va or fl2va), prompt, conditions, target, seed}` ([API.md](API.md#sglang-form)) |
