@@ -135,6 +135,10 @@ def test_shared_storage_failure_preserves_workers_and_recovers(tmp_path, monkeyp
     root, local = tmp_path / "shared", tmp_path / "local"
     (root / "deployment").mkdir(parents=True)
     (root / "deployment/token").write_text("x" * 40)
+    (root / "Sol-H3").mkdir()
+    (root / "Sol-H3/serve.py").write_text("")  # the supervisor checks its code directory
+    monkeypatch.delenv("H3_CODE_DIR", raising=False)
+    monkeypatch.delenv("H3_ASYNC_PUBLICATION", raising=False)
     for key, value in {"H3_DEPLOY_ROOT": str(root), "H3_LOCAL_ROOT": str(local),
                        "SLURM_JOB_ID": "123", "CUDA_VISIBLE_DEVICES": ",".join(map(str, range(device_count))),
                        "H3_GPU_TYPE": gpu_type, "H3_BASE_PORT": "18082"}.items():

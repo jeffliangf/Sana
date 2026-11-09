@@ -5,35 +5,37 @@ FastH3 adapter** service. It covers `serve.py`, `serve_node.py`, `gateway.py`, a
 the launchers in this directory. It does not use the separate SGLang deployment
 instructions at the repository root.
 
-**State on 2026-11-08 (H200).** 32 two-GPU H200 workers serve both request forms
-through the gateway. The serving runtime remains the validated `3718c71` code;
-the watchdog now uses the rebuilt cluster's hostnames and local paths.
-- Slurm 10–17 hold all 64 GPUs on
-  `dc02-gpu-{002,003,005,006,023,035,048,067}.internal.bigbeargpu.cloud`, with four
-  workers each on ports 18080–18083. `deployment/jobs.json` records all eight
-  allocations as running and admitted. Evidence is in
-  `deployment/fleet-32-dc02-20261107/`, with the extended validation under
-  `finish-20261108/test-suite/`.
+**State on 2026-11-09 (H200).** 20 two-GPU H200 workers serve both request forms
+through the gateway with [overlapped output publication](#overlapped-output-publication)
+(`H3_ASYNC_PUBLICATION=1`).
+- Slurm 25–29 hold all eight GPUs on
+  `dc02-gpu-{002,003,005,006,023}.internal.bigbeargpu.cloud` (jobs 26, 27, 28, 25,
+  29), four workers each on ports 18080–18083.
+  - They run the read-only release
+    `/home/jeff/sol-h3-h200/releases/20261109-async-publication-de684c517f65/Sol-H3`;
+    each `/healthz` reports its `release.source_sha256`.
+  - `deployment/jobs.json` records them. Evidence is in
+    `deployment/async-publication-20261109/`.
+- Validated on 2026-11-09 with 80 direct jobs, 20 jobs through the gateway URL
+  that reached every worker, a back-to-back overlap check, and an encoder
+  equivalence test on an H200. For the measured speed, see
+  [Roll out overlapped publication](#roll-out-overlapped-publication).
+- Node 035 was freed on 2026-11-09 at the user's request. Since 17:47 UTC that day,
+  048 and 067 run another user's jobs (`deployment/release-2-nodes-20261109T174700Z/`).
+  `pool.json` excludes the origins of all three nodes; leave them alone.
 - Workers cap PyTorch's pool at 95% of the GPU after warmup (132.8 GiB), the H200
   default.
-- `pool.json` is `{"excluded_workers": []}`: registry discovery, nothing excluded.
-- The gateway host is now `VM-187-Konsttech`. User lingering is enabled, and the
-  hourly watchdog covers all eight nodes. Its launch configuration was checked
-  against all 32 live workers.
-- `/raid` became root-owned during the rebuild. This fleet uses
-  `/var/tmp/jeff-sol-h3` on each node, with the relocated environment and verified
-  checkpoints. Its `launch.sh` sets `H3_BIND_HOST` to the node's `10.2.201.*`
-  address because the full hostname resolves to a USB link-local address.
-- The rebuild ended the previous 16-worker fleet (Slurm 3949–3952) and reset
-  Slurm job IDs. The old inventory is retained under `previous_inventory` in
-  `deployment/jobs.json`; do not use those old IDs for current operations.
-- Final verification passed 32 gateway jobs, 35 API contract checks, 8 legacy
-  jobs, 85 T2V cases, 94 I2V cases (6 expected rejections), 19 worst-case cases,
-  and 256 mixed requests at 64-client concurrency. All 64 GPUs were exercised;
-  no worker restarted or reported a GPU hardware error. Gateway health probes
-  stayed responsive, although instantaneous worker readiness dipped to 21 under
-  load before returning to 32. See `finish-20261108/final-report.json` in the
-  fleet evidence directory for the complete measurements and current GPU mapping.
+- The gateway host is `VM-187-Konsttech`, and user lingering is enabled. The hourly
+  watchdog runs the release's watchdog files and restarts each worker with its
+  allocation's release and publication mode.
+- Since the cluster rebuild, `/raid` is root-owned. The fleet uses
+  `/var/tmp/jeff-sol-h3` on each node. Its `launch.sh` sets `H3_BIND_HOST` to the
+  node's `10.2.201.*` address, because the full hostname resolves to a USB
+  link-local address.
+- The 32-worker fleet of 2026-11-07 (Slurm 10–17, code `3718c71`) passed the
+  extended validation on 2026-11-08: 256 mixed requests at 64-client concurrency
+  and the T2V/I2V matrix (`deployment/fleet-32-dc02-20261107/finish-20261108/final-report.json`).
+  Its inventory is under `previous_inventory` in `jobs.json`; do not use its job IDs.
 - **H100, 2026-11-06.** Eight four-GPU H100 workers with sharded weights ran on GMI
   nodes gpu-001/004/005/006. On that cluster's Slurm, whose job IDs restarted after a
   rebuild, they were jobs 6, 5, 7 and 8. Each node ran two workers on loopback ports
@@ -99,9 +101,10 @@ flowchart LR
     Archive --> Gateway
 ```
 
-Each worker runs one generation at a time, with eight waiting requests. The
-gateway chooses a healthy worker using observed queue depth, accepted jobs, and
-submissions in progress. This is a bounded worker queue, not a durable global
+Each worker runs one generation at a time, with eight waiting requests; with
+[overlapped publication](#overlapped-output-publication) it can also be publishing
+its previous video. The gateway chooses a healthy worker using observed queue
+depth, accepted jobs, and submissions in progress. This is a bounded worker queue, not a durable global
 queue for an arbitrary batch of 400 requests. With `W` healthy workers, there
 are `W` generation slots and up to `8 × W` waiting slots. A useful initial caller
 limit is `W` for latency-sensitive callers. Batch callers should keep about
@@ -197,6 +200,119 @@ worker acceptance while both job-record and journal writes are failing, it can
 still lose a keyless accepted ID. Worker restart still marks interrupted jobs
 failed instead of replaying GPU work. Do not promise zero failed requests or
 transparent recovery from node loss.
+
+## Overlapped output publication
+
+`H3_ASYNC_PUBLICATION=1` (`serve.py --async-publication`) lets a worker generate
+the next video while it publishes the previous one. The launcher default, `0`,
+publishes each MP4 before the next generation starts, as before. Since 2026-11-09 the
+H200 fleet runs with `1`, which its `launch.sh` sets
+([Roll out overlapped publication](#roll-out-overlapped-publication)).
+
+**What changes.** After generation, rank zero copies the video into pinned host
+memory and the GPU starts the next job. A background thread on rank zero finishes
+the previous MP4: the rest of the x264 encode, the audio mux, inspection, fsync, the
+atomic rename, and the terminal job record (`output_publication.py`). At most one
+publication runs per worker. When the next video is ready to stage before the
+previous publication ends, it waits for that slot, so a worker never holds more
+than one encoder or one set of pinned frames besides the generation on its GPUs.
+The model, adapter, request identities, media, queue capacity of eight, and the
+two-GPU topology are unchanged. Model calls, CUDA work, and every collective stay
+on the main thread. Warmups always publish synchronously, so readiness still
+follows complete outputs.
+
+**Expected gain.** In the r3 training run (42,738 videos) the time after
+generation averaged 2.27 s of 40.9 s: 1.2 s for 5-second clips, 2.4 s for 10-second
+clips, 3.4 s for 14-second clips. Because it grows with clip length, it is mostly
+the encode tail, which this overlaps. The copy off the GPU and the rank handshake
+stay on the GPU's path. The gain appears only when a worker already has its next
+job waiting, which was true for 84% of r3 jobs. That allows at most 5.9% more videos
+per worker-hour; an estimated 4–5%, less if the four workers on a node compete for
+CPU. A job's own latency does not shrink, because it still reports success after its
+MP4 is published; queued jobs start earlier.
+
+**Measured on 2026-11-09.** One request (243-frame `fl2va`) produced byte-identical
+videos in both modes on four workers:
+- Synchronously, each video occupied the GPU for 28.18 s: a 26.29 s pipeline plus
+  1.88 s of publication.
+- Overlapped, the GPU slot averaged 26.12 s, 7.3% less. The pipeline did not slow down.
+- The 2.79 s publication ran behind the next generation, 0.9 s slower than when it
+  blocked the GPU. So a job that has no successor finishes about 0.9 s later.
+
+The paired 64-job benchmark has not been run. GPU memory does not grow: the decoded video leaves the GPU when
+it is staged, in both modes.
+
+**Caller contract.** Status values stay `queued`, `running`, `succeeded`, and
+`failed`, and the gateway needs no change or restart. A video is `running` until
+its MP4 is published and its record written. While running, a job has an additive
+`stage`: `generating`, `staging` (including the wait for the publication slot), or
+`publishing`. `processing_s` keeps its meaning, generation start through
+publication, and `pipeline_s` is unchanged.
+
+**Timings.** Every job records `generation_started_at`, `generation_finished_at`,
+`publication_mode`, `gpu_slot_s`, and `host` (resident memory, CPU time, load, and
+PyTorch's pinned host pool, `pinned_gib`/`pinned_peak_gib`). Overlapped jobs add:
+- `staged_at` and `published_at`: wall-clock times;
+- `publication_slot_wait_s`: how long the video waited for the previous publication;
+- `publication_tail_s`: staging to the published MP4;
+- `encoder`: the encoder's phase timers. Its `elapsed_s` includes staging and the
+  phases overlap, so do not add them up.
+
+Adjacent jobs overlap, so the sum of `processing_s` no longer measures how long a
+worker was occupied. Use `gpu_slot_s` (generation start to staging, including the
+slot wait) or the `generation_started_at`..`staged_at` intervals, which do not
+overlap, together with GPU telemetry. Do not reuse the r3 occupancy calculation
+unchanged, and do not quote the 2.27 s as a measured saving.
+
+**Health.** `/healthz` adds `gpu_active_job`, `publishing_jobs`,
+`publication_capacity` (1 when overlapped, 0 otherwise), `publication_mode`,
+`release` (`code_dir` and `source_sha256`, a digest of the running Python
+sources), `drained`, `fatal_error`, and `process` (rank zero's `rss_gib` and
+`cpu_s`, and the node's `load_1m`). `active_job` stays a busy indicator: the job on
+the GPU, otherwise the job being published, until it is settled. The gateway
+counts it as load. `drained: true` means nothing is queued, held, generating,
+publishing, or waiting for a record write.
+
+**Failures.**
+- *Output storage.* A filesystem error while publishing (`ENOSPC`, `EDQUOT`, `EIO`,
+  read-only, and the others `publish_media` treats as storage) fails that job with
+  `storage_failure` and pauses admission at once (507). A video that is already
+  generating reaches its staging boundary on every rank. If storage has not
+  recovered by then, that job also fails with `storage_failure` and its frames are
+  released. Queued requests wait for the usual recovery. Nothing is rendered again
+  automatically.
+- *Fatal.* Encoder, media, CUDA, and any other unexpected error remain fatal. A
+  failed background publication fails its job with `inference_failed`, closes
+  admission (status `failed`), and stops every rank at the next staging or command
+  boundary.
+  - On any fatal error, rank zero fails its held, generating, and queued jobs at
+    once. It then gives an in-flight publication up to 10 s, and fails it if it
+    is still running.
+  - torchrun stops every rank as soon as one exits, and SIGTERM ends a rank at
+    once. So in this mode, a rank that fails while serving waits up to 13 s before
+    exiting; rank zero's exit ends that wait early.
+  - If only the other rank fails, rank zero is stuck in a collective and is killed
+    without settling its jobs. Its publication thread can still finish meanwhile.
+    The jobs it could not settle fail with `worker_restarted` at the next start, as
+    before.
+  - The supervisor then restarts the worker. A result that arrives late never
+    replaces a failure and is counted once.
+- *Records.* A terminal record that cannot be written behaves as before: the job
+  shows `running` with `persistence_pending` and the worker reports
+  `storage_paused` until the write succeeds.
+- *Restarts.* SIGTERM still ends a worker at once. On its next start, every job it
+  had queued, generating, or publishing fails with `worker_restarted`, never
+  replayed. Leftover `.partial.mp4` files and record temporaries are removed. An MP4
+  renamed just before the kill, without its record, is never served.
+
+**Launch settings.** `deploy_node.sh` exports `H3_ASYNC_PUBLICATION` (default `0`)
+and `H3_CODE_DIR`, the service code the allocation runs (default
+`$H3_DEPLOY_ROOT/Sol-H3`). `serve_node.py` starts every worker, including crash
+restarts, from `H3_CODE_DIR` with `--async-publication` when the setting is `1`. It
+records both in the node registry as `launch`. The watchdog passes them to
+`run-worker.sh`, so its restarts use the same release and mode. `serve.py` refuses a
+flag that disagrees with `H3_ASYNC_PUBLICATION`. Publication capacity is fixed at
+one in this release.
 
 ## Storage isolation and safeguards
 
@@ -356,12 +472,19 @@ code and units; the live copy is in `deployment/watchdog/`.
 - What it never does: stop a worker that answers, or submit or cancel Slurm jobs.
 - To keep it away from a worker, list the worker in `excluded_workers`.
 - Nodes: `NODES` in `watchdog.py` and the node pattern in `run-worker.sh` list the
-  fleet's nodes (0003, 0035, 0048, and 0067 since 2026-11-05). The watchdog ignores
-  any other node. Each node's job must be named `h3-api-<node>-p18080`.
+  fleet's nodes (002, 003, 005, 006, 023, 035, 048, and 067 since the 2026-11-07
+  rebuild). The watchdog ignores any other node. Each node's job must be named
+  `h3-api-<node>-p18080`. Since 2026-11-09, `excluded_workers` keeps it away from
+  035, 048, and 067, which no longer run H3 workers.
 - Restarted workers: `run-worker.sh` starts a worker with the same environment and
-  arguments as `serve_node.py`, including `H3_SERVING_MEMORY_FRACTION=0.95`. After
-  changing either file, compare them with `env_check.py` in
-  `deployment/rollout-api-v2-20261105/`.
+  arguments as `serve_node.py`, including `H3_SERVING_MEMORY_FRACTION=0.95`. It also
+  takes the allocation's launch settings (publication mode and code directory),
+  which `watchdog.py` reads from the node registry's `launch` block. The watchdog
+  restarts a worker only when that registry belongs to the node's running job.
+  Allocations started before these settings existed restart as before:
+  synchronous, from the shared `Sol-H3/`. After changing either file, compare them
+  with `watchdog/env_check.py`, which also checks each worker's code directory:
+  `srun --jobid=<job> --overlap --nodes=1 --ntasks=1 python3 env_check.py run-worker.sh`.
 - Shared `/home`: `~/.config/systemd/user` is on shared `/home`, so the unit has
   `ConditionHost=` and the script takes a host-local lock in `/run/user/<uid>`.
   On Nov 2 a lock on shared storage, held by another host's copy of the timer,
@@ -369,7 +492,7 @@ code and units; the live copy is in `deployment/watchdog/`.
 - Install, check and pause:
 
   ```bash
-  cp watchdog/watchdog.py watchdog/run-worker.sh /home/jeff/sol-h3-h200/deployment/watchdog/
+  cp watchdog/watchdog.py watchdog/run-worker.sh watchdog/env_check.py /home/jeff/sol-h3-h200/deployment/watchdog/
   cp watchdog/h3-watchdog.{service,timer} ~/.config/systemd/user/
   systemctl --user daemon-reload && systemctl --user enable --now h3-watchdog.timer
   python3 deployment/watchdog/watchdog.py --dry-run   # report only; a healthy run ends with "summary:"
@@ -402,6 +525,8 @@ The following defaults are implemented; they do not select available nodes:
 | `H3_MIN_FREE_GIB` | 20; node staging/output reserve. Gateway has its own `--min-free-gib` |
 | `H3_MAX_NUM_FRAMES` | Unset (345, the API maximum). A lower 17n+5 value caps what the worker admits and advertises; the gateway then routes longer requests elsewhere |
 | `H3_ATTENTION_BACKEND` | `sol`. `dense` runs dense attention only; used to measure the gate-fallback path's memory |
+| `H3_ASYNC_PUBLICATION` | `0`: publish each MP4 before the next generation. `1`: publish in the background while the next video generates, one publication at a time ([Overlapped output publication](#overlapped-output-publication)). Recorded in the registry and reused by watchdog restarts |
+| `H3_CODE_DIR` | `$H3_DEPLOY_ROOT/Sol-H3`. The service code this allocation runs; point it at an immutable release directory so later changes cannot reach running workers. Recorded in the registry and reused by watchdog restarts |
 
 An eight-GPU H200 allocation gives four workers; eight H100 GPUs give two
 four-GPU workers. They can coexist behind the same gateway. CPU affinities are
@@ -654,8 +779,12 @@ that origin to another worker/node.
 Exclude the affected endpoints, stop direct callers, and wait for every accepted
 gateway job on them to be failed or `video_cached: true`, with no pending metadata
 writes. Also verify each worker has `active_job: null`, `queued: 0`, and no pending
-writes. If storage is impaired, inspect in-memory health as well as disk records;
-an old on-disk status is not sufficient evidence of a completed drain.
+writes; workers with overlapped publication report all of this as `drained: true`,
+which also covers a publication still in progress. Worker success alone is not
+enough: the gateway must also have archived the video. If storage is impaired,
+inspect in-memory health as well as disk records; an old on-disk status is not
+sufficient evidence of a completed drain. The supervisor gives a worker 15 s after
+SIGTERM, so a stop never drains a queue by itself.
 
 Cancel only the recorded H3 job IDs with `scancel`. Retain output directories,
 tokens, gateway state, and exclusions. Confirm allocations are gone, the GPU
@@ -670,6 +799,105 @@ over newer accepted records. A forced stop can interrupt requests and must be
 recorded as such. There is no automatic redeploy/requeue loop after intentional
 cancellation.
 
+## Roll out overlapped publication
+
+This procedure comes from the r3 handover
+(`/home/jeff/reports/grpo-r3-efficiency-20261109/SANA_WORKER_HANDOVER.rst`). The
+gateway, its URL, token, job records, and archives stay untouched, and the gateway
+is not restarted.
+
+**2026-11-09 deployment** (`deployment/async-publication-20261109/`, with its README
+and `actions.log`):
+1. Node 006 was the canary. It ran the encoder equivalence test, then the release in
+   synchronous mode (job 24).
+2. The user asked to redeploy every worker without finishing the paired benchmark
+   (step 5). So 006 was relaunched with overlap (job 25), validated, and checked for
+   back-to-back overlap.
+3. 002, 003, 005, 023, and 035 were then replaced together (jobs 26–30). At the
+   user's request, 035 was freed again before validation. The other four were
+   validated directly and through the gateway, then admitted.
+
+The steps below are the full procedure; use them for the next rollout.
+Replace one allocation (four workers) at a time.
+
+1. **Reconcile and snapshot.** In a new `deployment/async-publication-<date>/`, save
+   `jobs.json`, `gateway/pool.json`, `gateway/endpoint.json`, `squeue -u jeff`, every
+   `deployment/dc02-gpu-*/node.json`, each worker's `/healthz`, the watchdog files and
+   units, and the SHA-256 of every file in the live `Sol-H3/`. The live workers run
+   `3718c71`. This release also carries `0cdeb00` (H100 weight sharding, inactive on
+   H200 because `H3_WEIGHT_SHARDING` is unset there) and the watchdog and
+   documentation changes since; record these differences in the evidence.
+2. **Stage an immutable release.** Copy the complete `Sol-H3/` of the released
+   commit, record its digest, and make it read-only:
+
+   ```bash
+   R=/home/jeff/sol-h3-h200/releases/<date>-async-publication-<commit>/Sol-H3
+   mkdir -p "$R" && rsync -a --exclude __pycache__ <released Sol-H3>/ "$R/"
+   (cd "$R" && python3 -c 'import service_storage as s; print(s.source_digest("."))') > "$R/../source_sha256"
+   chmod -R a-w "$(dirname "$R")"
+   ```
+
+   Leave the shared `Sol-H3/` alone: running allocations import from it. Install the
+   new `watchdog.py`, `run-worker.sh`, and `env_check.py` (see the watchdog section)
+   and run `watchdog.py --dry-run`; allocations without launch settings restart as
+   before.
+3. **Drain the canary.** Pick one node. Merge its four origins into
+   `excluded_workers`, keeping every other entry, and stop direct submissions to
+   them. The exclusion also keeps the watchdog away. Wait for the
+   [drain](#drain-stop-rollback): every gateway job on those workers failed or
+   `video_cached: true`, and each worker idle (`drained: true` once it runs this
+   release). Then `scancel` only that node's job.
+4. **Relaunch it synchronously.** While the node is free, run
+   `python -m pytest -q tests/test_encoder_equivalence.py` from the release in a
+   short one-GPU job there: the background path must decode to the same frames and
+   audio as the synchronous one. Reuse the fleet's `launch.sh` and `preflight.py`
+   (`deployment/fleet-32-dc02-20261107/`) in the new directory, exporting
+   `H3_CODE_DIR=$R` and `H3_ASYNC_PUBLICATION=0` and running
+   `$H3_CODE_DIR/deploy_node.sh`. Keep the `/var/tmp/jeff-sol-h3` local root, the
+   bond0 `H3_BIND_HOST`, ports 18080–18083, the job name `h3-api-<node>-p18080`, and
+   the sbatch shape. When the workers are ready, check each `/healthz`
+   (`publication_mode`, `release.source_sha256`, `slurm_job_id`), the
+   `SERVING_MEMORY_CAP` lines, `env_check.py`, and direct validation
+   (`validate.py workers` for the four origins).
+5. **Benchmark both modes.** With the origins still excluded, run
+   `publication_benchmark.py run` against the four workers: a manifest of at least
+   64 requests covering the production mix of tasks, lengths, aspect ratios, and long
+   prompts; `--inflight 2`; one warm pass. Repeat with `--inflight 1`, the case with
+   no waiting request. Sample GPU utilization and memory on the node meanwhile with
+   `monitor_gpu.py` from `finish-20261108/test-suite/`, as an `srun --overlap` step.
+   Then drain, `scancel`, relaunch with
+   `H3_ASYNC_PUBLICATION=1`, validate, and run the same benchmarks.
+   `publication_benchmark.py compare SYNC_DIR ASYNC_DIR` gives the comparison.
+   Proceed only if all of these hold:
+   - `throughput_ratio` is above 1 in repeated runs; rerun both modes while the
+     difference is within run-to-run noise;
+   - p50 and p95 end-to-end latency are not materially worse, and nothing failed;
+   - `gate_fallback_jobs` match between the runs, or the comparison measures the
+     numerical gate instead of publication;
+   - the trace shows the overlap (`visible_before_next_gpu_finished` above 0) and
+     `max_publishing_jobs` is at most 1;
+   - RSS, pinned memory, and load stay flat on all four workers of the node.
+
+   Otherwise return the canary to `H3_ASYNC_PUBLICATION=0`.
+6. **Admit the canary.** Remove only its four origins from `excluded_workers`. Run a
+   small gateway batch and an old-result download through the unchanged URL, and
+   record each worker's `release` and `publication_mode`.
+7. **Roll the other seven allocations**, one at a time, through steps 3, 4 (in the
+   validated mode), and 6; the benchmark runs only on the canary. For the final
+   check, adapt `finish-20261108/test-suite/run_suite.py` in a new evidence
+   directory. It hardcodes 32 workers, reads Slurm IDs from `jobs.json`, and resumes
+   from `suite-summary.json`, so never reuse a completed summary.
+8. **Finish.** Run the full API, media, and route validation and the 64-client mixed
+   stress test. Inspect every GPU, restart counts, storage backlog, `publishing_jobs`,
+   and watchdog parity. Update `jobs.json`, this document, and the README with the
+   release, mode, job IDs, and measurements.
+
+**Rollback** uses the same exclusion and drain. Relaunch the allocation with
+`H3_ASYNC_PUBLICATION=0` on the same release, or with
+`H3_CODE_DIR=/home/jeff/sol-h3-h200/Sol-H3` for the previous code; then validate and
+readmit it. Never restore an older gateway job database, and keep each worker's
+output directory.
+
 ## Local verification before rollout
 
 With the gateway/service HTTP dependencies and pytest installed, run from the
@@ -678,6 +906,7 @@ repository root (no GPU or Slurm allocation required):
 ```bash
 python -m pytest -q models/minimax_h3/Sol-H3/tests/
 bash -n models/minimax_h3/Sol-H3/deploy_node.sh
+bash -n models/minimax_h3/Sol-H3/watchdog/run-worker.sh
 ```
 
 The tests inject ENOSPC/EIO/quota/read-only failures, exercise admission versus
@@ -691,7 +920,27 @@ workers without job ID support. `test_request.py` covers the SGLang form:
 - base64 images and their limits;
 - rejected fields.
 
-The suite has 130 cases on 2026-11-05. The large GPU case in `test_lora_fusion.py`
-is skipped unless `H3_RUN_LARGE_GPU_TESTS=1`. A CPU broadcast
-stand-in tests output-error coordination; it does not replace the live distributed
-GPU validation in the redeployment procedure.
+`test_output_publication.py` covers overlapped publication with a fake encoder and
+gated generation:
+- the next video generates while the previous one publishes and downloads;
+- one publication slot, and frames never reused while an encoder holds them;
+- per-job metadata, idempotency keys in every state, and queue capacity;
+- injected `ENOSPC`, `EDQUOT`, `EIO`, and read-only failures in the encoder, fsync,
+  rename, and record write;
+- fatal encoder, media, and staging errors, the same collective order on 2 and 4
+  thread ranks, and a bounded shutdown that a late result cannot undo;
+- a real two-rank `torchrun` run in which both ranks fail while a publication is
+  still finishing: the publication must succeed;
+- restarts after a real SIGKILL during encoding, after the rename, and during a
+  record write.
+
+`test_launch.py` covers the flag and `H3_ASYNC_PUBLICATION`, the supervisor's mode
+and code directory, the watchdog's restart arguments, and `run-worker.sh` parity.
+`test_gateway.py` runs overlapped workers beside old ones through the unchanged
+gateway.
+
+The suite has 196 cases on 2026-11-09 (186 run without a GPU). The large GPU case in
+`test_lora_fusion.py` is skipped unless `H3_RUN_LARGE_GPU_TESTS=1`;
+`test_encoder_equivalence.py` needs one free GPU (rollout step 4). Threads stand in
+for ranks and a fake for the encoder; they do not replace the live distributed GPU
+validation in the redeployment procedure.

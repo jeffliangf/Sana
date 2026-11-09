@@ -37,6 +37,9 @@ def publish_registry(path, value):
 
 
 def stop_child(child):
+    # SIGTERM ends a worker at once: its unfinished jobs fail when it next starts (worker_restarted) or, if it
+    # never does, at the gateway (worker_lost). 15 s cannot drain a queue, so planned replacement waits for
+    # /healthz "drained" first (DEPLOYMENT.md).
     process = child["process"]
     if process.poll() is None:
         try:
@@ -127,6 +130,35 @@ def allocation_layout(root, hostname, workers, base_port=18080):
     return Path(root) / "deployment" / name, list(range(base_port, base_port + workers))
 
 
+def launch_settings(environ, root):
+    """Settings every restart of this allocation's workers must reuse; the registry records them for the
+    watchdog. H3_CODE_DIR is normally an immutable release directory (DEPLOYMENT.md)."""
+    async_publication = environ.get("H3_ASYNC_PUBLICATION", "0")
+    if async_publication not in {"0", "1"}:
+        raise ValueError("H3_ASYNC_PUBLICATION must be 0 or 1")
+    code_dir = Path(environ.get("H3_CODE_DIR") or Path(root) / "Sol-H3")
+    if not code_dir.is_absolute() or not (code_dir / "serve.py").is_file():
+        raise ValueError(f"H3_CODE_DIR must be an absolute directory containing serve.py: {code_dir}")
+    return {"code_dir": str(code_dir), "async_publication": async_publication == "1"}
+
+
+def serve_arguments(*, environ, root, local, checkpoints, token_file, address, port, ready_file, gpu_type):
+    """serve.py's arguments for one worker. watchdog/run-worker.sh must render the same (tests/test_launch.py)."""
+    arguments = ["--model", str(checkpoints / "MiniMax-H3"),
+                 "--adapter", str(checkpoints / "FastH3-4-step-Preview-v1-LoRA/dense-datafree/adapter_model.safetensors"),
+                 "--output-dir", str(local / f"sol-h3-service/{port}"), "--token-file", str(token_file),
+                 "--host", address, "--port", str(port),
+                 "--attention-backend", environ.get("H3_ATTENTION_BACKEND", "sol"),
+                 "--warmup-prompt-file", str(root / "demo_prompt.json"), "--ready-file", str(ready_file),
+                 "--queue-capacity", "8", "--encoder-threads", "8", "--gate-failure", "dense",
+                 "--expect-gpu", gpu_type, "--min-free-gib", environ.get("H3_MIN_FREE_GIB", "20")]
+    if environ.get("H3_ASYNC_PUBLICATION") == "1":
+        arguments.append("--async-publication")
+    if environ.get("H3_MAX_NUM_FRAMES"):
+        arguments += ["--max-num-frames", environ["H3_MAX_NUM_FRAMES"]]
+    return arguments
+
+
 def gpu_layout(devices, gpu_type, gpus_per_worker):
     if gpu_type not in {"H100", "H200"}:
         raise ValueError("H3_GPU_TYPE must be H100 or H200")
@@ -148,6 +180,7 @@ def main():
     token_file = root / "deployment" / "token"
     if len(token_file.read_text().strip()) < 32:
         raise ValueError("Missing deployment bearer token")
+    launch = launch_settings(os.environ, root)
     devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
     gpu_type = os.environ.get("H3_GPU_TYPE", "H200").upper()
     group_size = int(os.environ.get("H3_GPUS_PER_WORKER", "4" if gpu_type == "H100" else "2"))
@@ -177,7 +210,7 @@ def main():
     quiet_print(json.dumps({"node": hostname, "address": address, "job_id": job_id, "cpus": cpus,
                       "gpu_type": gpu_type, "gpus_per_worker": group_size,
                       "devices": devices, "ports": ports, "registry": str(registry), "runtime": str(runtime),
-                      "fastapi": fastapi.__version__, "uvicorn": uvicorn.__version__}))
+                      "launch": launch, "fastapi": fastapi.__version__, "uvicorn": uvicorn.__version__}))
 
     children = []
     stopping = False
@@ -202,18 +235,12 @@ def main():
         checkpoints = Path(os.environ.get("H3_CHECKPOINT_ROOT", str(local / "sol-h3-checkpoints")))
         command = ["taskset", "--cpu-list", ",".join(map(str, assigned_cpus)),
                    str(Path(sys.executable).with_name("torchrun")), "--standalone", "--nnodes=1", f"--nproc_per_node={group_size}",
-                   "serve.py", "--model", str(checkpoints / "MiniMax-H3"),
-                   "--adapter", str(checkpoints / "FastH3-4-step-Preview-v1-LoRA/dense-datafree/adapter_model.safetensors"),
-                   "--output-dir", str(local / f"sol-h3-service/{port}"), "--token-file", str(token_file),
-                   "--host", address, "--port", str(port),
-                   "--attention-backend", os.environ.get("H3_ATTENTION_BACKEND", "sol"),
-                   "--warmup-prompt-file", str(root / "demo_prompt.json"), "--ready-file", str(ready_file),
-                   "--queue-capacity", "8", "--encoder-threads", "8", "--gate-failure", "dense",
-                   "--expect-gpu", gpu_type, "--min-free-gib", os.environ.get("H3_MIN_FREE_GIB", "20")]
-        if os.environ.get("H3_MAX_NUM_FRAMES"):
-            command += ["--max-num-frames", os.environ["H3_MAX_NUM_FRAMES"]]
+                   "serve.py", *serve_arguments(environ=os.environ, root=root, local=local, checkpoints=checkpoints,
+                                                token_file=token_file, address=address, port=port,
+                                                ready_file=ready_file, gpu_type=gpu_type)]
         try:
-            process = subprocess.Popen(command, cwd=root / "Sol-H3", env=env, stdout=log, stderr=subprocess.STDOUT,
+            # Every start, including crash restarts, runs the allocation's own code directory.
+            process = subprocess.Popen(command, cwd=launch["code_dir"], env=env, stdout=log, stderr=subprocess.STDOUT,
                                        start_new_session=True)
         finally:
             log.close()
@@ -232,7 +259,7 @@ def main():
             states = refresh_workers(children, start, opener, runtime)
             status = node_status(states)
             publish_registry(registry / "node.json", {"hostname": hostname, "address": address, "slurm_job_id": job_id,
-                                                "base_port": base_port,
+                                                "base_port": base_port, "launch": launch,
                                                 "updated_at": time.time(), "status": status,
                                                 "workers": states})
             if status == "failed":
@@ -247,7 +274,7 @@ def main():
             with suppress(OSError):
                 (runtime / f"{child['port']}.ready.json").unlink(missing_ok=True)
         publish_registry(registry / "node.json", {"hostname": hostname, "address": address, "slurm_job_id": job_id,
-                                            "base_port": base_port,
+                                            "base_port": base_port, "launch": launch,
                                             "updated_at": time.time(), "status": "stopped", "workers": states})
 
 

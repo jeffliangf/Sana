@@ -5,6 +5,13 @@ umask 077
 export H3_DEPLOY_ROOT="${H3_DEPLOY_ROOT:-/home/jeff/sol-h3-h200}"
 export H3_LOCAL_ROOT="${H3_LOCAL_ROOT:-/raid/jeff}"
 export H3_GPU_TYPE="${H3_GPU_TYPE:-H200}"
+# The service code this allocation runs, normally an immutable release directory. The supervisor and the
+# watchdog restart every worker from it; never change files under running workers (DEPLOYMENT.md).
+export H3_CODE_DIR="${H3_CODE_DIR:-$H3_DEPLOY_ROOT/Sol-H3}"
+# 1 finishes and publishes each MP4 on a background thread while the next video generates
+# (serve.py --async-publication). 0, the default, publishes before the next generation starts.
+export H3_ASYNC_PUBLICATION="${H3_ASYNC_PUBLICATION:-0}"
+[[ "$H3_ASYNC_PUBLICATION" == [01] ]] || { echo "H3_ASYNC_PUBLICATION must be 0 or 1" >&2; exit 1; }
 # Two-GPU H200 workers need the serving cap. Without it PyTorch's pool grew to fill the GPU
 # (139.8 of 140.4 GiB) on the longest requests, leaving no room for CUDA libraries; with 0.95
 # the worst case measured 128.0 GiB allocated and 135.1 GiB in use (2026-11-05). 0 disables it.
@@ -30,7 +37,7 @@ if [[ ! -x "$venv/bin/python" ]] && [[ "$H3_GPU_TYPE" != H200 || "$venv" != /rai
     echo 'Prepare H3_VENV for this node/path first; the H200 tar has absolute interpreter paths.' >&2
     exit 1
 fi
-python3 "$H3_DEPLOY_ROOT/Sol-H3/storage_preflight.py" --local-root "$H3_LOCAL_ROOT" \
+python3 "$H3_CODE_DIR/storage_preflight.py" --local-root "$H3_LOCAL_ROOT" \
     --venv "$venv" --checkpoints "$checkpoints" --stage "$stage" \
     --min-free-gib "${H3_MIN_FREE_GIB:-20}"
 
@@ -83,7 +90,7 @@ export TORCHINDUCTOR_CACHE_DIR="$H3_LOCAL_ROOT/sol-h3-cache/inductor"
 export TRITON_CACHE_DIR="$H3_LOCAL_ROOT/sol-h3-cache/triton"
 export CUDA_CACHE_PATH="$H3_LOCAL_ROOT/sol-h3-cache/cuda"
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$CUDA_CACHE_PATH"
-cd "$H3_DEPLOY_ROOT/Sol-H3"
+cd "$H3_CODE_DIR"
 # Keep process logs on the node as well: shared storage can temporarily reject
 # writes without taking down the resident workers or their local output files.
 supervisor_logs="$H3_LOCAL_ROOT/sol-h3-supervisor"

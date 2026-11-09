@@ -1,6 +1,7 @@
 """Small filesystem primitives shared by the resident service and gateway."""
 from contextlib import suppress
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -73,3 +74,16 @@ def quiet_print(message):
     # A full log filesystem must not terminate the process it is diagnosing.
     with suppress(OSError):
         print(message, flush=True)
+
+
+def source_digest(code_dir):
+    """SHA-256 over a worker's Python sources (the service directory and h3_runtime/), by relative path.
+
+    Workers report it in /healthz as release.source_sha256. Compare a staged release with
+    ``python3 -c 'import service_storage as s; print(s.source_digest("."))'`` run in its directory.
+    """
+    root = Path(code_dir)
+    digest = hashlib.sha256()
+    for path in sorted([*root.glob("*.py"), *root.glob("h3_runtime/**/*.py")]):
+        digest.update(f"{path.relative_to(root).as_posix()}\0{hashlib.sha256(path.read_bytes()).hexdigest()}\n".encode())
+    return digest.hexdigest()

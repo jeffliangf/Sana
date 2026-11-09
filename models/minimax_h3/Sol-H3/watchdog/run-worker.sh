@@ -7,14 +7,22 @@
 # using GPUs 2i,2i+1 and CPUs 40i..40i+39 for i = port - 18080.
 # Since the rebuild /raid is root-owned, so the local root is /var/tmp/jeff-sol-h3, and the workers bind the bond0
 # address explicitly (H3_BIND_HOST): the full hostname resolves to a USB link-local address.
+# Optional <async-publication 0|1> <code-dir>: the allocation's launch settings from its node registry, which
+# watchdog.py passes so a restart uses the same release and publication mode as serve_node.py. Without them (an
+# allocation started before they existed) the worker restarts as before: synchronous, from the shared Sol-H3/.
 # Exit 2 = refused (wrong node, GPUs busy or unhealthy, port in use); the systemd unit does not retry a refusal.
 # CUDA numbers GPUs from 0 and skips one it cannot initialize (0023 since its GPU 3 fault), shifting every GPU after
 # it, so a real start passes the pair's UUIDs (nvidia-smi indices do not shift). H3_RENDER_ONLY=1 prints the
 # environment (with CUDA ordinals), CPU list and arguments instead of starting anything.
 set -euo pipefail
 umask 077
-node=${1:-} port=${2:-}
-[[ "$node" =~ ^0(02|03|05|06|23|35|48|67)$ && "$port" =~ ^1808[0-3]$ ]] || { echo "usage: run-worker.sh <node> <port>" >&2; exit 2; }
+node=${1:-} port=${2:-} mode=${3:-} code=${4:-}
+[[ "$node" =~ ^0(02|03|05|06|23|35|48|67)$ && "$port" =~ ^1808[0-3]$ ]] \
+  || { echo "usage: run-worker.sh <node> <port> [<async-publication 0|1> <code-dir>]" >&2; exit 2; }
+if [[ -n "$mode$code" ]]; then
+  [[ "$mode" =~ ^[01]$ && "$code" =~ ^/home/jeff/sol-h3-h200/[A-Za-z0-9._/-]+$ && "$code" != *..* ]] \
+    || { echo "invalid launch settings: async publication '$mode', code directory '$code'" >&2; exit 2; }
+fi
 i=$((port - 18080))
 addr=10.2.201.$((10#$node)) gpus=$((2 * i)),$((2 * i + 1)) cpus=$((40 * i))-$((40 * i + 39))
 L=/var/tmp/jeff-sol-h3 host=dc02-gpu-$node.internal.bigbeargpu.cloud
@@ -30,6 +38,7 @@ if [[ "${H3_RENDER_ONLY:-}" != 1 ]]; then
   if ss -ltn | grep -q "$addr:$port "; then echo "port $port in use" >&2; exit 2; fi
   cvd=$(timeout -s KILL 120 nvidia-smi -i "$gpus" --query-gpu=uuid --format=csv,noheader | paste -sd,) \
     && [[ "$cvd" =~ ^GPU-[0-9a-f-]+,GPU-[0-9a-f-]+$ ]] || { echo "cannot resolve the UUIDs of GPUs $gpus: ${cvd:-}" >&2; exit 2; }
+  [[ -z "$code" || -f "$code/serve.py" ]] || { echo "no serve.py in $code" >&2; exit 2; }
 fi
 # H3_SERVING_MEMORY_FRACTION is deploy_node.sh's H200 default since 2026-11-05; without it a restarted worker's
 # PyTorch pool can fill the GPU on the longest requests.
@@ -47,8 +56,14 @@ args=(--model $C/MiniMax-H3 --adapter $C/FastH3-4-step-Preview-v1-LoRA/dense-dat
   --host $addr --port $port --attention-backend sol --warmup-prompt-file /home/jeff/sol-h3-h200/demo_prompt.json
   --ready-file $R/$port.manual.ready.json --queue-capacity 8 --encoder-threads 8 --gate-failure dense
   --expect-gpu H200 --min-free-gib 20)
-if [[ "${H3_RENDER_ONLY:-}" == 1 ]]; then printf '%s\n' "${envs[@]}" "CPUS=$cpus" -- "${args[@]}"; exit 0; fi
+# deploy_node.sh exports both settings to serve_node.py's workers; serve.py checks the flag against the variable.
+if [[ -n "$mode" ]]; then
+  envs+=(H3_ASYNC_PUBLICATION=$mode H3_CODE_DIR=$code)
+  if [[ "$mode" == 1 ]]; then args+=(--async-publication); fi
+fi
+code=${code:-/home/jeff/sol-h3-h200/Sol-H3}
+if [[ "${H3_RENDER_ONLY:-}" == 1 ]]; then printf '%s\n' "${envs[@]}" "CPUS=$cpus" "CWD=$code" -- "${args[@]}"; exit 0; fi
 log="$R/$SLURM_JOB_ID-$port-manual-$(date -u +%Y%m%dT%H%M%SZ).log"
 echo "$(date -u +%FT%TZ) worker log: $log"
-cd /home/jeff/sol-h3-h200/Sol-H3
+cd "$code"
 exec env -i "${envs[@]}" taskset --cpu-list "$cpus" "$V/bin/torchrun" --standalone --nnodes=1 --nproc_per_node=2 serve.py "${args[@]}" >>"$log" 2>&1

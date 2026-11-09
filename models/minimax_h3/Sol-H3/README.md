@@ -34,26 +34,28 @@ image-to-video with stereo audio at 24 fps, in either request form:
 - The SGLang MiniMax-H3 form: `t2va` or `fl2va`, six aspect ratios or the first
   frame's own, 124–345 frames.
 
-**State on 2026-11-08.** 32 two-GPU H200 workers run on all eight nodes:
-`dc02-gpu-{002,003,005,006,023,035,048,067}.internal.bigbeargpu.cloud`, Slurm jobs
-10–17, four workers per node on ports 18080–18083. All are admitted through the
-gateway with the 0.95 serving cap. The rebuilt cluster uses
-`/var/tmp/jeff-sol-h3` for node-local environments, weights, caches, and outputs;
-the shared deployment root and caller URL are unchanged. Direct validation
-passed 128 jobs and gateway validation passed 32, covering every worker.
-Evidence is in `deployment/fleet-32-dc02-20261107/`; the extended T2V/I2V and
-stress-test results are under `finish-20261108/test-suite/` there.
-Check `/healthz` for live capacity.
+**State on 2026-11-09.** 20 two-GPU H200 workers run on five nodes:
+`dc02-gpu-{002,003,005,006,023}.internal.bigbeargpu.cloud`, Slurm jobs 25–29, four
+workers per node on ports 18080–18083. All are admitted through the gateway with
+the 0.95 serving cap and overlapped MP4 publication (`H3_ASYNC_PUBLICATION=1`).
+They run from the read-only release
+`/home/jeff/sol-h3-h200/releases/20261109-async-publication-de684c517f65/Sol-H3`.
+Direct validation passed 80 jobs, and gateway validation passed 20, covering every
+worker. Evidence is in `deployment/async-publication-20261109/`. Node 035 was freed
+on 2026-11-09, and 048 and 067 run another user's jobs. The rebuilt cluster keeps
+node-local environments, weights, caches, and outputs in `/var/tmp/jeff-sol-h3`. The
+shared deployment root and the caller URL are unchanged. Check `/healthz` for live
+capacity.
 
-The extended validation passed 35 API contract checks, 8 original-form jobs,
-85 T2V cases, 94 I2V cases (including 6 expected rejections), 19 worst-case cases,
-and 256 mixed requests with 64 concurrent clients. The client decoded 456 full
-videos and checked hashes, frame counts, geometry, FPS, audio, and four model
-forwards. The final audit found 32 ready workers, no worker restarts, and no GPU
-hardware errors. The hourly watchdog is enabled, recognizes all 32 workers, and
-uses the same launch configuration as the live fleet. User lingering keeps the
-gateway and watchdog running after SSH logout. Full evidence is in
-`deployment/fleet-32-dc02-20261107/finish-20261108/final-report.json`.
+The previous fleet, 32 workers from 2026-11-07, passed an extended validation on
+2026-11-08:
+- 35 API contract checks;
+- 85 T2V and 94 I2V cases, and 19 worst-case cases;
+- 256 mixed requests with 64 concurrent clients.
+
+The client decoded 456 full videos. Evidence is in
+`deployment/fleet-32-dc02-20261107/finish-20261108/final-report.json`. User
+lingering keeps the gateway and watchdog running after SSH logout.
 
 ### Access the deployed H200 service
 
@@ -210,6 +212,15 @@ the request. The service validates four transformer forwards and audio/video
 stream metadata before marking a request successful. A failed distributed
 generation terminates the process group instead of reusing inconsistent GPU state.
 
+With `--async-publication` (`H3_ASYNC_PUBLICATION=1` in the launchers), a worker
+starts the next generation as soon as the previous video is staged in pinned host
+memory, and one background thread finishes and publishes that MP4. The job stays
+`running`, with `stage: publishing`, until its MP4 is published. The launcher default
+is off; the H200 fleet runs with it since 2026-11-09, which measured 7.3% less GPU time
+per video for an identical request. See
+[Overlapped output publication](DEPLOYMENT.md#overlapped-output-publication).
+`publication_benchmark.py` runs the paired benchmark against excluded workers.
+
 The service keeps the numerical correctness gate enabled with its existing
 limits. `--gate-failure dense` (the service default) uses dense SDPA when **any
 rank** rejects a kernel's result. Rejected results are discarded and the shape
@@ -233,7 +244,10 @@ worker every time. A crash after at least 30 minutes of readiness starts a fresh
 count; a worker that fails three starts in a row is disabled while healthy
 siblings continue, and the node registry reports `degraded`. If every worker is
 disabled, the supervisor exits and releases the allocation. On H200 the launcher caps
-PyTorch's memory pool at 95% after warmup (`H3_SERVING_MEMORY_FRACTION`). It defaults to
+PyTorch's memory pool at 95% after warmup (`H3_SERVING_MEMORY_FRACTION`).
+`H3_CODE_DIR` selects the code an allocation runs (normally an immutable release
+directory) and `H3_ASYNC_PUBLICATION` its publication mode; the node registry records
+both, so watchdog restarts use the same release and mode. It defaults to
 `/home/jeff/sol-h3-h200` for shared code/registry and `/raid/jeff` for environments,
 checkpoints, caches, and outputs. It expects a private `deployment/token` and can
 initialize a fresh node from a checksummed `deployment/staging` snapshot. The
@@ -323,6 +337,7 @@ Evidence is in `/home/jeff/sol-h3-h200/deployment/` on the cluster unless noted.
 | 2026-11-05 | SGLang request form, round-based VAE decode, and the H200 memory cap by default, validated on test workers. Stale configuration archived | `api-v2-validation-20261105/`, `archive-20261105-stale/` |
 | 2026-11-05 | That code deployed: gateway updated in place, 16 workers on 0003, 0035, 0048, 0067. The watchdog restarts workers with the cap | `rollout-api-v2-20261105/` |
 | 2026-11-07/08 | 32 workers on the rebuilt eight-node cluster; persistent gateway and watchdog restored. T2V/I2V matrix and 256-request concurrent stress run passed | `fleet-32-dc02-20261107/finish-20261108/` |
+| 2026-11-09 | 048 and 067 released to another user. Overlapped MP4 publication deployed to all workers from a read-only release; 035 freed; 20 workers on 002, 003, 005, 006, 023 | `release-2-nodes-20261109T174700Z/`, `async-publication-20261109/` |
 
 ## Validation
 

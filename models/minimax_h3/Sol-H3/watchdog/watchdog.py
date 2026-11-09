@@ -9,6 +9,8 @@ seconds to answer) is restarted only when:
 - its node's Slurm job h3-api-<node>-p18080 is RUNNING;
 - it is not in pool.json excluded_workers (list a worker there to keep the watchdog away from it);
 - serve_node.py no longer manages it: the node registry marks the port disabled, or is older than 5 minutes;
+- the registry belongs to that running job, so its launch settings (publication mode, code directory) are the
+  allocation's own; run-worker.sh restarts the worker with them (none: synchronous, shared Sol-H3/);
 - its unit h3-worker-<node>-<port> is not running, starting or waiting to restart, and did not fail after its
   three allowed starts within the last 6 hours (a crash loop waits for a person or the cooldown).
 The restart is the srun --overlap step used for the hand revivals of 2026-11-01/02, run as a systemd --user unit
@@ -107,7 +109,23 @@ def unit_state(unit):
     return state
 
 
-def start(node, port, job):
+def launch_arguments(launch):
+    """run-worker.sh's optional arguments from the registry's launch block; None if it is malformed."""
+    if launch is None:
+        return []
+    if not isinstance(launch, dict) or not isinstance(launch.get("async_publication"), bool) \
+            or not isinstance(launch.get("code_dir"), str):
+        return None
+    return [str(int(launch["async_publication"])), launch["code_dir"]]
+
+
+def describe(settings):
+    if not settings:
+        return "synchronous publication, shared Sol-H3"
+    return f"{'async' if settings[0] == '1' else 'synchronous'} publication, code {settings[1]}"
+
+
+def start(node, port, job, settings=()):
     index = port - 18080
     command("systemd-run", "--user", f"--unit=h3-worker-{node}-{port}",
             f"--description=H3 worker {node}:{port} on GPUs {2 * index},{2 * index + 1} "
@@ -116,7 +134,7 @@ def start(node, port, job):
             "-p", "StartLimitBurst=3", "-p", "RestartPreventExitStatus=2",
             "srun", f"--jobid={job}", "--overlap", "--nodes=1", "--ntasks=1", "--cpus-per-task=160", "--mem=0",
             "--cpu-bind=none", f"--job-name=h3-{node}-{port}", f"--output={HERE}/srun-%j.%s.log",
-            "bash", str(HERE / "run-worker.sh"), node, str(port))
+            "bash", str(HERE / "run-worker.sh"), node, str(port), *settings)
 
 
 def route(url):
@@ -150,6 +168,11 @@ def decide(node, port, url, status, state, jobs, excluded, dry_run):
         return "down; node registry unreadable, retry next run"
     if who == "supervisor":
         return "down; serve_node.py manages it (restart in progress)"
+    if str(state.get("slurm_job_id")) != jobs[node]:
+        return f"down; node registry is from job {state.get('slurm_job_id')}, not {jobs[node]}; retry next run"
+    settings = launch_arguments(state.get("launch"))
+    if settings is None:
+        return "down; node registry has invalid launch settings; check it by hand"
     unit_now = unit_state(unit)
     active = unit_now.get("ActiveState", "")
     if active in {"active", "activating", "reloading", "deactivating"}:
@@ -160,11 +183,11 @@ def decide(node, port, url, status, state, jobs, excluded, dry_run):
         return (f"down; {unit} failed {failed_ago / 3600:.1f} h ago after its allowed restarts "
                 f"({unit_now.get('Result')}); next try 6 h after that failure")
     if dry_run:
-        return f"down; would start {unit} in job {jobs[node]}"
+        return f"down; would start {unit} in job {jobs[node]} ({describe(settings)})"
     if active == "failed":
         command("systemctl", "--user", "reset-failed", unit)
-    start(node, port, jobs[node])
-    return f"down; started {unit} in job {jobs[node]}, {route(url)}"
+    start(node, port, jobs[node], settings)
+    return f"down; started {unit} in job {jobs[node]} ({describe(settings)}), {route(url)}"
 
 
 def main():

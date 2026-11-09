@@ -4,15 +4,18 @@
 Requests use the original {prompt, duration, seed} form or the SGLang MiniMax-H3 form (see h3_request.py).
 
 Each worker owns its bounded request queue and output directory. All CUDA work
-runs on the main thread; rank zero's HTTP thread only validates and queues work.
+and every collective run on the main thread; rank zero's HTTP thread only
+validates and queues work. With --async-publication, rank zero's publisher
+thread finishes the previous video's MP4 (CPU only, one at a time) while the
+next video generates (output_publication.py).
 """
 
 from __future__ import annotations
 
 import argparse
 from contextlib import suppress
+import copy
 from datetime import timedelta
-import errno
 import json
 import os
 from pathlib import Path
@@ -21,6 +24,7 @@ import secrets
 import socket
 import threading
 import time
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -30,10 +34,19 @@ from starlette.concurrency import run_in_threadpool
 from h3_request import (LEGACY_NUM_FRAMES, MAX_BODY_BYTES, MAX_NUM_FRAMES, VALID_NUM_FRAMES, GenerateRequest,
                         RequestError, capabilities, inspect_image, output_profile, parse_request,
                         resolve_canvas_size, same_request)
-from service_storage import atomic_bytes, atomic_json, check_space, quiet_print, storage_probe
+from output_publication import (OutputPublisher, PublicationTask, encoder_timings, finish_output, freeze,
+                                partial_path, storage_error_message)
+from service_storage import atomic_bytes, atomic_json, check_space, quiet_print, source_digest, storage_probe
 
 __all__ = ["GenerateRequest", "WorkerState", "create_app", "caller_job_id", "atomic_json"]
 LEGACY_CANVAS = resolve_canvas_size(16, 9)
+TERMINAL = frozenset({"succeeded", "failed"})
+INFERENCE_FAILURE = {"status": "failed", "error": "inference worker failed", "error_code": "inference_failed"}
+ATTENTION_COUNTERS = ("sparse_calls", "dense_calls", "gate_fallback_calls", "gate_failures")
+# After a fatal error, an in-flight background publication gets this long to finish before its job is failed;
+# the other ranks delay their exit a little longer so torchrun does not stop rank zero first.
+PUBLISHER_SHUTDOWN_SECONDS = 10
+PEER_EXIT_DELAY_SECONDS = PUBLISHER_SHUTDOWN_SECONDS + 3
 
 
 def legacy_output(duration):
@@ -72,7 +85,7 @@ def publish_media(media, path, expected, encoder_threads, inspect_media, *, rank
     outcome = [None]
     profile = None
     if rank == 0:
-        temporary = path.with_name(f".{path.stem}.partial.mp4")
+        temporary = partial_path(path)
         try:
             media.save(temporary, encoder_threads=encoder_threads)
             profile = inspect_media(temporary, expected["duration_seconds"], expected["width"], expected["height"])
@@ -82,15 +95,10 @@ def publish_media(media, path, expected, encoder_threads, inspect_media, *, rank
             temporary.replace(path)
             outcome[0] = {"bytes": size}
         except Exception as error:
-            cause = error
-            while cause.__cause__ is not None:
-                cause = cause.__cause__
-            if not isinstance(cause, OSError) or cause.errno not in {
-                errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS, errno.EACCES,
-                errno.ENOENT, errno.EMFILE, errno.ENFILE,
-            }:
+            message = storage_error_message(error)
+            if message is None:
                 raise
-            outcome[0] = {"error": str(cause)}
+            outcome[0] = {"error": message}
         finally:
             with suppress(OSError):
                 temporary.unlink(missing_ok=True)
@@ -100,14 +108,31 @@ def publish_media(media, path, expected, encoder_threads, inspect_media, *, rank
     return {"media": profile, "bytes": outcome[0]["bytes"]}
 
 
+def process_usage():
+    """This process's resident memory and CPU time, and the node's load, for health and benchmarks."""
+    usage = {"cpu_s": round(sum(os.times()[:2]), 1)}
+    with suppress(OSError, ValueError, IndexError):
+        pages = int(Path("/proc/self/statm").read_text().split()[1])
+        usage["rss_gib"] = round(pages * os.sysconf("SC_PAGE_SIZE") / 2**30, 3)
+    with suppress(OSError):
+        usage["load_1m"] = round(os.getloadavg()[0], 2)
+    return usage
+
+
 class WorkerState:
+    """Rank zero's jobs: the admission queue, the job on the GPU (``active``), the job whose MP4 is
+    published in the background (``publishing``, async mode only), and the durable records."""
+
     def __init__(self, output_dir, *, capacity=8, min_free_gib=20, metadata=None, max_num_frames=MAX_NUM_FRAMES):
         self.root = Path(output_dir)
         self.root.mkdir(parents=True, exist_ok=True)
         self.pending = queue.Queue(maxsize=capacity)
         self.lock = threading.RLock()
         self.phase = "loading"
-        self.active = None
+        self.active = None  # the job on the GPU: generating, or staging its video
+        self.gpu_stage = None
+        self.publishing = {}  # job ID -> staging time, while the publisher finishes its MP4
+        self.fatal_error = None  # a background publication failed fatally; the worker must stop
         self.completed = 0
         self.min_free_bytes = min_free_gib * 2**30
         self.max_num_frames = max_num_frames
@@ -117,6 +142,11 @@ class WorkerState:
         self.held = None
         self.storage_error = None
         self.storage = {}
+        # No writer exists yet: remove interrupted MP4s and record/keyframe temporaries of a previous process.
+        for pattern in (".*.partial.mp4", ".*.tmp"):
+            for path in self.root.glob(pattern):
+                with suppress(OSError):
+                    path.unlink()
         # A killed distributed process cannot safely resume an in-flight job.
         # Preserve completed outputs, explicitly fail interrupted requests.
         for path in self.root.glob("*.json"):
@@ -170,8 +200,14 @@ class WorkerState:
                 record = dict(self.records[job_id])
                 if job_id in self.dirty:
                     record["persistence_pending"] = True
-                    if record["status"] in {"succeeded", "failed"}:
+                    if record["status"] in TERMINAL:
                         record["status"] = "running"
+                elif record["status"] == "running":
+                    # Additive and never persisted: the status stays "running" until the MP4 is published.
+                    stage = (self.gpu_stage if job_id == self.active else
+                             "publishing" if job_id in self.publishing else None)
+                    if stage:
+                        record["stage"] = stage
                 return record
             try:
                 return json.loads(path.read_text())
@@ -260,6 +296,8 @@ class WorkerState:
 
     def next_command(self):
         with self.lock:
+            if self.fatal_error:
+                return {"fatal": self.fatal_error}  # every rank stops at this boundary
             if not self.recover_storage():
                 return {"idle": True}
             if self.held is None:
@@ -271,36 +309,313 @@ class WorkerState:
                 if self.dirty:
                     return {"idle": True}
             command, self.held = self.held, None
-            self.active = command["id"]
+            self.active, self.gpu_stage = command["id"], "generating"
             return command
 
     def health(self):
+        usage = process_usage()
         with self.lock:
+            publishing = list(self.publishing)
+            # active_job stays set until a background publication has settled, for drain tooling and
+            # the gateway's load estimate; gpu_active_job is only the job on the GPU.
+            busy = self.active or next(iter(publishing), None)
+            queued = self.pending.qsize() + int(self.held is not None)
             return {
                 **self.metadata, "status": ("storage_paused" if self.phase == "ready" and
                                             (self.storage_error or self.dirty) else self.phase),
-                "active_job": self.active, "idempotency_key": True,
-                "queued": self.pending.qsize() + int(self.held is not None), "queue_capacity": self.pending.maxsize,
+                "active_job": busy, "gpu_active_job": self.active, "publishing_jobs": publishing,
+                "idempotency_key": True,
+                "queued": queued, "queue_capacity": self.pending.maxsize,
                 "completed_since_start": self.completed,
+                # Safe to stop this worker: nothing queued, generating, publishing, or awaiting persistence.
+                "drained": busy is None and not queued and not self.dirty,
+                "fatal_error": self.fatal_error,
                 "storage": {**self.storage, "error": self.storage_error, "pending_writes": len(self.dirty)},
+                "process": usage,
             }
 
-    def fail_pending(self):
+    def _settle(self, job_id, **values):
+        """Apply a terminal transition once, with the lock held. A late or repeated one, such as a
+        publication finishing after shutdown failed its job, changes nothing."""
+        record = self.records.get(job_id)
+        if record is None or record["status"] in TERMINAL:
+            return False
+        try:
+            self.update(job_id, **{"finished_at": time.time(), **values})
+        except BaseException:
+            # An unwritable result (not an OSError, which leaves a dirty record) must not block the failure.
+            self.records[job_id] = record
+            raise
+        return True
+
+    def set_stage(self, job_id, stage):
+        with self.lock:
+            if self.active == job_id:
+                self.gpu_stage = stage
+
+    def storage_available(self):
+        """Checked before staging a video: true unless storage is paused and still cannot recover."""
+        with self.lock:
+            return not (self.storage_error or self.dirty) or self.recover_storage()
+
+    def finish(self, job_id, result):
+        """Synchronous mode: record a published success once and free the GPU."""
+        with self.lock:
+            if self._settle(job_id, status="succeeded", **result):
+                self.completed += 1
+            if self.active == job_id:
+                self.active = self.gpu_stage = None
+
+    def fail_output(self, job_id, message):
+        """The GPU job's output could not be written or staged (every rank agreed): pause storage, fail it."""
+        with self.lock:
+            self.storage_error = message
+            self._settle(job_id, status="failed", error="output storage failure", error_code="storage_failure",
+                         storage_error=message)
+            if self.active == job_id:
+                self.active = self.gpu_stage = None
+
+    def begin_publication(self, job_id):
+        """Async mode: the video is staged, so the GPU is free for the next job."""
+        with self.lock:
+            if self.active == job_id:
+                self.active = self.gpu_stage = None
+            self.publishing[job_id] = time.time()
+
+    def publication_succeeded(self, job_id, result):
+        """Publisher thread: the MP4 is final. Clears only this job's publication entry."""
+        with self.lock:
+            if job_id not in self.publishing:
+                return False
+            settled = self._settle(job_id, status="succeeded", **result)
+            del self.publishing[job_id]
+            if settled:
+                self.completed += 1
+            return settled
+
+    def publication_failed(self, job_id, *, storage=None, fatal=None):
+        """Publisher thread: pause storage (as for a synchronous output failure), or stop admission and
+        make every rank stop at its next boundary (fatal: encoder, media, and other unexpected errors)."""
+        with self.lock:
+            if storage is not None:
+                self.storage_error = storage
+                failure = {"status": "failed", "error": "output storage failure", "error_code": "storage_failure",
+                           "storage_error": storage}
+            else:
+                self.fatal_error = fatal or "background publication failed"
+                self.phase = "failed"
+                failure = INFERENCE_FAILURE
+            if self.publishing.pop(job_id, None) is None:
+                return False
+            return self._settle(job_id, **failure)
+
+    def fail_pending(self, *, keep_publishing=False):
+        """Fail every unfinished job: held, on the GPU, queued, and publishing unless ``keep_publishing``.
+        Settled jobs keep their result."""
         with self.lock:
             self.phase = "failed"
-            failure = {"status": "failed", "error": "inference worker failed", "error_code": "inference_failed"}
-            if self.held:
-                self.update(self.held["id"], **failure, finished_at=time.time())
-                self.held = None
-            if self.active:
-                self.update(self.active, **failure, finished_at=time.time())
-                self.active = None
+            unfinished = [self.held["id"]] if self.held else []
+            unfinished += [self.active] if self.active else []
+            self.held = self.active = self.gpu_stage = None
+            if not keep_publishing:
+                unfinished += list(self.publishing)
+                self.publishing.clear()
             while True:
                 try:
-                    record = self.pending.get_nowait()
+                    unfinished.append(self.pending.get_nowait()["id"])
                 except queue.Empty:
                     break
-                self.update(record["id"], **failure, finished_at=time.time())
+            for job_id in unfinished:
+                self._settle(job_id, **INFERENCE_FAILURE)
+
+
+def publish_staged(task, state, inspect_media):
+    """Publisher thread: finish a staged MP4 and settle its job. No collectives or CUDA work here."""
+    try:
+        output = finish_output(task, inspect_media)
+        finished = time.perf_counter()
+        state.publication_succeeded(task.job_id, {
+            **task.result, **output, "processing_s": finished - task.started,
+            "publication_tail_s": finished - task.staged, "published_at": time.time(),
+            "encoder": encoder_timings(task.encode)})
+    except BaseException as error:  # every outcome must reach the main loop
+        message = storage_error_message(error)
+        if message is None:
+            quiet_print(f"PUBLICATION_FATAL job={task.job_id} error={error!r}")
+            state.publication_failed(task.job_id, fatal=f"{type(error).__name__}: {error}")
+        else:
+            quiet_print(f"PUBLICATION_STORAGE_FAILURE job={task.job_id} error={message}")
+            state.publication_failed(task.job_id, storage=message)
+
+
+def shut_down(state, publisher, timeout=PUBLISHER_SHUTDOWN_SECONDS):
+    """Rank zero after a fatal error: close admission and fail the held, GPU, and queued jobs at once (a
+    SIGTERM from torchrun can end this process at any moment), then give an in-flight publication a
+    bounded time and fail it if it is still running. A publication that finishes later changes nothing."""
+    state.fail_pending(keep_publishing=True)
+    if publisher is not None and not publisher.wait_idle(timeout):
+        quiet_print(f"PUBLISHER_SHUTDOWN_TIMEOUT publication still running after {timeout} s; failing its job")
+    state.fail_pending()
+
+
+def stop_after_error(rank, state, publisher, *, async_publication, serving):
+    """main()'s error path on every rank, before the exception ends the process. torchrun stops all ranks
+    as soon as one exits, and SIGTERM ends a rank at once, so a rank that fails beside rank zero (the same
+    error on every rank) stays up while rank zero gives its in-flight publication a bounded time. Once rank
+    zero exits, torchrun stops this rank, so the wait lasts only as long as rank zero needs."""
+    if state is not None:
+        shut_down(state, publisher)
+    elif rank != 0 and async_publication and serving:
+        time.sleep(PEER_EXIT_DELAY_SECONDS)
+
+
+def job_from_record(record, output_dir):
+    """What a GPU job needs from a queued record; legacy records carry only a duration."""
+    output = record.get("output") or legacy_output(record["duration"])
+    image = None
+    if record.get("conditions"):
+        condition = record["conditions"][0]
+        image = str(Path(output_dir) / f"{record['id']}.keyframe0.{condition['format']}")
+    return {"prompt": record["prompt"], "seed": record["seed"], "output": output, "image": image}
+
+
+class JobExecutor:
+    """One job's GPU work on every rank's main thread, with the same collective order on each rank.
+
+    ``runtime`` supplies the rank-local begin(), generate(job), forwards(), metrics(), and host_memory().
+    broadcast/gather/barrier are the CPU control group's collectives. Rank zero also gets the
+    WorkerState and, in async mode, the OutputPublisher. Tests drive this without a model.
+    """
+
+    def __init__(self, *, rank, runtime, broadcast, gather, barrier, encoder_threads, inspect_media,
+                 state=None, publisher=None):
+        self.rank, self.runtime = rank, runtime
+        self.broadcast, self.gather, self.barrier = broadcast, gather, barrier
+        self.encoder_threads, self.inspect_media = encoder_threads, inspect_media
+        self.state, self.publisher = state, publisher
+
+    def _generate(self, job):
+        self.runtime.begin()
+        started = time.perf_counter()
+        timing = {"generation_started_at": time.time()}
+        media = self.runtime.generate(job)
+        forwards = self.runtime.forwards()
+        if forwards != 4:
+            raise RuntimeError(f"Expected four transformer forwards, got {forwards}")
+        timing["generation_finished_at"] = time.time()
+        timing["pipeline_s"] = media.elapsed_s if media is not None else None
+        return media, started, timing
+
+    @staticmethod
+    def _summary(ranks):
+        return {"transformer_forwards": 4, "memory": [item["memory"] for item in ranks],
+                "attention": [item["attention"] for item in ranks],
+                "used_gate_fallback": any(item["attention"] and item["attention"]["gate_fallback_calls"]
+                                          for item in ranks)}
+
+    def execute(self, job, path, job_id=None):
+        """Generate and publish before returning (warmups and synchronous mode); rank zero gets the result."""
+        media, started, timing = self._generate(job)
+        if self.rank == 0 and job_id is not None and self.state is not None:
+            self.state.set_stage(job_id, "publishing")
+        output = publish_media(media, path, job["output"], self.encoder_threads, self.inspect_media,
+                               rank=self.rank, broadcast=self.broadcast)
+        self.barrier()
+        elapsed = time.perf_counter() - started
+        ranks = self.gather(self.runtime.metrics())
+        if self.rank == 0:
+            return {**timing, "processing_s": elapsed, **output, **self._summary(ranks),
+                    "publication_mode": "sync", "gpu_slot_s": elapsed, "host": self.runtime.host_memory()}
+        return None
+
+    def execute_async(self, job_id, job, path):
+        """Generate, stage, and hand the video to rank zero's publisher; the next job can start at once.
+
+        Raises OutputStorageError on every rank if paused output storage prevents staging, and
+        RuntimeError on every rank after a fatal background publication error.
+        """
+        media, started, timing = self._generate(job)
+        # This job's per-rank metrics, copied before a later generation can change them.
+        ranks = self.gather(copy.deepcopy(self.runtime.metrics()))
+        outcome = [None]
+        if self.rank == 0:
+            outcome[0] = self._stage(job_id, media, path, job["output"], started,
+                                     {**timing, **self._summary(ranks), "publication_mode": "async"})
+        media = None  # a video that was not staged releases its GPU memory here
+        self.broadcast(outcome)
+        if "fatal" in outcome[0]:
+            raise RuntimeError(f"A background publication failed: {outcome[0]['fatal']}")
+        if "error" in outcome[0]:
+            raise OutputStorageError(outcome[0]["error"])
+        self.barrier()
+
+    def _stage(self, job_id, media, path, expected, started, result):
+        """Rank zero: wait for the publication slot, stage the video, and start its publication."""
+        state, publisher = self.state, self.publisher
+        state.set_stage(job_id, "staging")
+        waited = publisher.reserve()
+        handed_off = False
+        try:
+            if state.fatal_error:
+                return {"fatal": state.fatal_error}
+            if not state.storage_available():
+                # An earlier publication paused storage: fail this job as a synchronous output failure would.
+                return {"error": state.storage_error or "output storage is paused"}
+            temporary = partial_path(path)
+            try:
+                encode = media.save_async(temporary, encoder_threads=self.encoder_threads)
+            except Exception as error:
+                message = storage_error_message(error)
+                if message is None:
+                    raise  # CUDA and other staging errors stay fatal, as in publish_media
+                with suppress(OSError):
+                    temporary.unlink(missing_ok=True)
+                return {"error": message}
+            staged = time.perf_counter()
+            task = PublicationTask(
+                job_id=job_id, encode=encode, path=path, expected=freeze(expected), started=started, staged=staged,
+                result=freeze({**result, "gpu_slot_s": staged - started, "publication_slot_wait_s": waited,
+                               "staged_at": time.time(), "host": self.runtime.host_memory()}))
+            state.begin_publication(job_id)
+            publisher.start(task)
+            handed_off = True
+            return {"staged": True}
+        finally:
+            if not handed_off:
+                publisher.release()
+
+
+def serve_jobs(executor, *, rank, broadcast, state, output_dir, async_publication, alive=lambda: True,
+               idle_seconds=1):
+    """The worker loop on every rank: rank zero picks the next command and every rank runs it."""
+    output_dir = Path(output_dir)
+    while True:
+        command = None
+        if rank == 0:
+            if not alive():
+                raise RuntimeError("HTTP server stopped")
+            command = state.next_command()
+        commands = [command]
+        broadcast(commands)
+        command = commands[0]
+        if command.get("fatal"):
+            raise RuntimeError(f"A background publication failed: {command['fatal']}")
+        if command.get("idle"):
+            time.sleep(idle_seconds)
+            continue
+        path = output_dir / f"{command['id']}.mp4"
+        job = job_from_record(command, output_dir)
+        try:
+            if async_publication:
+                executor.execute_async(command["id"], job, path)
+                continue
+            result = executor.execute(job, path, command["id"])
+        except OutputStorageError as error:
+            if rank == 0:
+                state.fail_output(command["id"], str(error))
+            continue
+        if rank == 0:
+            state.finish(command["id"], result)
 
 
 def create_app(state, token):
@@ -378,6 +693,9 @@ def parse_args(argv=None):
     parser.add_argument("--expect-gpu", default="H200")
     parser.add_argument("--max-num-frames", type=int, default=MAX_NUM_FRAMES,
                         help="Largest output frame count this worker admits (a 17n+5 value, 124-345)")
+    parser.add_argument("--async-publication", action="store_true",
+                        help="Finish and publish each MP4 on a background thread while the next video generates, "
+                             "one publication at a time (DEPLOYMENT.md); default: publish before the next job")
     args = parser.parse_args(argv)
     if min(args.queue_capacity, args.encoder_threads, args.min_free_gib) < 1:
         parser.error("queue capacity, encoder threads, and free disk threshold must be positive")
@@ -385,6 +703,13 @@ def parse_args(argv=None):
         parser.error(f"--max-num-frames must be one of {list(VALID_NUM_FRAMES)}")
     if not 1 <= args.port <= 65535:
         parser.error("invalid TCP port")
+    # The launchers set both from H3_ASYNC_PUBLICATION; a mismatch means the supervisor and watchdog drifted.
+    setting = os.environ.get("H3_ASYNC_PUBLICATION", "")
+    if setting not in {"", "0", "1"}:
+        parser.error("H3_ASYNC_PUBLICATION must be 0 or 1")
+    if setting and (setting == "1") != args.async_publication:
+        parser.error(f"--async-publication {'is missing' if setting == '1' else 'is set'} "
+                     f"but H3_ASYNC_PUBLICATION={setting}")
     return args
 
 
@@ -436,10 +761,12 @@ def main():
     else:
         control = None
     rank = dist.get_rank() if dist.is_initialized() else 0
-    state = server = server_thread = None
+    state = server = server_thread = publisher = None
     forwards = [0]
+    serving = False
     try:
         if rank == 0:
+            code_dir = Path(__file__).resolve().parent
             state = WorkerState(args.output_dir, capacity=args.queue_capacity, min_free_gib=args.min_free_gib,
                                 metadata={"hostname": socket.gethostname(), "gpus": world_size,
                                           "gpu": torch.cuda.get_device_name(device), "attention": args.attention_backend,
@@ -448,6 +775,10 @@ def main():
                                           "fps": 24, "transformer_forwards": 4,
                                           "encoder_threads": args.encoder_threads,
                                           "weight_sharding": weight_sharding,
+                                          "publication_mode": "async" if args.async_publication else "sync",
+                                          "publication_capacity": OutputPublisher.capacity if args.async_publication else 0,
+                                          # The running code: its directory and a digest of its Python sources.
+                                          "release": {"code_dir": str(code_dir), "source_sha256": source_digest(code_dir)},
                                           "slurm_job_id": os.environ.get("SLURM_JOB_ID")},
                                 max_num_frames=args.max_num_frames)
             server = uvicorn.Server(uvicorn.Config(create_app(state, token), host=args.host, port=args.port,
@@ -473,48 +804,57 @@ def main():
             if world_size > 1:
                 dist.broadcast_object_list(values, src=0, group=control)
 
-        def job_from_record(record):
-            """What execute() needs from a queued record; legacy records carry only a duration."""
-            output = record.get("output") or legacy_output(record["duration"])
-            image = None
-            if record.get("conditions"):
-                condition = record["conditions"][0]
-                image = str(args.output_dir / f"{record['id']}.keyframe0.{condition['format']}")
-            return {"prompt": record["prompt"], "seed": record["seed"], "output": output, "image": image}
+        def gather(value):
+            if world_size == 1:
+                return [value]
+            values = [None] * world_size
+            dist.all_gather_object(values, value, group=control)
+            return values
 
-        def execute(job, path):
-            torch.cuda.reset_peak_memory_stats(device)
-            forwards[0] = 0
-            attention = engine.sparse_attention
-            counters = ("sparse_calls", "dense_calls", "gate_fallback_calls", "gate_failures")
-            before = {key: getattr(attention, key) for key in counters} if attention else {}
-            started = time.perf_counter()
-            expected = job["output"]
-            media = engine.generate(job["prompt"], num_frames=expected["num_frames"], height=expected["height"],
-                                    width=expected["width"], seed=job["seed"], image=job["image"])
-            if forwards[0] != 4:
-                raise RuntimeError(f"Expected four transformer forwards, got {forwards[0]}")
-            pipeline_s = media.elapsed_s if media is not None else None
-            output = publish_media(media, path, expected, args.encoder_threads, inspect_media,
-                                   rank=rank, broadcast=broadcast)
+        def barrier():
             if world_size > 1:
                 dist.barrier()
-            elapsed = time.perf_counter() - started
+
+        attention = engine.sparse_attention
+        before = {}
+
+        def begin():
+            torch.cuda.reset_peak_memory_stats(device)
+            forwards[0] = 0
+            before.clear()
+            before.update({key: getattr(attention, key) for key in ATTENTION_COUNTERS} if attention else {})
+
+        def generate(job):
+            expected = job["output"]
+            return engine.generate(job["prompt"], num_frames=expected["num_frames"], height=expected["height"],
+                                   width=expected["width"], seed=job["seed"], image=job["image"])
+
+        def metrics():
             memory = {"rank": rank, "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30,
                       "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / 2**30}
-            attention_stats = ({key: getattr(attention, key) - before[key] for key in counters}
+            attention_stats = ({key: getattr(attention, key) - before[key] for key in ATTENTION_COUNTERS}
                                | {"gate": attention.gate_stats, "rejected_shapes": len(attention._rejected_shapes)}
                                if attention else None)
-            rank_result = {"memory": memory, "attention": {"rank": rank, **attention_stats} if attention_stats else None}
-            ranks = [rank_result]
-            if world_size > 1:
-                ranks = [None] * world_size
-                dist.all_gather_object(ranks, rank_result, group=control)
-            if rank == 0:
-                return {"pipeline_s": pipeline_s, "processing_s": elapsed, **output,
-                        "transformer_forwards": forwards[0], "memory": [item["memory"] for item in ranks],
-                        "attention": [item["attention"] for item in ranks],
-                        "used_gate_fallback": any(item["attention"] and item["attention"]["gate_fallback_calls"] for item in ranks)}
+            return {"memory": memory, "attention": {"rank": rank, **attention_stats} if attention_stats else None}
+
+        def host_memory():
+            """Resident memory, CPU time, and PyTorch's pinned host pool, which holds rank zero's staged frames."""
+            usage = process_usage()
+            with suppress(Exception):  # the pinned-pool statistics are newer than some PyTorch releases
+                stats = torch.cuda.memory.host_memory_stats()
+                for name, key in (("pinned_gib", "allocated_bytes.current"), ("pinned_peak_gib", "allocated_bytes.peak")):
+                    if key in stats:
+                        usage[name] = round(stats[key] / 2**30, 3)
+            return usage
+
+        if rank == 0 and args.async_publication:
+            publisher = OutputPublisher(lambda task: publish_staged(task, state, inspect_media))
+        executor = JobExecutor(rank=rank, runtime=SimpleNamespace(begin=begin, generate=generate,
+                                                                  forwards=lambda: forwards[0], metrics=metrics,
+                                                                  host_memory=host_memory),
+                               broadcast=broadcast, gather=gather, barrier=barrier,
+                               encoder_threads=args.encoder_threads, inspect_media=inspect_media,
+                               state=state, publisher=publisher)
 
         prompt = read_prompt(args.warmup_prompt_file)
         warmups = []
@@ -530,8 +870,9 @@ def main():
                         time.sleep(5)
                         continue
                     try:
-                        result = execute({"prompt": prompt, "seed": 42, "output": legacy_output(duration),
-                                          "image": None}, path)
+                        # Warmups always publish synchronously, so readiness follows complete outputs.
+                        result = executor.execute({"prompt": prompt, "seed": 42, "output": legacy_output(duration),
+                                                   "image": None}, path)
                         break
                     except OutputStorageError as error:
                         if rank == 0:
@@ -557,38 +898,12 @@ def main():
                     quiet_print(f"READY_FILE_WRITE_FAILED {error!r}; use /healthz")
             quiet_print("H3_WORKER_READY " + json.dumps(ready))
 
-        while True:
-            command = None
-            if rank == 0:
-                if not server_thread.is_alive():
-                    raise RuntimeError("HTTP server stopped")
-                command = state.next_command()
-            if world_size > 1:
-                commands = [command]
-                dist.broadcast_object_list(commands, src=0, group=control)
-                command = commands[0]
-            if command.get("idle"):
-                time.sleep(1)
-                continue
-            path = args.output_dir / f"{command['id']}.mp4"
-            try:
-                result = execute(job_from_record(command), path)
-            except OutputStorageError as error:
-                if rank == 0:
-                    with state.lock:
-                        state.storage_error = str(error)
-                        state.update(command["id"], status="failed", error="output storage failure",
-                                     error_code="storage_failure", finished_at=time.time(), storage_error=str(error))
-                        state.active = None
-                continue
-            if rank == 0:
-                with state.lock:
-                    state.update(command["id"], status="succeeded", finished_at=time.time(), **result)
-                    state.active = None
-                    state.completed += 1
+        serving = True
+        serve_jobs(executor, rank=rank, broadcast=broadcast, state=state, output_dir=args.output_dir,
+                   async_publication=args.async_publication,
+                   alive=server_thread.is_alive if server_thread is not None else (lambda: True))
     except BaseException:
-        if state is not None:
-            state.fail_pending()
+        stop_after_error(rank, state, publisher, async_publication=args.async_publication, serving=serving)
         raise
     finally:
         if rank == 0 and args.ready_file:

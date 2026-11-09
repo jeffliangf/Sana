@@ -205,6 +205,8 @@ not expire and are never rendered again.
 | `media` | `succeeded` | `width`, `height`, `fps`, `video_codec`, `audio_codec`, `sample_rate`, `channels`, `duration_s` |
 | `processing_s`, `pipeline_s` | `succeeded` | Worker time per video, end to end and for the model pipeline |
 | `transformer_forwards`, `used_gate_fallback`, `memory`, `attention` | `succeeded` | Diagnostics: four forwards, whether the dense numerical fallback ran, per-GPU memory and attention counters |
+| `stage` | `running`, upgraded workers | `generating`, `staging`, or `publishing`. Informational; keep polling `status` |
+| `publication_mode`, `generation_started_at`, `generation_finished_at`, `gpu_slot_s`, `host`; with background publication also `staged_at`, `published_at`, `publication_slot_wait_s`, `publication_tail_s`, `encoder` | `succeeded`, upgraded workers | Timing diagnostics of the worker's GPU and publication phases; Unix seconds for `*_at` |
 | `error`, `error_code` | `failed` | Message and stable code, below |
 | `persistence_pending` | briefly | `true` while storage catches up; the status shows `running`, keep polling |
 
@@ -454,6 +456,7 @@ the token, large batches, and incidents, contact the deployment owner, Jeff.
 
 | Date | Change |
 |---|---|
+| 2026-11-09 | Additive job fields: `stage` while running, and timing diagnostics. Workers publish a video while generating the next. Status values, existing fields, and their meaning, including `processing_s`, are unchanged |
 | 2026-11-05 | The SGLang MiniMax-H3 request form: `t2va` and first-frame `fl2va` with base64 images, six aspect ratios or the image's own, 124–345 frames; `/v1/videos/{id}` and `/v1/videos/{id}/content`; `task`, `target`, `conditions`, and `output` on jobs; `api` in `/healthz`; 28 MiB request limit. The original form is unchanged |
 | 2026-10-28 | Optional `Idempotency-Key` (the job ID); `error_code` on failed jobs, including `worker_lost`; `video_sha256` and `video_bytes` on succeeded jobs; `idempotency_key` in `/healthz` |
 | 2026-10-22 | Stable gateway URL with job archive and polling |

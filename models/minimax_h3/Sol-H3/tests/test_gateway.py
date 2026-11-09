@@ -35,6 +35,8 @@ class Fleet:
         self.down = set()  # Refuse every connection.
         self.legacy = set()  # Predates job ID support.
         self.v1 = set()  # Predates the SGLang-form contract.
+        self.async_workers = set()  # Publish in the background: new health fields, a "publishing" stage.
+        self.published = set()
         self.bodies = []
         self.media = b"example-mp4"
         self.expected_bytes = len(self.media)
@@ -49,6 +51,10 @@ class Fleet:
                       "active_job": None, "idempotency_key": endpoint not in self.legacy}
             if endpoint not in self.v1:
                 health["api"] = h3_request.capabilities()
+            if endpoint in self.async_workers:  # busy publishing an earlier video, with the GPU free
+                health.update(active_job=str(uuid4()), gpu_active_job=None, publishing_jobs=["earlier"],
+                              publication_mode="async", publication_capacity=1, drained=False, fatal_error=None,
+                              release={"code_dir": "/release", "source_sha256": "0" * 64}, process={"cpu_s": 1.0})
             return httpx.Response(200, json=health)
         assert request.headers["Authorization"] == AUTH["Authorization"]
         if request.method == "POST":
@@ -78,6 +84,9 @@ class Fleet:
         assert job["endpoint"] == endpoint, "Job must stay on the accepting worker"
         if request.url.path.endswith("/video"):
             return httpx.Response(200, content=self.media)
+        if endpoint in self.async_workers and identifier not in self.published:
+            self.published.add(identifier)  # The first poll finds the MP4 still being published.
+            return httpx.Response(200, json={**job["value"], "status": "running", "stage": "publishing"})
         return httpx.Response(200, json={**job["value"], "status": "succeeded", "bytes": self.expected_bytes})
 
 
@@ -100,6 +109,35 @@ def test_concurrent_requests_spread_across_workers(tmp_path):
         assert len({v["id"] for v in values}) == 6
         assert collections.Counter(x["endpoint"] for x in fleet.jobs.values()) == {url: 2 for url in URLS}
         assert all(router.load(v["id"])["worker"] == fleet.jobs[v["id"]]["endpoint"] for v in values)
+        await router.client.aclose()
+    asyncio.run(run())
+
+
+def test_async_publication_workers_work_with_the_installed_gateway_beside_old_workers(tmp_path):
+    async def run():
+        fleet = Fleet()
+        fleet.async_workers = {URLS[0]}
+        router = make_gateway(tmp_path, fleet)
+        await router.refresh_pool()
+        assert set(router.ready) == set(URLS)  # The extra health fields do not affect admission.
+        # A publication still counts as load: the first job goes to an idle old worker.
+        first = await router.submit(gateway.GenerateRequest(prompt="first"))
+        assert fleet.jobs[first["id"]]["endpoint"] != URLS[0]
+        values = [first] + list(await asyncio.gather(
+            *(router.submit(gateway.GenerateRequest(prompt=f"request {i}")) for i in range(8))))
+        on_async = [v["id"] for v in values if fleet.jobs[v["id"]]["endpoint"] == URLS[0]]
+        assert on_async and len(on_async) < len(values)
+        for identifier in on_async:
+            await router.refresh_job(identifier)
+            public = router.public(router.load(identifier))
+            assert (public["status"], public["stage"]) == ("running", "publishing")
+        digest = hashlib.sha256(fleet.media).hexdigest()
+        for value in values:
+            await router.refresh_job(value["id"])
+            public = router.public(router.load(value["id"]))
+            assert public["status"] == "succeeded" and public["video_sha256"] == digest
+            assert (router.root / "videos" / f"{value['id']}.mp4").read_bytes() == fleet.media
+        assert len([c for c in fleet.calls if c[0] == "POST"]) == len(values)  # nothing was generated twice
         await router.client.aclose()
     asyncio.run(run())
 
