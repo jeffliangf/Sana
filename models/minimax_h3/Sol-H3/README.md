@@ -34,15 +34,15 @@ image-to-video with stereo audio at 24 fps, in either request form:
 - The SGLang MiniMax-H3 form: `t2va` or `fl2va`, six aspect ratios or the first
   frame's own, 124–345 frames.
 
-**State on 2026-11-09.** 20 two-GPU H200 workers run on five nodes:
-`dc02-gpu-{002,003,005,006,023}.internal.bigbeargpu.cloud`, Slurm jobs 25–29, four
-workers per node on ports 18080–18083. All are admitted through the gateway with
-the 0.95 serving cap and overlapped MP4 publication (`H3_ASYNC_PUBLICATION=1`).
+**State on 2026-11-10.** 24 two-GPU H200 workers run on six nodes:
+`dc02-gpu-{002,003,005,006,023,035}.internal.bigbeargpu.cloud`, Slurm jobs 25–29 and
+37, four workers per node on ports 18080–18083. All are admitted through the gateway
+with the 0.95 serving cap and overlapped MP4 publication (`H3_ASYNC_PUBLICATION=1`).
 They run from the read-only release
 `/home/jeff/sol-h3-h200/releases/20261109-async-publication-de684c517f65/Sol-H3`.
-Direct validation passed 80 jobs, and gateway validation passed 20, covering every
-worker. Evidence is in `deployment/async-publication-20261109/`. Node 035 was freed
-on 2026-11-09, and 048 and 067 run another user's jobs. The rebuilt cluster keeps
+Direct validation passed 96 jobs, covering every worker, and gateway validation
+passed 20. Evidence is in `deployment/async-publication-20261109/`. Nodes 048 and 067
+run another user's jobs. The rebuilt cluster keeps
 node-local environments, weights, caches, and outputs in `/var/tmp/jeff-sol-h3`. The
 shared deployment root and the caller URL are unchanged. Check `/healthz` for live
 capacity.
@@ -338,6 +338,7 @@ Evidence is in `/home/jeff/sol-h3-h200/deployment/` on the cluster unless noted.
 | 2026-11-05 | That code deployed: gateway updated in place, 16 workers on 0003, 0035, 0048, 0067. The watchdog restarts workers with the cap | `rollout-api-v2-20261105/` |
 | 2026-11-07/08 | 32 workers on the rebuilt eight-node cluster; persistent gateway and watchdog restored. T2V/I2V matrix and 256-request concurrent stress run passed | `fleet-32-dc02-20261107/finish-20261108/` |
 | 2026-11-09 | 048 and 067 released to another user. Overlapped MP4 publication deployed to all workers from a read-only release; 035 freed; 20 workers on 002, 003, 005, 006, 023 | `release-2-nodes-20261109T174700Z/`, `async-publication-20261109/` |
+| 2026-11-10 | 035 back on the same release: 24 workers | `async-publication-20261109/` |
 
 ## Validation
 

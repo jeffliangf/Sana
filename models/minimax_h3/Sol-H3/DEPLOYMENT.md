@@ -5,24 +5,25 @@ FastH3 adapter** service. It covers `serve.py`, `serve_node.py`, `gateway.py`, a
 the launchers in this directory. It does not use the separate SGLang deployment
 instructions at the repository root.
 
-**State on 2026-11-09 (H200).** 20 two-GPU H200 workers serve both request forms
+**State on 2026-11-10 (H200).** 24 two-GPU H200 workers serve both request forms
 through the gateway with [overlapped output publication](#overlapped-output-publication)
 (`H3_ASYNC_PUBLICATION=1`).
-- Slurm 25–29 hold all eight GPUs on
-  `dc02-gpu-{002,003,005,006,023}.internal.bigbeargpu.cloud` (jobs 26, 27, 28, 25,
-  29), four workers each on ports 18080–18083.
+- Six allocations hold all eight GPUs on
+  `dc02-gpu-{002,003,005,006,023,035}.internal.bigbeargpu.cloud` (Slurm 26, 27, 28,
+  25, 29, 37), four workers each on ports 18080–18083.
   - They run the read-only release
     `/home/jeff/sol-h3-h200/releases/20261109-async-publication-de684c517f65/Sol-H3`;
     each `/healthz` reports its `release.source_sha256`.
   - `deployment/jobs.json` records them. Evidence is in
     `deployment/async-publication-20261109/`.
-- Validated on 2026-11-09 with 80 direct jobs, 20 jobs through the gateway URL
-  that reached every worker, a back-to-back overlap check, and an encoder
-  equivalence test on an H200. For the measured speed, see
-  [Roll out overlapped publication](#roll-out-overlapped-publication).
-- Node 035 was freed on 2026-11-09 at the user's request. Since 17:47 UTC that day,
-  048 and 067 run another user's jobs (`deployment/release-2-nodes-20261109T174700Z/`).
-  `pool.json` excludes the origins of all three nodes; leave them alone.
+- Validated with 96 direct jobs that covered every worker, plus a back-to-back
+  overlap check and an encoder equivalence test on an H200. On 2026-11-09, 20 more
+  jobs went through the gateway URL, covering each worker admitted that day. For the
+  measured speed, see [Roll out overlapped publication](#roll-out-overlapped-publication).
+- Node 035 was freed on 2026-11-09 and brought back on 2026-11-10 (Slurm 37). Since
+  17:47 UTC on 2026-11-09, 048 and 067 run another user's jobs
+  (`deployment/release-2-nodes-20261109T174700Z/`). `pool.json` excludes their
+  origins; leave them alone.
 - Workers cap PyTorch's pool at 95% of the GPU after warmup (132.8 GiB), the H200
   default.
 - The gateway host is `VM-187-Konsttech`, and user lingering is enabled. The hourly
@@ -475,7 +476,7 @@ code and units; the live copy is in `deployment/watchdog/`.
   fleet's nodes (002, 003, 005, 006, 023, 035, 048, and 067 since the 2026-11-07
   rebuild). The watchdog ignores any other node. Each node's job must be named
   `h3-api-<node>-p18080`. Since 2026-11-09, `excluded_workers` keeps it away from
-  035, 048, and 067, which no longer run H3 workers.
+  048 and 067, which run another user's jobs.
 - Restarted workers: `run-worker.sh` starts a worker with the same environment and
   arguments as `serve_node.py`, including `H3_SERVING_MEMORY_FRACTION=0.95`. It also
   takes the allocation's launch settings (publication mode and code directory),
@@ -815,7 +816,8 @@ and `actions.log`):
    back-to-back overlap.
 3. 002, 003, 005, 023, and 035 were then replaced together (jobs 26–30). At the
    user's request, 035 was freed again before validation. The other four were
-   validated directly and through the gateway, then admitted.
+   validated directly and through the gateway, then admitted. On 2026-11-10, 035 came
+   back on the same release (Slurm 37) and was validated and admitted.
 
 The steps below are the full procedure; use them for the next rollout.
 Replace one allocation (four workers) at a time.
