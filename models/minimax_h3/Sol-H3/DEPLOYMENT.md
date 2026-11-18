@@ -5,12 +5,12 @@ FastH3 adapter** service. It covers `serve.py`, `serve_node.py`, `gateway.py`, a
 the launchers in this directory. It does not use the separate SGLang deployment
 instructions at the repository root.
 
-**State on 2026-11-18 (H200).** 24 two-GPU H200 workers serve both request forms
+**State on 2026-11-18 (H200).** 20 two-GPU H200 workers serve both request forms
 through the gateway with [overlapped output publication](#overlapped-output-publication)
 (`H3_ASYNC_PUBLICATION=1`) and accept prompts of up to 16,000 characters.
-- Six allocations hold all eight GPUs on
-  `dc02-gpu-{002,003,005,006,023,035}.internal.bigbeargpu.cloud` (Slurm 53, 54, 55,
-  52, 56, 57), four workers each on ports 18080–18083.
+- Five allocations hold all eight GPUs on
+  `dc02-gpu-{002,003,005,006,023}.internal.bigbeargpu.cloud` (Slurm 53, 54, 55,
+  52, 56), four workers each on ports 18080–18083.
   - They run the read-only release
     `/home/jeff/sol-h3-h200/releases/20261118-prompt-16k-f2ff5008346a/Sol-H3`;
     each `/healthz` reports its `release.source_sha256`.
@@ -30,6 +30,10 @@ through the gateway with [overlapped output publication](#overlapped-output-publ
 - Since 17:47 UTC on 2026-11-09, 048 and 067 run other users' jobs
   (`deployment/release-2-nodes-20261109T174700Z/`). `pool.json` excludes their
   origins; leave them alone.
+- 035 (Slurm 57) was drained and released at 19:41 UTC on 2026-11-18 at the user's
+  request; no job failed. Since about 20:04 it runs another user's job. `pool.json`
+  keeps its four origins excluded. The record `deployment/release-035-20261118/` says
+  how to bring it back.
 - Workers cap PyTorch's pool at 95% of the GPU after warmup (132.8 GiB), the H200
   default.
 - The gateway host is `VM-187-Konsttech`, and user lingering is enabled. The hourly
@@ -484,7 +488,8 @@ code and units; the live copy is in `deployment/watchdog/`.
   fleet's nodes (002, 003, 005, 006, 023, 035, 048, and 067 since the 2026-11-07
   rebuild). The watchdog ignores any other node. Each node's job must be named
   `h3-api-<node>-p18080`. Since 2026-11-09, `excluded_workers` keeps it away from
-  048 and 067, which run another user's jobs.
+  048 and 067, which run another user's jobs, and since 2026-11-18 from the
+  released 035.
 - Restarted workers: `run-worker.sh` starts a worker with the same environment and
   arguments as `serve_node.py`, including `H3_SERVING_MEMORY_FRACTION=0.95`. It also
   takes the allocation's launch settings (publication mode and code directory),
