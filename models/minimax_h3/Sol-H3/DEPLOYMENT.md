@@ -5,23 +5,29 @@ FastH3 adapter** service. It covers `serve.py`, `serve_node.py`, `gateway.py`, a
 the launchers in this directory. It does not use the separate SGLang deployment
 instructions at the repository root.
 
-**State on 2026-11-10 (H200).** 24 two-GPU H200 workers serve both request forms
+**State on 2026-11-18 (H200).** 24 two-GPU H200 workers serve both request forms
 through the gateway with [overlapped output publication](#overlapped-output-publication)
-(`H3_ASYNC_PUBLICATION=1`).
+(`H3_ASYNC_PUBLICATION=1`) and accept prompts of up to 16,000 characters.
 - Six allocations hold all eight GPUs on
-  `dc02-gpu-{002,003,005,006,023,035}.internal.bigbeargpu.cloud` (Slurm 26, 27, 28,
-  25, 29, 37), four workers each on ports 18080–18083.
+  `dc02-gpu-{002,003,005,006,023,035}.internal.bigbeargpu.cloud` (Slurm 53, 54, 55,
+  52, 56, 57), four workers each on ports 18080–18083.
   - They run the read-only release
-    `/home/jeff/sol-h3-h200/releases/20261109-async-publication-de684c517f65/Sol-H3`;
+    `/home/jeff/sol-h3-h200/releases/20261118-prompt-16k-f2ff5008346a/Sol-H3`;
     each `/healthz` reports its `release.source_sha256`.
   - `deployment/jobs.json` records them. Evidence is in
-    `deployment/async-publication-20261109/`.
-- Validated with 96 direct jobs that covered every worker, plus a back-to-back
-  overlap check and an encoder equivalence test on an H200. On 2026-11-09, 20 more
-  jobs went through the gateway URL, covering each worker admitted that day. For the
-  measured speed, see [Roll out overlapped publication](#roll-out-overlapped-publication).
-- Node 035 was freed on 2026-11-09 and brought back on 2026-11-10 (Slurm 37). Since
-  17:47 UTC on 2026-11-09, 048 and 067 run another user's jobs
+    `deployment/prompt-16k-20261118/`.
+- Validated on 2026-11-18 with 96 direct jobs that covered every worker and 24 jobs
+  through the gateway URL. 16,000-character English and Chinese prompts (up to 12,375
+  Qwen tokens) at 345 frames on the widest canvas peaked at 129.7 GiB allocated, under
+  the 132.8 GiB cap, and produced coherent video. The overlap check and encoder
+  equivalence test of 2026-11-09 still apply; that code is unchanged. For the measured
+  speed, see [Roll out overlapped publication](#roll-out-overlapped-publication).
+- **Slurm can lose an allocation.** Requeues on 2026-11-13/14 marked the previous jobs
+  (25–29, 37) FAILED while their original steps kept serving, so Slurm showed the
+  nodes idle. If workers answer but `squeue` lists no `h3-api-*` job, `scancel`
+  cannot stop them: drain, send SIGTERM to the node's `serve_node.py`, wait a minute
+  for the ports' TIME_WAIT to clear (preflight binds them), then submit.
+- Since 17:47 UTC on 2026-11-09, 048 and 067 run other users' jobs
   (`deployment/release-2-nodes-20261109T174700Z/`). `pool.json` excludes their
   origins; leave them alone.
 - Workers cap PyTorch's pool at 95% of the GPU after warmup (132.8 GiB), the H200
@@ -79,8 +85,9 @@ address drift. Ordinary worker scaling requires neither running that installer
 nor restarting the gateway. Updating gateway code requires a service restart;
 keeping the socket open preserves the address but does not guarantee that an
 in-flight HTTP request survives a process restart. The new process reads every job
-record before it answers. With 175,000 records on 2026-11-05 that took 35 minutes,
-so restart only when the API can be unavailable that long.
+record before it answers, 32 at a time. One at a time, 175,000 records took 35 minutes on
+2026-11-05, and 470,000 would have taken about three hours; in parallel they took about 2.3 ms
+each. Restart only when the API can be unavailable that long.
 
 Clients outside the private network use their own SSH tunnel, as described in
 [the access guide](README.md#access-the-deployed-h200-service). Cluster access
@@ -379,10 +386,11 @@ These paths handle reported I/O errors. A filesystem call that hangs indefinitel
 can still block its process. The gateway host, its persistent storage, and network
 remain shared dependencies; there is no second gateway or replicated job database.
 
-A gateway restart reads every `jobs/*.json` before it answers. On 2026-10-28,
-33,521 records on the shared MooseFS `/home` took about seven minutes; the socket
-kept the address, but status and download requests waited until the scan ended.
-Schedule gateway restarts accordingly.
+A gateway restart reads every `jobs/*.json` before it answers, 32 records at a time
+(`STARTUP_READERS` in `gateway.py`). A single read on the shared MooseFS `/home` takes
+about 24 ms, so the old one-at-a-time scan took about seven minutes for 33,521 records
+(2026-10-28) and 35 minutes for 175,000 (2026-11-05). The socket keeps the address, but
+status and download requests wait until the scan ends. Schedule gateway restarts accordingly.
 
 ### Capacity, retention, and incident response
 

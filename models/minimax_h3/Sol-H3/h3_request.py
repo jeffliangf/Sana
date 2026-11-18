@@ -41,7 +41,9 @@ LEGACY_NUM_FRAMES = {5: 124, 10: 243}
 DEFAULT_ASPECT_RATIO = "16:9"  # 1344x768
 ASPECT_RATIOS = ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16")
 TASKS = ("t2va", "fl2va")
-MAX_PROMPT_CHARS = 8000
+# About 3,500 Qwen tokens of English or 12,300 of Chinese. The model has no limit of its own: the text encoder
+# reads the whole prompt and each token becomes one DiT row, next to about 104,000 rows for a 345-frame clip.
+MAX_PROMPT_CHARS = 16000
 DEFAULT_SEED = 42
 MAX_SEED = 2**63 - 1
 MAX_IMAGE_BYTES = 20 * 2**20
@@ -50,7 +52,7 @@ MIN_IMAGE_SIDE = 32
 MAX_IMAGE_PIXELS = 40_000_000
 IMAGE_FORMATS = {"PNG": "png", "JPEG": "jpg", "WEBP": "webp"}
 LEGACY_BODY_BYTES = 32 * 2**10
-# A 20 MiB image is 26.7 MiB as base64; leave room for an 8,000-character prompt.
+# A 20 MiB image is 26.7 MiB as base64; leave room for a 16,000-character prompt.
 MAX_BODY_BYTES = 28 * 2**20
 API_VERSION = 2
 UNSUPPORTED_FIELDS = {

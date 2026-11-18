@@ -30,7 +30,7 @@ def test_auth_readiness_validation_and_queue_limit(tmp_path):
     assert client.post("/v1/videos", json=payload, headers=AUTH).status_code == 503
     state.phase = "ready"
     for invalid in ({"duration": 15}, {"duration": "5"}, {"seed": True}, {"seed": -1},
-                    {"prompt": " "}, {"prompt": "x" * 8001}, {"unexpected": "field"}):
+                    {"prompt": " "}, {"prompt": "x" * 16001}, {"unexpected": "field"}):
         assert client.post("/v1/videos", json={**payload, **invalid}, headers=AUTH).status_code == 422
     first = client.post("/v1/videos", json=payload, headers=AUTH)
     assert first.status_code == 202

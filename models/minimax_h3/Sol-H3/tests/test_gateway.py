@@ -622,6 +622,24 @@ def test_leftover_storage_probe_does_not_break_restart_job_scan(tmp_path, monkey
     asyncio.run(restarted.client.aclose())
 
 
+def test_restart_scan_reads_records_in_parallel_batches_and_keeps_only_unfinished_jobs(tmp_path, monkeypatch):
+    jobs = tmp_path / "state/jobs"
+    jobs.mkdir(parents=True)
+    expected = set()
+    for index in range(11):
+        identifier = str(uuid4())
+        status, cached = [("running", False), ("succeeded", False), ("succeeded", True), ("failed", False)][index % 4]
+        (jobs / f"{identifier}.json").write_text(json.dumps({"job": {"id": identifier, "status": status},
+                                                              "video_cached": cached}))
+        if status != "failed" and not cached:
+            expected.add(identifier)
+    (jobs / f".{uuid4()}.json.tmp").write_text("{")  # A half-written atomic_json temporary is not a record.
+    monkeypatch.setattr(gateway, "STARTUP_BATCH", 3)
+    router = make_gateway(tmp_path, Fleet())
+    assert set(router.pending) == expected and len(expected) == 6
+    asyncio.run(router.client.aclose())
+
+
 @pytest.mark.parametrize("bad", [{"workers": [None]}, {"workers": [{"endpoint": 12}]}, {"updated_at": float("nan")}])
 def test_malformed_registry_cannot_remove_healthy_siblings(tmp_path, bad):
     async def run():

@@ -44,6 +44,14 @@ def test_legacy_requests_are_unchanged():
         rejected({"prompt": "x", **invalid})
 
 
+def test_prompts_up_to_16000_characters_are_accepted_in_both_forms():
+    longest = "猫" * 8000 + "x" * 8000  # Characters, not bytes or tokens, are what the limit counts.
+    assert parse_request({"prompt": longest}).identity["prompt"] == longest
+    assert parse_request({"task": "t2va", "prompt": longest}).identity["prompt"] == longest
+    for body in ({"prompt": longest + "x"}, {"task": "t2va", "prompt": longest + "x"}):
+        assert rejected(body)[0]["type"] == "string_too_long"
+
+
 def test_t2va_defaults_to_16_9_and_five_seconds():
     parsed = parse_request({"task": "t2va", "prompt": "A fox."})
     assert parsed.resolve() == {"width": 1344, "height": 768, "num_frames": 124, "fps": 24,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 import hashlib
 import json
@@ -29,6 +30,10 @@ from service_storage import check_space, storage_probe
 __all__ = ["Gateway", "GenerateRequest", "create_app"]
 
 LOG = logging.getLogger("h3.gateway")
+# The gateway answers nothing until it has read every job record. On the cluster file system one read takes
+# about 24 ms, which is three hours for 470,000 records; 32 parallel reads took 2.3 ms per record.
+STARTUP_READERS = 32
+STARTUP_BATCH = 4096  # Bounds the futures held at once.
 
 
 def origin(value):
@@ -49,6 +54,14 @@ def job_id(value):
     except (ValueError, AttributeError):
         raise HTTPException(404, "Unknown job") from None
     return value
+
+
+def unfinished_record(path):
+    """A job record that still needs memory or polling, or None once it has failed or its video is cached."""
+    record = json.loads(path.read_text())
+    if record["job"]["status"] != "failed" and not record.get("video_cached"):
+        return record
+    return None
 
 
 class Gateway:
@@ -86,10 +99,12 @@ class Gateway:
         self.io_limit = asyncio.Semaphore(16)
         self.maintenance = []
         # Only unfinished jobs need memory or polling; completed records stay on disk.
-        for path in (self.root / "jobs").glob("*.json"):
-            record = json.loads(path.read_text())
-            if record["job"]["status"] != "failed" and not record.get("video_cached"):
-                self.pending[record["job"]["id"]] = record
+        paths = list((self.root / "jobs").glob("*.json"))
+        with ThreadPoolExecutor(STARTUP_READERS, thread_name_prefix="h3-startup") as readers:
+            for start in range(0, len(paths), STARTUP_BATCH):
+                for record in readers.map(unfinished_record, paths[start:start + STARTUP_BATCH]):
+                    if record is not None:
+                        self.pending[record["job"]["id"]] = record
         # A known acceptance may have reached its journal but not jobs/<id>.json.
         # Unknown outcomes remain for reconciliation; never replay their POSTs.
         for path in (self.root / "uncertain").glob("*.json"):

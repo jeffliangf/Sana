@@ -84,7 +84,7 @@ header and be at most 28 MiB, which leaves room for a base64 first frame of up t
 
 | Body field | Type | Rules | Default |
 |---|---|---|---|
-| `prompt` | string | 1–8,000 characters, not only whitespace; surrounding whitespace is trimmed | required |
+| `prompt` | string | 1–16,000 characters, not only whitespace; surrounding whitespace is trimmed | required |
 | `duration` | integer | `5` or `10` (seconds); the string `"5"` is rejected | `5` |
 | `seed` | integer | 0 to 2^63−1; booleans are rejected | `42` |
 
@@ -99,7 +99,7 @@ MiniMax-H3 cookbook, restricted to what this deployment runs.
 | Field | Type | Rules | Default |
 |---|---|---|---|
 | `task` | string | `t2va` (text only) or `fl2va` (text and a first frame); `ref2va` is rejected | required |
-| `prompt` | string | 1–8,000 characters, not only whitespace | required |
+| `prompt` | string | 1–16,000 characters, not only whitespace | required |
 | `conditions` | array | `t2va`: empty. `fl2va`: exactly one `{"type": "image", "role": "keyframe", "frame_index": 0, "uri": ...}` | `[]` |
 | `conditions[].uri` | string | A base64 image: `data:image/png;base64,...` (or `image/jpeg`, `image/webp`), or SGLang's `base64://...`. PNG, JPEG, or WebP; at most 20 MiB; sides of 32–8,192 pixels; at most 40 million pixels | required |
 | `target.aspect_ratio` | string | `auto`, `21:9`, `16:9`, `4:3`, `1:1`, `3:4`, or `9:16` | `16:9` for `t2va`, `auto` for `fl2va` |
@@ -425,7 +425,8 @@ same or fewer tokens per frame. Queueing and download are not included.
   prompt length, that length runs dense on that worker from then on. This
   happened to 6–25% of 5- and 10-second requests and to about half of
   14-second ones in the measurement. It happens more often with very long
-  prompts: 14.4-second clips with 8,000-character prompts took 82–99 s.
+  prompts: 14.4-second clips with 8,000-character prompts took 82–99 s, and with
+  15,000–16,000-character prompts 102–116 s.
 - **New lengths.** A worker's first request with a new combination of prompt
   length, canvas, and frame count compiles kernels once. That is the "first
   request of a new length" column.

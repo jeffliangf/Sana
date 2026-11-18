@@ -34,14 +34,14 @@ image-to-video with stereo audio at 24 fps, in either request form:
 - The SGLang MiniMax-H3 form: `t2va` or `fl2va`, six aspect ratios or the first
   frame's own, 124–345 frames.
 
-**State on 2026-11-10.** 24 two-GPU H200 workers run on six nodes:
-`dc02-gpu-{002,003,005,006,023,035}.internal.bigbeargpu.cloud`, Slurm jobs 25–29 and
-37, four workers per node on ports 18080–18083. All are admitted through the gateway
-with the 0.95 serving cap and overlapped MP4 publication (`H3_ASYNC_PUBLICATION=1`).
-They run from the read-only release
-`/home/jeff/sol-h3-h200/releases/20261109-async-publication-de684c517f65/Sol-H3`.
+**State on 2026-11-18.** 24 two-GPU H200 workers run on six nodes:
+`dc02-gpu-{002,003,005,006,023,035}.internal.bigbeargpu.cloud`, Slurm jobs 52–57,
+four workers per node on ports 18080–18083. All are admitted through the gateway
+with the 0.95 serving cap and overlapped MP4 publication (`H3_ASYNC_PUBLICATION=1`),
+and accept prompts of up to 16,000 characters. They run from the read-only release
+`/home/jeff/sol-h3-h200/releases/20261118-prompt-16k-f2ff5008346a/Sol-H3`.
 Direct validation passed 96 jobs, covering every worker, and gateway validation
-passed 20. Evidence is in `deployment/async-publication-20261109/`. Nodes 048 and 067
+passed 24. Evidence is in `deployment/prompt-16k-20261118/`. Nodes 048 and 067
 run another user's jobs. The rebuilt cluster keeps
 node-local environments, weights, caches, and outputs in `/var/tmp/jeff-sol-h3`. The
 shared deployment root and the caller URL are unchanged. Check `/healthz` for live
@@ -130,8 +130,8 @@ The socket keeps the same listener across service restarts. The deployment scrip
 pins the address in `gateway/endpoint.json` and refuses an accidental address or
 port change on later updates. Update gateway code, then run
 `systemctl --user restart h3-gateway.service`; GPU workers continue running. The
-gateway answers again only after reading every job record: 35 minutes with 175,000
-records on 2026-11-05.
+gateway answers again only after reading every job record, 32 at a time: about 2.3 ms per
+record on the cluster (35 minutes for 175,000 records when they were read one at a time).
 This is one gateway host, so a host or network outage can still interrupt access.
 
 The gateway reads `deployment/*/node.json` and probes workers every two seconds.
