@@ -415,14 +415,17 @@ queues only 8 jobs, so this is not a durable batch queue.
 
 | Clip | Text-to-video, warm | First frame, warm | First request of a new length | MP4 size |
 |---|---|---|---|---|
-| 124 frames, 5.2 s | 22 s | 24 s | 30 s | about 1–4 MB |
-| 243 frames, 10.1 s | 50–51 s | 56–58 s | 56–64 s | about 1–7 MB |
-| 345 frames, 14.4 s | 94 s | 101–102 s | 91–102 s | about 2–13 MB |
+| 124 frames, 5.2 s | 20.5 s | 24 s | 27 s; 30 s with a first frame | about 1–4 MB |
+| 243 frames, 10.1 s | 49–51 s | 56–58 s | 55–58 s; 61–64 s with a first frame | about 1–7 MB |
+| 345 frames, 14.4 s | 88–91 s | 93–99 s | about the same as warm | about 2–13 MB |
 
-These are generation times per video on a two-GPU H200 worker, measured on 2026-11-21
-with SMD-H3 E at 1344×768 and prompts of about 2,000–5,000 characters.
-- Writing the MP4 takes about 4 s more; it overlaps the worker's next generation.
-- Other aspect ratios have the same or fewer tokens per frame.
+These are generation times per video (`pipeline_s`) on a two-GPU H200 worker, measured on
+2026-11-21 with SMD-H3 E at 1344×768 (first frames: the image's own canvas) and prompts of
+about 2,000–5,000 characters.
+- Writing the MP4 adds 1–4 s (`processing_s` minus `pipeline_s`); it overlaps the worker's
+  next generation.
+- Other aspect ratios have the same or fewer tokens per frame, so they are faster: a 345-frame
+  1:1 clip took 44 s and a 4:3 one 61 s.
 - Queueing and download are not included.
 - songyang's SMD-E service takes about the same time on the same requests.
 

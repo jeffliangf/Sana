@@ -53,6 +53,12 @@ image-to-video with stereo audio at 24 fps, in either request form:
   this engine at Sana `175081e` with E. For 52 of its stored T2V and I2V test requests
   (same prompt, seed and first frame), the decoded frames and audio differ only by video
   encoding. Details are in [Deployment history](#deployment-history).
+  - The request forms the RL sends match too: the legacy form, `t2va` at 5 s, and `fl2va` with
+    `aspect_ratio: auto`, through the gateway.
+  - Two of our own renders of the same request differ by as much: their audio is bit-identical
+    and their video is 40–45 dB apart.
+  - Every setting that affects the output (`settings-comparison.md` in the evidence) and every
+    numeric package version is the same.
 - **Evidence.** `deployment/smd-e-20261121/`.
 - **Other nodes.** Nodes 035, 048 and 067 run other users' jobs.
 - **Node-local files.** The rebuilt cluster keeps node-local environments, weights,

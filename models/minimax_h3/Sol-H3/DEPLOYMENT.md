@@ -25,7 +25,9 @@ They accept prompts of up to 16,000 characters.
   - 80 direct jobs covering every worker and 20 through the gateway URL.
   - The H3 preflight of the RL run `grpo-mixed-hydrogen-group8-16h100-20261118-toolc-16k`
     (`check_unified_api`, `require_h3_pool` with 20 workers) passes on the live `/healthz`.
-  - 345-frame T2V and I2V take 91–102 s per job and peak at 122.9 GiB.
+  - At 1344×768, generation (`pipeline_s`) takes 88–91 s for 345-frame T2V and 93–99 s for
+    I2V. MP4 writing adds 1–4 s. Memory peaks at 122.9 GiB.
+  - Every pixel-relevant setting matches songyang's workers (`settings-comparison.md` there).
   - Stored test requests of songyang's SMD-E service on 035/067 decode to the same frames and audio up to video
     encoding (`parity-compare*.jsonl`, `README.md` there).
 - **Disk.** Worker outputs were cleaned the same day (`deployment/worker-output-cleanup-20261121/`), leaving about
