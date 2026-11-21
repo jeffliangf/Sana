@@ -14,15 +14,25 @@
 # CUDA numbers GPUs from 0 and skips one it cannot initialize (0023 since its GPU 3 fault), shifting every GPU after
 # it, so a real start passes the pair's UUIDs (nvidia-smi indices do not shift). H3_RENDER_ONLY=1 prints the
 # environment (with CUDA ordinals), CPU list and arguments instead of starting anything.
+# Optional <adapter-profile> after those: the worker's profile from the registry (adapter_profiles.json); without it
+# the worker restarts with fasth3-dense-datafree, the only profile before profiles existed and the T2V default.
+# Optional <gate-failure dense|off> after the profile: the allocation's numerical-gate setting (H3_GATE_FAILURE);
+# without it the worker restarts with the dense-fallback gate, the only setting before it existed.
 set -euo pipefail
 umask 077
-node=${1:-} port=${2:-} mode=${3:-} code=${4:-}
+node=${1:-} port=${2:-} mode=${3:-} code=${4:-} profile=${5:-} gate=${6:-}
 [[ "$node" =~ ^0(02|03|05|06|23|35|48|67)$ && "$port" =~ ^1808[0-3]$ ]] \
-  || { echo "usage: run-worker.sh <node> <port> [<async-publication 0|1> <code-dir>]" >&2; exit 2; }
-if [[ -n "$mode$code" ]]; then
+  || { echo "usage: run-worker.sh <node> <port> [<async-publication 0|1> <code-dir> [<adapter-profile> [<gate-failure>]]]" >&2; exit 2; }
+if [[ -n "$mode$code$profile$gate" ]]; then
   [[ "$mode" =~ ^[01]$ && "$code" =~ ^/home/jeff/sol-h3-h200/[A-Za-z0-9._/-]+$ && "$code" != *..* ]] \
     || { echo "invalid launch settings: async publication '$mode', code directory '$code'" >&2; exit 2; }
 fi
+[[ -z "$profile" || "$profile" =~ ^[a-z0-9][a-z0-9.-]{0,63}$ ]] \
+  || { echo "invalid adapter profile '$profile'" >&2; exit 2; }
+[[ -z "$gate" || ( -n "$profile" && "$gate" =~ ^(dense|off)$ ) ]] \
+  || { echo "invalid gate setting '$gate' (dense or off, after an adapter profile)" >&2; exit 2; }
+gate=${gate:-dense}
+profile=${profile:-fasth3-dense-datafree}
 i=$((port - 18080))
 addr=10.2.201.$((10#$node)) gpus=$((2 * i)),$((2 * i + 1)) cpus=$((40 * i))-$((40 * i + 39))
 L=/var/tmp/jeff-sol-h3 host=dc02-gpu-$node.internal.bigbeargpu.cloud
@@ -51,10 +61,10 @@ envs=(HOME=/home/jeff USER=jeff LOGNAME=jeff SHELL=/bin/bash LANG=C.UTF-8 TMPDIR
   PYTORCH_ALLOC_CONF=expandable_segments:True NCCL_SOCKET_IFNAME=lo GLOO_SOCKET_IFNAME=lo NCCL_SOCKET_FAMILY=AF_INET
   TORCHINDUCTOR_CACHE_DIR=$L/sol-h3-cache/inductor TRITON_CACHE_DIR=$L/sol-h3-cache/triton
   CUDA_CACHE_PATH=$L/sol-h3-cache/cuda)
-args=(--model $C/MiniMax-H3 --adapter $C/FastH3-4-step-Preview-v1-LoRA/dense-datafree/adapter_model.safetensors
+args=(--model $C/MiniMax-H3 --adapter-profile $profile
   --output-dir $L/sol-h3-service/$port --token-file /home/jeff/sol-h3-h200/deployment/token
   --host $addr --port $port --attention-backend sol --warmup-prompt-file /home/jeff/sol-h3-h200/demo_prompt.json
-  --ready-file $R/$port.manual.ready.json --queue-capacity 8 --encoder-threads 8 --gate-failure dense
+  --ready-file $R/$port.manual.ready.json --queue-capacity 8 --encoder-threads 8 --gate-failure $gate
   --expect-gpu H200 --min-free-gib 20)
 # deploy_node.sh exports both settings to serve_node.py's workers; serve.py checks the flag against the variable.
 if [[ -n "$mode" ]]; then

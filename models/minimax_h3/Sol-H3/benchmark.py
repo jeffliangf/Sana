@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark resident four-forward T2V inference, including MP4 completion."""
+"""Benchmark resident T2V inference for one adapter profile, including MP4 completion."""
 
 from __future__ import annotations
 
@@ -21,7 +21,8 @@ ROOT = Path(__file__).resolve().parent
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--adapter", type=Path, required=True)
+    parser.add_argument("--adapter-profile", help="Adapter profile from adapter_profiles.json (default: FastH3)")
+    parser.add_argument("--adapter", type=Path, help="Adapter file (default: the profile's file next to --model)")
     parser.add_argument("--output-dir", type=Path, required=True, help="New directory; never overwritten")
     parser.add_argument("--prompt-file", type=Path, default=ROOT.parent / "demo_prompt.json")
     parser.add_argument("--durations", nargs="+", type=int, choices=(5, 10, 15), default=[5, 10])
@@ -35,6 +36,14 @@ def parse_args(argv=None):
         parser.error("--warmups and --repeats must be positive")
     if len(set(args.durations)) != len(args.durations):
         parser.error("--durations must not contain duplicates")
+    from h3_runtime.adapters import get_profile
+
+    try:
+        profile = get_profile(args.adapter_profile, task="t2v")
+    except ValueError as error:
+        parser.error(str(error))
+    args.adapter_profile = profile.name
+    args.adapter = args.adapter or profile.default_path(args.model)
     if not args.adapter.is_file():
         parser.error("--adapter must be a local adapter_model.safetensors file")
     return args
@@ -117,7 +126,10 @@ def main():
     import torch.distributed as dist
 
     from h3_runtime import MiniMaxH3Inference
-    from h3_runtime.engine import DURATION_FRAMES, INFERENCE_STEPS
+    from h3_runtime.adapters import get_profile
+    from h3_runtime.engine import DURATION_FRAMES
+
+    profile = get_profile(args.adapter_profile)
 
     if not torch.cuda.is_available():
         raise RuntimeError("A CUDA GPU is required; this benchmark cannot run on a login/CPU node")
@@ -196,10 +208,11 @@ def main():
                 "prompt": prompt, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
                 "devices": devices, "packages": versions, "cuda_version": torch.version.cuda,
                 "attention_backend": args.attention_backend, "compute_quant": "none", "lora_mode": "merged",
-                "scheduler_points": INFERENCE_STEPS, "expected_transformer_forwards": 4,
+                "adapter_profile": profile.name, "scheduler_points": profile.scheduler_points,
+                "expected_transformer_forwards": profile.transformer_forwards,
                 "warmups_per_duration": args.warmups, "repeats_per_duration": args.repeats,
                 "seed": args.seed, "durations": args.durations,
-                "timing": "Warm requests include text encoding, four DiT forwards and AV decode; request_to_mp4_s also includes MP4 writing. Model load, warmup, validation and telemetry are excluded.",
+                "timing": "Warm requests include text encoding, the profile's DiT forwards and AV decode; request_to_mp4_s also includes MP4 writing. Model load, warmup, validation and telemetry are excluded.",
                 "environment": {key: value for key, value in os.environ.items()
                                 if key.startswith(("H3_SOL_", "H3_ULYSSES_", "H3_VAE_", "SOL_ATTN_"))
                                 or key in {"PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"}},
@@ -209,7 +222,8 @@ def main():
         torch.cuda.reset_peak_memory_stats(device)
         started = time.perf_counter()
         engine = MiniMaxH3Inference(args.model, args.adapter, attention_backend=args.attention_backend,
-                                    task="t2v", compute_quant="none", lora_mode="merged")
+                                    task="t2v", compute_quant="none", lora_mode="merged",
+                                    adapter_profile=profile)
         barrier()
         initialization = gather({"rank": rank, "seconds": time.perf_counter() - started,
                                  "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
@@ -253,8 +267,9 @@ def main():
                     "sparse_calls": engine.sparse_attention.sparse_calls - sparse_before if engine.sparse_attention else 0,
                 }
                 ranks = gather(local)
-                if any(item["transformer_forwards"] != 4 for item in ranks):
-                    raise RuntimeError(f"Expected exactly four transformer forwards on each rank: {ranks}")
+                if any(item["transformer_forwards"] != profile.transformer_forwards for item in ranks):
+                    raise RuntimeError(f"Expected exactly {profile.transformer_forwards} transformer forwards "
+                                       f"on each rank: {ranks}")
                 if engine.sparse_attention and any(item["sparse_calls"] == 0 or not (item["sparse"]["gate"] or {}).get("passed") for item in ranks):
                     raise RuntimeError("Sparse attention did not execute with a passing numerical check on every rank")
                 if rank == 0:

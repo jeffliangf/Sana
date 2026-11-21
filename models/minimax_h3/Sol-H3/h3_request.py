@@ -56,9 +56,9 @@ LEGACY_BODY_BYTES = 32 * 2**10
 MAX_BODY_BYTES = 28 * 2**20
 API_VERSION = 2
 UNSUPPORTED_FIELDS = {
-    "num_inference_steps": "this deployment runs a fixed four-step FastH3 profile",
-    "flow_shift": "the video flow shift is fixed by the four-step FastH3 profile",
-    "audio_flow_shift": "the audio flow shift is fixed by the four-step FastH3 profile",
+    "num_inference_steps": "each worker runs a fixed adapter profile (see /healthz adapter)",
+    "flow_shift": "the video flow shift is fixed by the worker's adapter profile",
+    "audio_flow_shift": "the audio flow shift is fixed by the worker's adapter profile",
     "guidance_scale": "MiniMax-H3 is guidance-distilled; there is no guidance scale",
     "guidance_scale_2": "MiniMax-H3 is guidance-distilled; there is no guidance scale",
     "true_cfg_scale": "MiniMax-H3 is guidance-distilled; there is no guidance scale",

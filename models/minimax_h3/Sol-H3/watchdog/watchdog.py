@@ -33,6 +33,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import time
@@ -109,20 +110,40 @@ def unit_state(unit):
     return state
 
 
-def launch_arguments(launch):
-    """run-worker.sh's optional arguments from the registry's launch block; None if it is malformed."""
+PROFILE_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]{0,63}$")
+GATE_POLICIES = ("dense", "off")
+
+
+def launch_arguments(launch, index=0):
+    """run-worker.sh's optional arguments from the registry's launch block for the worker at ``index`` (port order);
+    None if it is malformed. Registries from before adapter profiles restart with the default (FastH3), and those
+    from before the gate setting with the dense-fallback gate."""
     if launch is None:
         return []
     if not isinstance(launch, dict) or not isinstance(launch.get("async_publication"), bool) \
             or not isinstance(launch.get("code_dir"), str):
         return None
-    return [str(int(launch["async_publication"])), launch["code_dir"]]
+    settings = [str(int(launch["async_publication"])), launch["code_dir"]]
+    if "adapter_profiles" in launch:
+        profiles = launch["adapter_profiles"]
+        if not isinstance(profiles, list) or not 0 <= index < len(profiles) \
+                or not all(isinstance(name, str) and PROFILE_NAME.match(name) for name in profiles):
+            return None
+        settings.append(profiles[index])
+    if "gate_failure" in launch:
+        # Positional after the profile, which every registry with a gate setting records.
+        if "adapter_profiles" not in launch or launch["gate_failure"] not in GATE_POLICIES:
+            return None
+        settings.append(launch["gate_failure"])
+    return settings
 
 
 def describe(settings):
     if not settings:
         return "synchronous publication, shared Sol-H3"
-    return f"{'async' if settings[0] == '1' else 'synchronous'} publication, code {settings[1]}"
+    profile = f", adapter {settings[2]}" if len(settings) > 2 else ""
+    gate = f", gate {settings[3]}" if len(settings) > 3 else ""
+    return f"{'async' if settings[0] == '1' else 'synchronous'} publication, code {settings[1]}{profile}{gate}"
 
 
 def start(node, port, job, settings=()):
@@ -170,7 +191,7 @@ def decide(node, port, url, status, state, jobs, excluded, dry_run):
         return "down; serve_node.py manages it (restart in progress)"
     if str(state.get("slurm_job_id")) != jobs[node]:
         return f"down; node registry is from job {state.get('slurm_job_id')}, not {jobs[node]}; retry next run"
-    settings = launch_arguments(state.get("launch"))
+    settings = launch_arguments(state.get("launch"), port - int(state.get("base_port", 18080)))
     if settings is None:
         return "down; node registry has invalid launch settings; check it by hand"
     unit_now = unit_state(unit)

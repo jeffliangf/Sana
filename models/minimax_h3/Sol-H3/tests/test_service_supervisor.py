@@ -5,6 +5,7 @@ import io
 import errno
 import json
 from pathlib import Path
+import shutil
 from unittest.mock import Mock
 
 import pytest
@@ -135,8 +136,11 @@ def test_shared_storage_failure_preserves_workers_and_recovers(tmp_path, monkeyp
     root, local = tmp_path / "shared", tmp_path / "local"
     (root / "deployment").mkdir(parents=True)
     (root / "deployment/token").write_text("x" * 40)
-    (root / "Sol-H3").mkdir()
+    (root / "Sol-H3/h3_runtime").mkdir(parents=True)
     (root / "Sol-H3/serve.py").write_text("")  # the supervisor checks its code directory
+    # ...and validates the workers' adapter profiles against that directory's registry.
+    for name in ("adapter_profiles.json", "h3_runtime/adapters.py"):
+        shutil.copy2(Path(__file__).resolve().parents[1] / name, root / "Sol-H3" / name)
     monkeypatch.delenv("H3_CODE_DIR", raising=False)
     monkeypatch.delenv("H3_ASYNC_PUBLICATION", raising=False)
     for key, value in {"H3_DEPLOY_ROOT": str(root), "H3_LOCAL_ROOT": str(local),

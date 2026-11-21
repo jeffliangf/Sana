@@ -488,11 +488,13 @@ class JobExecutor:
     """
 
     def __init__(self, *, rank, runtime, broadcast, gather, barrier, encoder_threads, inspect_media,
-                 state=None, publisher=None):
+                 state=None, publisher=None, transformer_forwards=4):
         self.rank, self.runtime = rank, runtime
         self.broadcast, self.gather, self.barrier = broadcast, gather, barrier
         self.encoder_threads, self.inspect_media = encoder_threads, inspect_media
         self.state, self.publisher = state, publisher
+        # The worker's adapter profile fixes this count (adapter_profiles.json); any other count is a fault.
+        self.transformer_forwards = transformer_forwards
 
     def _generate(self, job):
         self.runtime.begin()
@@ -500,15 +502,14 @@ class JobExecutor:
         timing = {"generation_started_at": time.time()}
         media = self.runtime.generate(job)
         forwards = self.runtime.forwards()
-        if forwards != 4:
-            raise RuntimeError(f"Expected four transformer forwards, got {forwards}")
+        if forwards != self.transformer_forwards:
+            raise RuntimeError(f"Expected {self.transformer_forwards} transformer forwards, got {forwards}")
         timing["generation_finished_at"] = time.time()
         timing["pipeline_s"] = media.elapsed_s if media is not None else None
         return media, started, timing
 
-    @staticmethod
-    def _summary(ranks):
-        return {"transformer_forwards": 4, "memory": [item["memory"] for item in ranks],
+    def _summary(self, ranks):
+        return {"transformer_forwards": self.transformer_forwards, "memory": [item["memory"] for item in ranks],
                 "attention": [item["attention"] for item in ranks],
                 "used_gate_fallback": any(item["attention"] and item["attention"]["gate_fallback_calls"]
                                           for item in ranks)}
@@ -677,14 +678,19 @@ def create_app(state, token):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--adapter", type=Path, required=True)
+    parser.add_argument("--adapter-profile",
+                        help="Adapter profile from adapter_profiles.json: the LoRA plus its forward count, flow shifts "
+                             "and strength (default: the T2V/I2V default, FastH3)")
+    parser.add_argument("--adapter", type=Path,
+                        help="Adapter file (default: the profile's file below the directory that holds --model)")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--token-file", type=Path, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--attention-backend", choices=("sol", "sol_bsa", "dense"), default="sol")
-    parser.add_argument("--gate-failure", choices=("error", "dense"), default="dense",
-                        help="Use dense SDPA for shapes rejected by the numerical gate (service default)")
+    parser.add_argument("--gate-failure", choices=("error", "dense", "off"), default="dense",
+                        help="Use dense SDPA for shapes rejected by the numerical gate (service default); 'off' "
+                             "runs no gate and always uses Sol attention, as songyang's SMD-E service does")
     parser.add_argument("--queue-capacity", type=int, default=8)
     parser.add_argument("--encoder-threads", type=int, default=8)
     parser.add_argument("--min-free-gib", type=int, default=20)
@@ -710,6 +716,13 @@ def parse_args(argv=None):
     if setting and (setting == "1") != args.async_publication:
         parser.error(f"--async-publication {'is missing' if setting == '1' else 'is set'} "
                      f"but H3_ASYNC_PUBLICATION={setting}")
+    from h3_runtime.adapters import get_profile
+
+    try:
+        # Resolve before loading anything: an unknown or Ref2VA-only profile is a launch error.
+        args.adapter_profile = get_profile(args.adapter_profile, task="t2v").name
+    except ValueError as error:
+        parser.error(str(error))
     return args
 
 
@@ -727,6 +740,9 @@ def main():
     import uvicorn
     from benchmark import inspect_media, read_prompt
     from h3_runtime import MiniMaxH3Inference
+    from h3_runtime.adapters import get_profile
+
+    profile = get_profile(args.adapter_profile)
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -747,11 +763,13 @@ def main():
     if weight_sharding not in {"0", "1"}:
         raise ValueError("H3_WEIGHT_SHARDING must be '0' or '1'")
     weight_sharding = weight_sharding == "1"
+    gate = args.attention_backend != "dense" and args.gate_failure != "off"
     if args.attention_backend != "dense":
         os.environ["SOL_ATTN_STRICT"] = "1"
-        os.environ["SOL_ATTN_CORRECTNESS_GATE"] = "1"
-        os.environ["SOL_ATTN_GATE_FAILURE"] = args.gate_failure
-        os.environ["SOL_ATTN_GATE_EACH_REQUEST"] = "1"
+        os.environ["SOL_ATTN_CORRECTNESS_GATE"] = "1" if gate else "0"
+        if gate:
+            os.environ["SOL_ATTN_GATE_FAILURE"] = args.gate_failure
+            os.environ["SOL_ATTN_GATE_EACH_REQUEST"] = "1"
         if os.environ.get("H3_SOL_BACKEND", args.attention_backend) != args.attention_backend:
             raise ValueError("H3_SOL_BACKEND conflicts with selected backend")
     if world_size > 1:
@@ -770,9 +788,11 @@ def main():
             state = WorkerState(args.output_dir, capacity=args.queue_capacity, min_free_gib=args.min_free_gib,
                                 metadata={"hostname": socket.gethostname(), "gpus": world_size,
                                           "gpu": torch.cuda.get_device_name(device), "attention": args.attention_backend,
-                                          "gate_failure_policy": args.gate_failure, "gate_each_request": True,
+                                          "gate_failure_policy": args.gate_failure, "gate_each_request": gate,
                                           "duration_seconds": [5, 10], "width": 1344, "height": 768,
-                                          "fps": 24, "transformer_forwards": 4,
+                                          "fps": 24, "transformer_forwards": profile.transformer_forwards,
+                                          # Replaced by the loaded file's details once the engine exists.
+                                          "adapter": {"profile": profile.name},
                                           "encoder_threads": args.encoder_threads,
                                           "weight_sharding": weight_sharding,
                                           "publication_mode": "async" if args.async_publication else "sync",
@@ -793,7 +813,10 @@ def main():
 
         engine = MiniMaxH3Inference(args.model, args.adapter, attention_backend=args.attention_backend,
                                     task="t2v", compute_quant="none", lora_mode="merged",
-                                    weight_sharding=weight_sharding)
+                                    weight_sharding=weight_sharding, adapter_profile=args.adapter_profile)
+        if rank == 0:
+            with state.lock:
+                state.metadata.update(transformer_forwards=engine.transformer_forwards, adapter=engine.adapter)
 
         def count_forward(*unused):
             forwards[0] += 1
@@ -854,7 +877,7 @@ def main():
                                                                   host_memory=host_memory),
                                broadcast=broadcast, gather=gather, barrier=barrier,
                                encoder_threads=args.encoder_threads, inspect_media=inspect_media,
-                               state=state, publisher=publisher)
+                               state=state, publisher=publisher, transformer_forwards=engine.transformer_forwards)
 
         prompt = read_prompt(args.warmup_prompt_file)
         warmups = []

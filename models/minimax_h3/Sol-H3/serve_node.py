@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 from contextlib import suppress
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -142,15 +144,47 @@ def launch_settings(environ, root):
     return {"code_dir": str(code_dir), "async_publication": async_publication == "1"}
 
 
-def serve_arguments(*, environ, root, local, checkpoints, token_file, address, port, ready_file, gpu_type):
-    """serve.py's arguments for one worker. watchdog/run-worker.sh must render the same (tests/test_launch.py)."""
-    arguments = ["--model", str(checkpoints / "MiniMax-H3"),
-                 "--adapter", str(checkpoints / "FastH3-4-step-Preview-v1-LoRA/dense-datafree/adapter_model.safetensors"),
+def adapter_profiles(environ, code_dir, workers):
+    """One adapter profile per worker from H3_ADAPTER_PROFILE: one name for every worker, or a comma-separated list
+    with one name per worker (in port order). Unset means the code directory's T2V default (FastH3). Names are
+    checked against that directory's adapter_profiles.json, without importing the model runtime."""
+    path = Path(code_dir) / "h3_runtime/adapters.py"
+    name = f"h3_adapter_profiles_{hashlib.sha256(str(path).encode()).hexdigest()[:16]}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    adapters = importlib.util.module_from_spec(spec)
+    sys.modules[name] = adapters  # dataclasses resolve their annotations through sys.modules
+    spec.loader.exec_module(adapters)
+    setting = environ.get("H3_ADAPTER_PROFILE", "").strip()
+    names = [name.strip() for name in setting.split(",")] if setting else [None]
+    if len(names) == 1:
+        names *= workers
+    if len(names) != workers:
+        raise ValueError(f"H3_ADAPTER_PROFILE lists {len(names)} profiles for {workers} workers")
+    return [adapters.get_profile(name, task="t2v").name for name in names]
+
+
+GATE_POLICIES = ("dense", "off")
+
+
+def gate_failure_policy(environ):
+    """H3_GATE_FAILURE for every worker: 'dense' (default) runs the numerical gate and uses dense attention for the
+    shapes it rejects; 'off' runs no gate, so every shape uses Sol attention (songyang's SMD-E service)."""
+    value = environ.get("H3_GATE_FAILURE", "").strip() or "dense"
+    if value not in GATE_POLICIES:
+        raise ValueError(f"H3_GATE_FAILURE must be one of {GATE_POLICIES}, got {value!r}")
+    return value
+
+
+def serve_arguments(*, environ, root, local, checkpoints, token_file, address, port, ready_file, gpu_type,
+                    adapter_profile, gate_failure="dense"):
+    """serve.py's arguments for one worker. watchdog/run-worker.sh must render the same (tests/test_launch.py).
+    serve.py finds the profile's adapter file below ``checkpoints``, next to MiniMax-H3."""
+    arguments = ["--model", str(checkpoints / "MiniMax-H3"), "--adapter-profile", adapter_profile,
                  "--output-dir", str(local / f"sol-h3-service/{port}"), "--token-file", str(token_file),
                  "--host", address, "--port", str(port),
                  "--attention-backend", environ.get("H3_ATTENTION_BACKEND", "sol"),
                  "--warmup-prompt-file", str(root / "demo_prompt.json"), "--ready-file", str(ready_file),
-                 "--queue-capacity", "8", "--encoder-threads", "8", "--gate-failure", "dense",
+                 "--queue-capacity", "8", "--encoder-threads", "8", "--gate-failure", gate_failure,
                  "--expect-gpu", gpu_type, "--min-free-gib", environ.get("H3_MIN_FREE_GIB", "20")]
     if environ.get("H3_ASYNC_PUBLICATION") == "1":
         arguments.append("--async-publication")
@@ -186,6 +220,9 @@ def main():
     group_size = int(os.environ.get("H3_GPUS_PER_WORKER", "4" if gpu_type == "H100" else "2"))
     groups = gpu_layout(devices, gpu_type, group_size)
     workers = len(groups)
+    # Recorded with the other launch settings so the watchdog restarts each worker with its own profile and gate.
+    launch["adapter_profiles"] = profiles = adapter_profiles(os.environ, launch["code_dir"], workers)
+    launch["gate_failure"] = gate_failure = gate_failure_policy(os.environ)
     base_port = int(os.environ.get("H3_BASE_PORT", "18080"))
     registry, ports = allocation_layout(root, hostname, workers, base_port)
     registry.mkdir(parents=True, exist_ok=True)
@@ -231,13 +268,16 @@ def main():
             ready_file.unlink(missing_ok=True)
         log_path = runtime / f"{job_id}-{port}-attempt{attempt}.log"
         log = log_path.open("a")
-        env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(visible[index])}
+        # The supervisor consumes H3_ADAPTER_PROFILE and H3_GATE_FAILURE; each worker gets them as arguments.
+        env = {key: value for key, value in os.environ.items() if key not in {"H3_ADAPTER_PROFILE", "H3_GATE_FAILURE"}}
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(visible[index])
         checkpoints = Path(os.environ.get("H3_CHECKPOINT_ROOT", str(local / "sol-h3-checkpoints")))
         command = ["taskset", "--cpu-list", ",".join(map(str, assigned_cpus)),
                    str(Path(sys.executable).with_name("torchrun")), "--standalone", "--nnodes=1", f"--nproc_per_node={group_size}",
                    "serve.py", *serve_arguments(environ=os.environ, root=root, local=local, checkpoints=checkpoints,
                                                 token_file=token_file, address=address, port=port,
-                                                ready_file=ready_file, gpu_type=gpu_type)]
+                                                ready_file=ready_file, gpu_type=gpu_type,
+                                                adapter_profile=profiles[index], gate_failure=gate_failure)]
         try:
             # Every start, including crash restarts, runs the allocation's own code directory.
             process = subprocess.Popen(command, cwd=launch["code_dir"], env=env, stdout=log, stderr=subprocess.STDOUT,
@@ -245,9 +285,10 @@ def main():
         finally:
             log.close()
         quiet_print(f"START worker={index} port={port} GPUs={group} pid={process.pid} attempt={attempt} "
-                    f"failures_in_a_row={failures}")
+                    f"failures_in_a_row={failures} adapter_profile={profiles[index]}")
         return {"process": process, "attempt": attempt, "failures": failures, "started": time.monotonic(),
                 "index": index, "port": port, "gpus": group, "endpoint": f"http://{address}:{port}",
+                "adapter_profile": profiles[index],
                 "log": str(log_path), "ready_seen": False, "ready_at": None}
 
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))

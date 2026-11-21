@@ -13,7 +13,9 @@ from h3_runtime import MiniMaxH3Inference
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, help="MiniMax-H3 checkpoint directory or repo ID")
-    parser.add_argument("--adapter", required=True, help="FastH3 dense-datafree adapter file")
+    parser.add_argument("--adapter-profile",
+                        help="Adapter profile from adapter_profiles.json (default: the task's default)")
+    parser.add_argument("--adapter", help="Adapter file (default: the profile's file next to --model)")
     parser.add_argument(
         "--attention-backend",
         choices=("dense", "sol", "sol_bsa"),
@@ -106,6 +108,7 @@ def main() -> int:
         reference_image_resize_mode=args.reference_image_resize_mode,
         compute_quant=args.compute_quant,
         lora_mode=args.lora_mode,
+        adapter_profile=args.adapter_profile,
     ) as engine:
         if args.warmup:
             engine.warmup(
@@ -133,6 +136,7 @@ def main() -> int:
                         "attention_backend": args.attention_backend,
                         "compute_quant": args.compute_quant,
                         "lora_mode": args.lora_mode,
+                        "adapter": engine.adapter,
                         "reference_image_resize_mode": (
                             args.reference_image_resize_mode if args.task == "ref2va" else None
                         ),

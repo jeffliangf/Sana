@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import time
@@ -13,13 +14,16 @@ import torch
 import torch.distributed as dist
 from PIL import Image, ImageOps
 
+from .adapters import AdapterProfile, get_profile, install_explicit_schedule, verify_file
 from .compute_quant import COMPUTE_QUANT_MODES
 
 
 WIDTH = 1344
 HEIGHT = 768
 FPS = 24
-INFERENCE_STEPS = 5  # Five scheduler points execute four DiT forwards.
+# The default (FastH3) profile's five scheduler points execute four DiT forwards. A worker's real count comes
+# from its adapter profile (adapter_profiles.json): ``MiniMaxH3Inference.transformer_forwards``.
+INFERENCE_STEPS = 5
 DURATION_FRAMES = {5: 124, 10: 243, 15: 362}
 # Every 17n+5 length the video VAE decodes between the 5- and 15-second presets.
 VALID_NUM_FRAMES = frozenset(range(DURATION_FRAMES[5], DURATION_FRAMES[15] + 1, 17))
@@ -120,14 +124,18 @@ class MiniMaxH3Inference:
     def __init__(
         self,
         model_path: str,
-        adapter_path: str | Path,
+        adapter_path: str | Path | None = None,
         attention_backend: str = "sol_bsa",
         task: str = "t2v",
         reference_image_resize_mode: str = "match",
         compute_quant: str = "none",
         lora_mode: str = "merged",
         weight_sharding: bool = False,
+        adapter_profile: str | AdapterProfile | None = None,
     ) -> None:
+        """``adapter_profile`` (a name in adapter_profiles.json, default: the task's) fixes the adapter's
+        forward count, flow shifts, strength, and alpha policy. ``adapter_path`` defaults to the profile's
+        file below the directory that holds ``model_path``."""
         lora_mode = lora_mode.lower()
         if lora_mode not in {"merged", "separate", "fused"}:
             raise ValueError("lora_mode must be merged, separate, or fused")
@@ -185,6 +193,12 @@ class MiniMaxH3Inference:
         self.attention_backend = attention_backend
         self.reference_image_resize_mode = reference_image_resize_mode
         self.compute_quant = compute_quant
+        self.adapter_profile = get_profile(adapter_profile, task=task)
+        self.transformer_forwards = self.adapter_profile.transformer_forwards
+        self.inference_steps = self.adapter_profile.scheduler_points
+        adapter_path = Path(adapter_path) if adapter_path else self.adapter_profile.default_path(model_path)
+        # Before any weights load: a wrong or partial file fails fast, and /healthz can report the digest.
+        adapter_sha256 = verify_file(self.adapter_profile, adapter_path)
 
         from diffusers import ComponentsManager, ModularPipeline
 
@@ -243,18 +257,34 @@ class MiniMaxH3Inference:
                     component.to(self.device)
         else:
             self.pipe.to(self.device)
-        self.pipe.scheduler.set_shift(12.0)
-        self.pipe.audio_scheduler.set_shift(3.0)
+        profile = self.adapter_profile
+        self.pipe.scheduler.set_shift(profile.video_shift)
+        self.pipe.audio_scheduler.set_shift(profile.audio_shift)
+        # A shorter last step (SMD: final_step_size_scale 0.5) needs an explicit grid. The pipeline then gets it
+        # whatever step count it asks for, and the AdaLN precompute caches it on the first request.
+        for scheduler, shift in ((self.pipe.scheduler, profile.video_shift),
+                                 (self.pipe.audio_scheduler, profile.audio_shift)):
+            sigmas = profile.sigmas(shift)
+            if sigmas is not None:
+                install_explicit_schedule(scheduler, sigmas)
 
         from .lora import fuse_lora, load_lora_branches
 
         load_adapter = fuse_lora if lora_mode == "merged" else load_lora_branches
-        load_adapter(
+        report = load_adapter(
             self.transformer,
             adapter_path,
-            alpha=8 if task == "ref2va" else 64,
-            scale=1.0,
+            alpha=profile.alpha,
+            scale=profile.strength,
         )
+        report = report.summary() if hasattr(report, "summary") else dict(report)
+        # What /healthz reports as "adapter": the profile, the exact file, and how its update was scaled.
+        self.adapter = {**profile.summary(), "file": str(adapter_path), "sha256": adapter_sha256,
+                        "lora_mode": lora_mode, "load": report}
+        if self.rank == 0:
+            print(f"[h3.adapter] {profile.name}: {profile.transformer_forwards} forwards, shifts "
+                  f"{profile.video_shift:g}/{profile.audio_shift:g}, final step x{profile.final_step_size_scale:g}, "
+                  f"{json.dumps(report)}", flush=True)
 
         if self.world_size > 1:
             from diffusers.models._modeling_parallel import ContextParallelConfig
@@ -421,7 +451,7 @@ class MiniMaxH3Inference:
             "height": height,
             "width": width,
             "num_frames": num_frames,
-            "num_inference_steps": INFERENCE_STEPS,
+            "num_inference_steps": self.inference_steps,
             "generator": torch.Generator().manual_seed(int(seed)),
             "output_type": "pt",
         }
