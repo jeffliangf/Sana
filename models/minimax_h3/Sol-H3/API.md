@@ -1,7 +1,8 @@
 # Sol-H3 video API
 
 Text-to-video and first-frame image-to-video, with synchronized audio, from
-MiniMax H3-Base FL2VA with the four-step FastH3 adapter. Callers submit a
+MiniMax H3-Base FL2VA with the eight-step SMD-H3 E adapter (the four-step FastH3
+adapter until 2026-11-21; see the [changelog](#changelog)). Callers submit a
 request, poll a job, and download an MP4 from one stable gateway. Requests use
 the original `{prompt, duration, seed}` form or the
 [SGLang MiniMax-H3 form](#sglang-form) (`task`, `conditions`, `target`). This
@@ -147,10 +148,11 @@ image of a different shape.
 Other values round up to the next valid count; 8.5 s gives 209 frames (8.708 s).
 Requests from about 4.48 s to 14.39 s are accepted. Shorter or longer ones get a 422.
 
-**First frame is experimental.** The FastH3 adapter was distilled for
-text-to-video only, and FastVideo did not train it with first- or last-frame
-conditioning. `fl2va` runs MiniMax-H3's native first-frame path through that
-adapter, so check the results for your use case.
+**First frame is experimental.** SMD-H3 E was post-trained for text-to-video only.
+`fl2va` runs MiniMax-H3's native first-frame path through it, as songyang's SMD-E service
+does, so check the results for your use case.
+- E's published setting is 1344×768.
+- Other aspect ratios run the same model and path, but their quality has not been measured.
 
 Examples:
 
@@ -411,25 +413,27 @@ submit through download. Batch callers can raise that toward two per worker whil
 latency and 429s stay low. Tell the owner before a batch of hundreds: each worker
 queues only 8 jobs, so this is not a durable batch queue.
 
-| Clip | Text-to-video, warm | First frame, warm | Dense fallback, warm | First request of a new length | MP4 size |
-|---|---|---|---|---|---|
-| 124 frames, 5.2 s | 13.5 s | 15.2 s | 17–19 s | 26–28 s | about 1–4 MB |
-| 243 frames, 10.1 s | 32 s | 34 s | 46–48 s | 42–53 s | about 1–7 MB |
-| 345 frames, 14.4 s | 52 s | 56 s | 79–82 s | 65–90 s | about 2–13 MB |
+| Clip | Text-to-video, warm | First frame, warm | First request of a new length | MP4 size |
+|---|---|---|---|---|
+| 124 frames, 5.2 s | 22 s | 24 s | 30 s | about 1–4 MB |
+| 243 frames, 10.1 s | 50–51 s | 56–58 s | 56–64 s | about 1–7 MB |
+| 345 frames, 14.4 s | 94 s | 101–102 s | 91–102 s | about 2–13 MB |
 
-These are worker times per video on a two-GPU H200 worker, measured on 2026-11-05
-at 1344×768 with prompts of about 2,000 characters. Other aspect ratios have the
-same or fewer tokens per frame. Queueing and download are not included.
+These are generation times per video on a two-GPU H200 worker, measured on 2026-11-21
+with SMD-H3 E at 1344×768 and prompts of about 2,000–5,000 characters.
+- Writing the MP4 takes about 4 s more; it overlaps the worker's next generation.
+- Other aspect ratios have the same or fewer tokens per frame.
+- Queueing and download are not included.
+- songyang's SMD-E service takes about the same time on the same requests.
 
-- **Dense fallback.** When the sparse attention's numerical check rejects a
-  prompt length, that length runs dense on that worker from then on. This
-  happened to 6–25% of 5- and 10-second requests and to about half of
-  14-second ones in the measurement. It happens more often with very long
-  prompts: 14.4-second clips with 8,000-character prompts took 82–99 s, and with
-  15,000–16,000-character prompts 102–116 s.
+- **No dense fallback.** Since 2026-11-21 the workers run without the sparse
+  attention's numerical check (`gate_failure_policy: off` in a worker's
+  `/healthz`), so no prompt length switches to dense attention.
 - **New lengths.** A worker's first request with a new combination of prompt
   length, canvas, and frame count compiles kernels once. That is the "first
-  request of a new length" column.
+  request of a new length" column: about 6 s extra at 5 and 10 seconds.
+- **Long prompts.** Very long prompts add text tokens to every step. Expect 14.4-second clips with
+  15,000–16,000-character prompts to take noticeably longer than the table.
 - **Capacity.** Longer clips occupy a worker for longer: one 14.4-second clip
   costs about four 5-second clips. Plan concurrency in worker time, not job
   count. A
@@ -457,6 +461,7 @@ the token, large batches, and incidents, contact the deployment owner, Jeff.
 
 | Date | Change |
 |---|---|
+| 2026-11-21 | The model behind the same URL is SMD-H3 E (eight steps) instead of FastH3 (four steps), with the same settings as songyang's SMD-E service. The same request and seed now give a different video than before. Generation takes about 1.6 times as long ([Capacity and latency](#capacity-and-latency)). Requests, responses, job fields, `/healthz`, and limits are unchanged |
 | 2026-11-09 | Additive job fields: `stage` while running, and timing diagnostics. Workers publish a video while generating the next. Status values, existing fields, and their meaning, including `processing_s`, are unchanged |
 | 2026-11-05 | The SGLang MiniMax-H3 request form: `t2va` and first-frame `fl2va` with base64 images, six aspect ratios or the image's own, 124–345 frames; `/v1/videos/{id}` and `/v1/videos/{id}/content`; `task`, `target`, `conditions`, and `output` on jobs; `api` in `/healthz`; 28 MiB request limit. The original form is unchanged |
 | 2026-10-28 | Optional `Idempotency-Key` (the job ID); `error_code` on failed jobs, including `worker_lost`; `video_sha256` and `video_bytes` on succeeded jobs; `idempotency_key` in `/healthz` |

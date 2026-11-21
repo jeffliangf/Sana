@@ -1,27 +1,40 @@
 # H3 service design and redeployment runbook
 
-This is the operating contract for Jeff's self-hosted **H3-Base FL2VA + four-step
-FastH3 adapter** service. It covers `serve.py`, `serve_node.py`, `gateway.py`, and
+This is the operating contract for Jeff's self-hosted **H3-Base FL2VA + few-step
+adapter** service: SMD-H3 E since 2026-11-21, the four-step FastH3 adapter before
+([adapter profiles](README.md#adapter-profiles)). It covers `serve.py`, `serve_node.py`, `gateway.py`, and
 the launchers in this directory. It does not use the separate SGLang deployment
 instructions at the repository root.
 
-**State on 2026-11-18 (H200).** 20 two-GPU H200 workers serve both request forms
-through the gateway with [overlapped output publication](#overlapped-output-publication)
-(`H3_ASYNC_PUBLICATION=1`) and accept prompts of up to 16,000 characters.
-- Five allocations hold all eight GPUs on
-  `dc02-gpu-{002,003,005,006,023}.internal.bigbeargpu.cloud` (Slurm 53, 54, 55,
-  52, 56), four workers each on ports 18080–18083.
+**State on 2026-11-21 (H200).** 20 two-GPU H200 workers serve **SMD-H3 E** through the
+unchanged gateway, in both request forms, with
+[overlapped output publication](#overlapped-output-publication) (`H3_ASYNC_PUBLICATION=1`).
+They accept prompts of up to 16,000 characters.
+- **Allocations.** Five allocations hold all eight GPUs on
+  `dc02-gpu-{002,003,005,006,023}.internal.bigbeargpu.cloud` (Slurm 102, 103, 104,
+  101, 105), four workers each on ports 18080–18083.
   - They run the read-only release
-    `/home/jeff/sol-h3-h200/releases/20261118-prompt-16k-f2ff5008346a/Sol-H3`;
-    each `/healthz` reports its `release.source_sha256`.
-  - `deployment/jobs.json` records them. Evidence is in
-    `deployment/prompt-16k-20261118/`.
-- Validated on 2026-11-18 with 96 direct jobs that covered every worker and 24 jobs
-  through the gateway URL. 16,000-character English and Chinese prompts (up to 12,375
-  Qwen tokens) at 345 frames on the widest canvas peaked at 129.7 GiB allocated, under
-  the 132.8 GiB cap, and produced coherent video. The overlap check and encoder
-  equivalence test of 2026-11-09 still apply; that code is unchanged. For the measured
-  speed, see [Roll out overlapped publication](#roll-out-overlapped-publication).
+    `/home/jeff/sol-h3-h200/releases/20261121-smd-e-11eeb3f94d12/Sol-H3` with
+    `H3_ADAPTER_PROFILE=smd-e-8step` and `H3_GATE_FAILURE=off`.
+  - Each `/healthz` reports its `release.source_sha256`, its `adapter` and
+    `gate_failure_policy: off`.
+  - `deployment/jobs.json` records them. Evidence is in `deployment/smd-e-20261121/`.
+  - Its `launch.sh` copies the E LoRA from `deployment/staging/sol-h3-checkpoints/SMD-E/` next to MiniMax-H3
+    on each node.
+- **Validation on 2026-11-21.**
+  - 80 direct jobs covering every worker and 20 through the gateway URL.
+  - The H3 preflight of the RL run `grpo-mixed-hydrogen-group8-16h100-20261118-toolc-16k`
+    (`check_unified_api`, `require_h3_pool` with 20 workers) passes on the live `/healthz`.
+  - 345-frame T2V and I2V take 91–102 s per job and peak at 122.9 GiB.
+  - Stored test requests of songyang's SMD-E service on 035/067 decode to the same frames and audio up to video
+    encoding (`parity-compare*.jsonl`, `README.md` there).
+- **Disk.** Worker outputs were cleaned the same day (`deployment/worker-output-cleanup-20261121/`), leaving about
+  115 GB free per node. `/var/tmp/jeff-h3-base-fl2va` (another project) holds 145 GB on each node.
+- **Fleet freeze.** The RL run launched on this fleet relies on the profile, gate and worker count. Do not change
+  them while it runs without telling its operators.
+- **The 2026-11-18 FastH3 fleet.** Release `20261118-prompt-16k-f2ff5008346a`, Slurm 52–56, was stopped on
+  2026-11-20 (`deployment/stop-20-workers-20261120T211328Z/`). Its 16,000-character memory test still bounds the
+  worst case: 129.7 GiB allocated at 345 frames on the widest canvas, under the 132.8 GiB cap.
 - **Slurm can lose an allocation.** Requeues on 2026-11-13/14 marked the previous jobs
   (25–29, 37) FAILED while their original steps kept serving, so Slurm showed the
   nodes idle. If workers answer but `squeue` lists no `h3-api-*` job, `scancel`
@@ -38,7 +51,7 @@ through the gateway with [overlapped output publication](#overlapped-output-publ
   default.
 - The gateway host is `VM-187-Konsttech`, and user lingering is enabled. The hourly
   watchdog runs the release's watchdog files and restarts each worker with its
-  allocation's release and publication mode.
+  allocation's release, publication mode, adapter profile and gate setting.
 - Since the cluster rebuild, `/raid` is root-owned. The fleet uses
   `/var/tmp/jeff-sol-h3` on each node. Its `launch.sh` sets `H3_BIND_HOST` to the
   node's `10.2.201.*` address, because the full hostname resolves to a USB
@@ -492,8 +505,12 @@ code and units; the live copy is in `deployment/watchdog/`.
   released 035.
 - Restarted workers: `run-worker.sh` starts a worker with the same environment and
   arguments as `serve_node.py`, including `H3_SERVING_MEMORY_FRACTION=0.95`. It also
-  takes the allocation's launch settings (publication mode and code directory),
-  which `watchdog.py` reads from the node registry's `launch` block. The watchdog
+  takes the allocation's launch settings, which `watchdog.py` reads from the node registry's `launch` block:
+  - the publication mode and code directory;
+  - since 2026-11-21, the worker's adapter profile and the gate setting (arguments 5 and 6).
+
+  Install the watchdog files of the release the fleet runs. With older files, a restart would come back with
+  the default FastH3 profile and the gate on, a silently mixed fleet. The watchdog
   restarts a worker only when that registry belongs to the node's running job.
   Allocations started before these settings existed restart as before:
   synchronous, from the shared `Sol-H3/`. After changing either file, compare them
@@ -541,6 +558,8 @@ The following defaults are implemented; they do not select available nodes:
 | `H3_ATTENTION_BACKEND` | `sol`. `dense` runs dense attention only; used to measure the gate-fallback path's memory |
 | `H3_ASYNC_PUBLICATION` | `0`: publish each MP4 before the next generation. `1`: publish in the background while the next video generates, one publication at a time ([Overlapped output publication](#overlapped-output-publication)). Recorded in the registry and reused by watchdog restarts |
 | `H3_CODE_DIR` | `$H3_DEPLOY_ROOT/Sol-H3`. The service code this allocation runs; point it at an immutable release directory so later changes cannot reach running workers. Recorded in the registry and reused by watchdog restarts |
+| `H3_ADAPTER_PROFILE` | The code directory's T2V default (`fasth3-dense-datafree`). One profile name from `adapter_profiles.json` for every worker, or a comma-separated list with one per worker in port order ([adapter profiles](README.md#adapter-profiles)). The adapter file must sit at the profile's `file` below `H3_CHECKPOINT_ROOT`. Recorded in the registry and reused by watchdog restarts. The SMD-E fleet uses `smd-e-8step` |
+| `H3_GATE_FAILURE` | `dense`: run the numerical gate and use dense attention for the shapes it rejects. `off`: no gate, Sol attention for every shape (songyang's SMD-E service; the SMD-E fleet since 2026-11-21). Recorded in the registry and reused by watchdog restarts |
 
 An eight-GPU H200 allocation gives four workers; eight H100 GPUs give two
 four-GPU workers. They can coexist behind the same gateway. CPU affinities are
@@ -560,8 +579,9 @@ block shards. Measured on 2026-11-06:
   T2V and I2V requests.
 
 Two-GPU H100 workers would not fit 345-frame requests even with sharding, so keep
-four GPUs per worker on H100. Keep the four-step adapter, numerical gate, and dense
-fallback; do not relax tolerances to make a deployment pass.
+four GPUs per worker on H100. Do not relax tolerances, or turn the gate off, to make a
+failing deployment pass. `H3_GATE_FAILURE=off` is a fleet decision: the SMD-E fleet matches
+songyang's service that way. It is not a repair.
 
 The historical H200 environment tar contains absolute interpreter/shebang paths
 for `/raid/jeff/sol-h3-venv` and shared Python. It is not a portable environment for

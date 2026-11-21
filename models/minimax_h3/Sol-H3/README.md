@@ -26,7 +26,8 @@ To retain separate LoRA branch arithmetic, use `--lora-mode separate`, or
 - **Operating it:** the [deployment design and runbook](DEPLOYMENT.md) covers the
   gateway, workers, storage, the serving memory cap, scaling, validation, and drain.
 
-The model is **H3-Base FL2VA plus the four-step FastH3 adapter**. A stable CPU
+The model is **H3-Base FL2VA plus the eight-step SMD-H3 E adapter** since 2026-11-21
+(the four-step FastH3 adapter before; see [Adapter profiles](#adapter-profiles)). A stable CPU
 gateway routes requests to two-GPU H200 workers. Each worker generates one video
 at a time and queues up to eight more. Workers serve text-to-video and first-frame
 image-to-video with stereo audio at 24 fps, in either request form:
@@ -34,19 +35,29 @@ image-to-video with stereo audio at 24 fps, in either request form:
 - The SGLang MiniMax-H3 form: `t2va` or `fl2va`, six aspect ratios or the first
   frame's own, 124–345 frames.
 
-**State on 2026-11-18.** 20 two-GPU H200 workers run on five nodes:
-`dc02-gpu-{002,003,005,006,023}.internal.bigbeargpu.cloud`, Slurm jobs 52–56,
-four workers per node on ports 18080–18083. Node 035 (Slurm 57) was released at
-19:41 UTC (`deployment/release-035-20261118/`). All are admitted through the gateway
-with the 0.95 serving cap and overlapped MP4 publication (`H3_ASYNC_PUBLICATION=1`),
-and accept prompts of up to 16,000 characters. They run from the read-only release
-`/home/jeff/sol-h3-h200/releases/20261118-prompt-16k-f2ff5008346a/Sol-H3`.
-Direct validation passed 96 jobs, covering every worker, and gateway validation
-passed 24. Evidence is in `deployment/prompt-16k-20261118/`. Nodes 048 and 067
-run another user's jobs. The rebuilt cluster keeps
-node-local environments, weights, caches, and outputs in `/var/tmp/jeff-sol-h3`. The
-shared deployment root and the caller URL are unchanged. Check `/healthz` for live
-capacity.
+**State on 2026-11-21.** 20 two-GPU H200 workers serve **SMD-H3 E** on five nodes:
+`dc02-gpu-{002,003,005,006,023}.internal.bigbeargpu.cloud`, Slurm jobs 102, 103,
+104, 101 and 105, four workers per node on ports 18080–18083.
+- **Model settings.** Adapter profile `smd-e-8step`, with no numerical gate
+  (`H3_GATE_FAILURE=off`), as on songyang's SMD-E service on 035/067.
+- **Release.** The read-only release
+  `/home/jeff/sol-h3-h200/releases/20261121-smd-e-11eeb3f94d12/Sol-H3`.
+- **Unchanged.** The 0.95 serving cap, overlapped MP4 publication
+  (`H3_ASYNC_PUBLICATION=1`), prompts of up to 16,000 characters, the gateway, its URL
+  and both request forms.
+- **Validation.**
+  - 80 direct jobs covering every worker, and 20 through the gateway.
+  - The H3 preflight of the RL run `grpo-mixed-hydrogen-group8-16h100-20261118-toolc-16k`,
+    with that run's own code, passes against the live gateway.
+- **Same videos as songyang's service.** That service is guian's package, which runs
+  this engine at Sana `175081e` with E. For 52 of its stored T2V and I2V test requests
+  (same prompt, seed and first frame), the decoded frames and audio differ only by video
+  encoding. Details are in [Deployment history](#deployment-history).
+- **Evidence.** `deployment/smd-e-20261121/`.
+- **Other nodes.** Nodes 035, 048 and 067 run other users' jobs.
+- **Node-local files.** The rebuilt cluster keeps node-local environments, weights,
+  caches, and outputs in `/var/tmp/jeff-sol-h3`.
+- **Live capacity.** Check `/healthz`.
 
 The previous fleet, 32 workers from 2026-11-07, passed an extended validation on
 2026-11-08:
@@ -231,6 +242,17 @@ reference, CUDA error, or failed collective still terminates the worker.
 `--gate-failure error` restores the fatal gate behavior; benchmarks retain that
 strict default. No numerical tolerance was increased.
 
+`--gate-failure off` (deploy setting `H3_GATE_FAILURE=off`) runs no gate: every
+shape uses Sol attention, as songyang's SMD-E service does. The H200 SMD-E fleet
+runs this way since 2026-11-21.
+- In the 2026-11-20/21 adapter A/B, every shape the gate had rejected failed by one
+  bf16 ULP of `max_abs`.
+- In that A/B, Sol-path videos scored at least as well as dense-fallback ones.
+- At eight steps, dense fallback costs about 27% on a 10-second clip.
+
+With the gate off, `used_gate_fallback` is always false and `/healthz` reports
+`gate_failure_policy: off` and `gate_each_request: false`.
+
 Completed job JSON includes `used_gate_fallback` and per-rank `attention`
 counters (`sparse_calls`, `dense_calls`, `gate_fallback_calls`, `gate_failures`)
 plus the gate's measured errors. Dense fallback can be slower, so include those
@@ -296,6 +318,46 @@ stops when free disk space falls below 20 GiB. The HTTP endpoints are intended f
 the private cluster network or an SSH tunnel. The gateway above provides routing
 across workers; use its fixed URL in training clients.
 
+### Adapter profiles
+
+Each worker merges one few-step adapter for its lifetime, together with the sampling schedule that adapter
+was distilled for. The AdaLN precompute fixes the step schedule on the first request.
+- **Where profiles live.** `adapter_profiles.json` defines them; `h3_runtime/adapters.py` validates them.
+- **Selecting one.** Use `serve.py --adapter-profile` or the deploy setting `H3_ADAPTER_PROFILE`, which takes
+  one name, or a comma-separated list with one name per worker.
+- **What a profile fixes:**
+  - the transformer forward count;
+  - the video and audio flow shifts and the strength;
+  - optionally `final_step_size_scale`;
+  - the adapter file, by path, size and SHA-256.
+- **Before loading.** `serve.py` checks the file's size and SHA-256 before it loads any weights.
+- **Where `/healthz` reports it.** Each worker's `/healthz` reports the profile under `adapter` and its forward
+  count under `transformer_forwards`. The gateway does not aggregate them.
+
+| Profile | Adapter | Forwards | Shifts (video/audio) | Notes |
+|---|---|---|---|---|
+| `fasth3-dense-datafree` | FastVideo FastH3 4-step Preview v1 (dense, data-free) | 4 | 12/3 | T2V/I2V default |
+| `lightx2v-fl2v-4step-v1.2`, `-v1.3` | LightX2V MiniMax-H3 Turbo FL2V 4-step | 4 | 6/3 | file alpha 8 at rank 128 |
+| `lightx2v-fl2v-8step-v1.2` | LightX2V MiniMax-H3 Turbo FL2V 8-step | 8 | 12/3 | per-layer alpha tensors |
+| `lightx2v-ref2v-4step-v0.1` | LightX2V Ref2VA 4-step | 4 | 12/3 | Ref2VA default |
+| `smd-e-8step` | SMD-H3 E (`smd_h3_div16f_ck3`) | 8 | 12/3 | last step at half size (`final_step_size_scale` 0.5); production since 2026-11-21 |
+
+**LoRA alpha.** The loader never guesses alpha. It reads, in order: per-layer `.alpha` tensors, then the file's
+`alpha` metadata, then the profile's `alpha`. FastVideo hybrid files use their rank. E embeds rank 192 and
+alpha 192, so its update scale is 1.0.
+
+**SMD's shorter last step.** SMD samples 8 steps from 1 to 0, with the last step half as long as the others.
+- The pre-shift grid is 1, .867, .733, .6, .467, .333, .2, .067, 0. It comes from `raw_sigma_grid` in the SMD
+  release's `tools/infer_minimax_h3.py`.
+- The grid is shifted per modality: 12 for video, 3 for audio.
+- `install_explicit_schedule` makes both schedulers use that grid whatever step count the pipeline asks for, as
+  SMD's runner does.
+- Profiles with even steps keep the scheduler's own grid, so they sample exactly as before.
+
+**Files outside the Hugging Face Hub.** E is not on the Hub. Its profile's `source.copy_from` names the shared
+copy `/home/guian/shared/h3-serving/models/smd-e/`. `download_checkpoints.py --adapter-profile smd-e-8step`
+copies that file and verifies it.
+
 ### Validation of the SGLang request form
 
 On 2026-11-05 the SGLang request form was validated on eight test workers on 0048
@@ -341,6 +403,8 @@ Evidence is in `/home/jeff/sol-h3-h200/deployment/` on the cluster unless noted.
 | 2026-11-09 | 048 and 067 released to another user. Overlapped MP4 publication deployed to all workers from a read-only release; 035 freed; 20 workers on 002, 003, 005, 006, 023 | `release-2-nodes-20261109T174700Z/`, `async-publication-20261109/` |
 | 2026-11-10 | 035 back on the same release: 24 workers | `async-publication-20261109/` |
 | 2026-11-18 | Prompt limit raised to 16,000 characters; all 24 workers redeployed (Slurm 52–57). At 19:41 UTC 035 was drained and released: 20 workers on 002, 003, 005, 006, 023 | `prompt-16k-20261118/`, `release-035-20261118/` |
+| 2026-11-20 | Whole fleet drained and stopped at the user's request; gateway kept answering 503 | `stop-20-workers-20261120T211328Z/` |
+| 2026-11-21 | SMD-H3 E on 20 workers (Slurm 101–105): adapter profile `smd-e-8step`, gate off, same gateway and API. The same videos as songyang's SMD-E service on 52 of its stored requests (26 T2V, 26 I2V): video PSNR 33.7–43.0 dB (median 38.4) and audio correlation 0.94–0.9997 (median 0.996) after the encoders' 1024-sample AAC offset. Re-encoding our own output with their encoder settings produces the same gap; a different seed gives 8.3 dB and 0.002. Worker outputs cleaned to about 115 GB free per node | `smd-e-20261121/`, `worker-output-cleanup-20261121/` |
 
 ## Validation
 
