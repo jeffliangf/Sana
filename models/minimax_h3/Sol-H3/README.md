@@ -35,7 +35,7 @@ image-to-video with stereo audio at 24 fps, in either request form:
 - The SGLang MiniMax-H3 form: `t2va` or `fl2va`, six aspect ratios or the first
   frame's own, 124–345 frames.
 
-**State on 2026-11-21.** 20 two-GPU H200 workers serve **SMD-H3 E** on five nodes:
+**State on 2026-11-23.** Since 2026-11-21, 20 two-GPU H200 workers serve **SMD-H3 E** on five nodes:
 `dc02-gpu-{002,003,005,006,023}.internal.bigbeargpu.cloud`, Slurm jobs 102, 103,
 104, 101 and 105, four workers per node on ports 18080–18083.
 - **Model settings.** Adapter profile `smd-e-8step`, with no numerical gate
@@ -59,6 +59,13 @@ image-to-video with stereo audio at 24 fps, in either request form:
     and their video is 40–45 dB apart.
   - Every setting that affects the output (`settings-comparison.md` in the evidence) and every
     numeric package version is the same.
+- **In production.** From 2026-11-21 to 18:07 UTC on 2026-11-23, the gateway completed 63,198
+  jobs, nearly all from the verl RL runs, and all succeeded. A job took a median of 58 s on its worker, and at
+  most 109 s. Since 18:22 UTC on 2026-11-23 the fleet serves RL job 1335, until about 2026-11-25
+  23:25 UTC; see the fleet freeze in the [runbook](DEPLOYMENT.md).
+- **H100 workers render different videos.** On 2026-11-23, four-GPU SMD-E workers on H100 gave a
+  different video for the same request and seed, so they were not added
+  ([H100 workers](DEPLOYMENT.md#h100-workers-on-another-cluster)).
 - **Evidence.** `deployment/smd-e-20261121/`.
 - **Other nodes.** Nodes 035, 048 and 067 run other users' jobs.
 - **Node-local files.** The rebuilt cluster keeps node-local environments, weights,
@@ -226,9 +233,10 @@ Each worker handles one generation at a time and queues up to eight waiting
 requests; a full queue returns 429. Jobs and videos remain in that worker's output
 directory across restarts. Interrupted requests are marked failed, so callers can
 decide whether to resubmit. Keep polling/downloading from the worker that accepted
-the request. The service validates four transformer forwards and audio/video
-stream metadata before marking a request successful. A failed distributed
-generation terminates the process group instead of reusing inconsistent GPU state.
+the request. The service validates the adapter profile's transformer forward count
+(eight for `smd-e-8step`) and audio/video stream metadata before marking a request
+successful. A failed distributed generation terminates the process group instead of
+reusing inconsistent GPU state.
 
 With `--async-publication` (`H3_ASYNC_PUBLICATION=1` in the launchers), a worker
 starts the next generation as soon as the previous video is staged in pinned host
@@ -411,6 +419,8 @@ Evidence is in `/home/jeff/sol-h3-h200/deployment/` on the cluster unless noted.
 | 2026-11-18 | Prompt limit raised to 16,000 characters; all 24 workers redeployed (Slurm 52–57). At 19:41 UTC 035 was drained and released: 20 workers on 002, 003, 005, 006, 023 | `prompt-16k-20261118/`, `release-035-20261118/` |
 | 2026-11-20 | Whole fleet drained and stopped at the user's request; gateway kept answering 503 | `stop-20-workers-20261120T211328Z/` |
 | 2026-11-21 | SMD-H3 E on 20 workers (Slurm 101–105): adapter profile `smd-e-8step`, gate off, same gateway and API. The same videos as songyang's SMD-E service on 52 of its stored requests (26 T2V, 26 I2V): video PSNR 33.7–43.0 dB (median 38.4) and audio correlation 0.94–0.9997 (median 0.996) after the encoders' 1024-sample AAC offset. Re-encoding our own output with their encoder settings produces the same gap; a different seed gives 8.3 dB and 0.002. Worker outputs cleaned to about 115 GB free per node | `smd-e-20261121/`, `worker-output-cleanup-20261121/` |
+| 2026-11-21/23 | RL training on SMD-E (GMI Slurm 1225–1229, 1261): 63,198 gateway jobs, all succeeded; median 58 s and at most 109 s per job on its worker. Worker outputs cleaned again under load (15:06 UTC on 11-21, 03:16 UTC on 11-23), with no failed job. Job 1261 stopped on 11-23 at 18:10 UTC after one download 404, most likely caused by a `find` over the gateway's `jobs/` directory; job 1335 replaced it | `worker-output-cleanup-20261121T1506Z/`, `worker-output-cleanup-20261123T0316Z/` |
+| 2026-11-23 | Three SMD-E H100 workers on GMI gpu-001/005 reached the gateway host through reverse tunnels but rendered different videos from the H200 workers for the same seed (18–31 dB PSNR), so they were not admitted and were stopped | GMI cluster: `deployment/smd-e-h100-20261123/` |
 
 ## Validation
 

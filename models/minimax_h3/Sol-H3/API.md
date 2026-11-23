@@ -111,7 +111,8 @@ MiniMax-H3 cookbook, restricted to what this deployment runs.
 | `num_outputs_per_prompt`, `n` | integer | `1` | `1` |
 
 The following get a 422 that names the field:
-- `num_inference_steps`, `flow_shift`, and `audio_flow_shift`: the four-step profile fixes them.
+- `num_inference_steps`, `flow_shift`, and `audio_flow_shift`: the deployed adapter profile fixes
+  them (eight steps since 2026-11-21).
 - `guidance_scale` and `negative_prompt`: the model is guidance-distilled.
 - Any other unknown field.
 - A last-frame keyframe (`frame_index: -1`), or two keyframes.
@@ -187,7 +188,9 @@ unavailable, so poll again.
 
 Returns the MP4 once the job has `succeeded`: 409 before that, 410 if the file was
 removed, 404 for an unknown ID. Downloads can be repeated at any time; videos do
-not expire and are never rendered again.
+not expire and are never rendered again. A 404 for an ID that has already reported
+`succeeded` means the gateway briefly could not read the job's record (seen once, on
+2026-11-23). Retry the download after a few seconds instead of failing the job.
 
 ## Job object
 
@@ -206,7 +209,7 @@ not expire and are never rendered again.
 | `video_sha256`, `video_bytes` | `succeeded` | SHA-256 and size of the stored MP4; check your download against them |
 | `media` | `succeeded` | `width`, `height`, `fps`, `video_codec`, `audio_codec`, `sample_rate`, `channels`, `duration_s` |
 | `processing_s`, `pipeline_s` | `succeeded` | Worker time per video, end to end and for the model pipeline |
-| `transformer_forwards`, `used_gate_fallback`, `memory`, `attention` | `succeeded` | Diagnostics: four forwards, whether the dense numerical fallback ran, per-GPU memory and attention counters |
+| `transformer_forwards`, `used_gate_fallback`, `memory`, `attention` | `succeeded` | Diagnostics: eight forwards (four before 2026-11-21), whether the dense numerical fallback ran, per-GPU memory and attention counters |
 | `stage` | `running`, upgraded workers | `generating`, `staging`, or `publishing`. Informational; keep polling `status` |
 | `publication_mode`, `generation_started_at`, `generation_finished_at`, `gpu_slot_s`, `host`; with background publication also `staged_at`, `published_at`, `publication_slot_wait_s`, `publication_tail_s`, `encoder` | `succeeded`, upgraded workers | Timing diagnostics of the worker's GPU and publication phases; Unix seconds for `*_at` |
 | `error`, `error_code` | `failed` | Message and stable code, below |
@@ -439,9 +442,14 @@ about 2,000–5,000 characters.
   15,000–16,000-character prompts to take noticeably longer than the table.
 - **Capacity.** Longer clips occupy a worker for longer: one 14.4-second clip
   costs about four 5-second clips. Plan concurrency in worker time, not job
-  count. A
-gateway restart stops answers for about 7 minutes while it reloads job records;
-rendering continues, so keep retrying with the same key and keep polling.
+  count.
+- **Under load.** From 2026-11-21 to 2026-11-23 the 20 workers completed 63,198 jobs of mixed
+  lengths and shapes, nearly all from RL training, which often kept every worker busy. A job took
+  a median of 58 s on its worker from start to finish (`finished_at` minus `started_at`, MP4
+  included), p99 96 s and at most 109 s. Queueing is extra.
+- **Gateway restarts.** A gateway restart stops answers while it reloads job records: 11 minutes
+  for 471,557 records on 2026-11-18, longer as records accumulate. Rendering continues, so keep
+  retrying with the same key and keep polling.
 
 ## Troubleshooting
 
@@ -452,6 +460,7 @@ rendering continues, so keep retrying with the same key and keep polling.
 | Every call hangs for minutes, then works | The gateway is restarting | Keep retrying with the same key |
 | 401 | Token missing or mistyped, or stray characters in the header file | Recreate the header file from the token file |
 | 404 on poll right after a 502 | The gateway has not recorded the job | Repeat the POST with the same key |
+| 404 on the download right after `succeeded` | The gateway briefly could not read the job's record | Retry the download with the same ID after a few seconds |
 | 502 on the same key for 10 minutes | Its worker is unreachable | The key ends as `failed`, `worker_lost`; regenerate with a new key |
 | 422 naming `conditions[0].uri` | The first frame is not base64 PNG, JPEG, or WebP, does not decode, is over 20 MiB, or (with `auto`) is wider than 4:1 or taller than 1:4 | Fix the image; for an extreme shape, send an explicit `aspect_ratio` |
 | 422 naming `num_inference_steps`, `flow_shift`, or `audio_flow_shift` | Fields copied from SGLang's cookbook that this deployment fixes | Remove them |

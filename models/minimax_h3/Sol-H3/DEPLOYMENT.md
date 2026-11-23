@@ -6,7 +6,7 @@ adapter** service: SMD-H3 E since 2026-11-21, the four-step FastH3 adapter befor
 the launchers in this directory. It does not use the separate SGLang deployment
 instructions at the repository root.
 
-**State on 2026-11-21 (H200).** 20 two-GPU H200 workers serve **SMD-H3 E** through the
+**State on 2026-11-23 (H200).** Since 2026-11-21, 20 two-GPU H200 workers serve **SMD-H3 E** through the
 unchanged gateway, in both request forms, with
 [overlapped output publication](#overlapped-output-publication) (`H3_ASYNC_PUBLICATION=1`).
 They accept prompts of up to 16,000 characters.
@@ -30,10 +30,27 @@ They accept prompts of up to 16,000 characters.
   - Every pixel-relevant setting matches songyang's workers (`settings-comparison.md` there).
   - Stored test requests of songyang's SMD-E service on 035/067 decode to the same frames and audio up to video
     encoding (`parity-compare*.jsonl`, `README.md` there).
-- **Disk.** Worker outputs were cleaned the same day (`deployment/worker-output-cleanup-20261121/`), leaving about
-  115 GB free per node. `/var/tmp/jeff-h3-base-fl2va` (another project) holds 145 GB on each node.
-- **Fleet freeze.** The RL run launched on this fleet relies on the profile, gate and worker count. Do not change
-  them while it runs without telling its operators.
+- **Production.** From 06:24 UTC on 2026-11-21 to 18:07 UTC on 2026-11-23 the gateway completed 63,198 jobs,
+  nearly all from the verl RL runs `grpo-mixed-hydrogen-group8-16h100-*-smd-cir` (GMI Slurm 1225–1229 and 1261).
+  All succeeded and were archived.
+  - On the worker, start to finish (MP4 included, queueing excluded): median 58 s, p99 96 s, max 109 s.
+    Generation alone (`pipeline_s`): median 55 s, max 101 s.
+  - Jobs 1225–1229 ended for training reasons, not rendering ones.
+  - Callers lost 12 renders when their own SSH tunnels stalled (16:40 UTC on 11-21 and 10:15 UTC on 11-22). The
+    gateway and workers stayed healthy.
+  - Job 1261 stopped at 18:10 UTC on 2026-11-23. One download returned 404 two seconds after its job reported
+    `succeeded`, most likely because of an operator's directory scan
+    ([Storage](#storage-isolation-and-safeguards)).
+- **Disk.** Worker outputs were cleaned three times: at 06:39 and 15:06 UTC on 2026-11-21, and at 03:16 UTC on
+  2026-11-23 (`deployment/worker-output-cleanup-20261123T0316Z/`). The last left 112 GB free per node, about 3.5 days
+  of RL load ([Capacity](#capacity-retention-and-incident-response)). `/var/tmp/jeff-h3-base-fl2va` (another project)
+  holds 145 GB on each node.
+- **Fleet freeze.** Since 18:22 UTC on 2026-11-23 the fleet serves RL job 1335. It continues job 1261
+  (`grpo-mixed-hydrogen-group8-16h100-20261122-s190-nocall-smd-cir`, from 23:25 UTC on 2026-11-22) until about
+  2026-11-25 23:25 UTC.
+  - Its operators rely on the profile, gate and worker count. Do not change them while it runs without telling
+    its operators.
+  - They decided to keep their runs on these H200 workers only (see H100 below).
 - **The 2026-11-18 FastH3 fleet.** Release `20261118-prompt-16k-f2ff5008346a`, Slurm 52–56, was stopped on
   2026-11-20 (`deployment/stop-20-workers-20261120T211328Z/`). Its 16,000-character memory test still bounds the
   worst case: 129.7 GiB allocated at 345 frames on the widest canvas, under the 132.8 GiB cap.
@@ -62,6 +79,10 @@ They accept prompts of up to 16,000 characters.
   extended validation on 2026-11-08: 256 mixed requests at 64-client concurrency
   and the T2V/I2V matrix (`deployment/fleet-32-dc02-20261107/finish-20261108/final-report.json`).
   Its inventory is under `previous_inventory` in `jobs.json`; do not use its job IDs.
+- **H100, 2026-11-23 (SMD-E).** Three four-GPU SMD-E workers on GMI gpu-001 and gpu-005 (Slurm 1267 and 1268)
+  reached the gateway host through reverse tunnels. For the same request and seed they rendered a different video
+  than the H200 workers (18–31 dB PSNR), so they were not admitted. They were stopped at 04:02 UTC; see
+  [H100 workers](#h100-workers-on-another-cluster).
 - **H100, 2026-11-06.** Eight four-GPU H100 workers with sharded weights ran on GMI
   nodes gpu-001/004/005/006. On that cluster's Slurm, whose job IDs restarted after a
   rebuild, they were jobs 6, 5, 7 and 8. Each node ran two workers on loopback ports
@@ -89,7 +110,7 @@ stop workers.
 | Request size | At most 28 MiB; a base64 first frame can be up to 20 MiB |
 | Caller job ID | Optional `Idempotency-Key: <lowercase UUID>` header; it becomes the job ID |
 | Poll / download | `GET /v1/jobs/{id}` / `GET /v1/jobs/{id}/video`, or SGLang's `GET /v1/videos/{id}` (`completed`) / `GET /v1/videos/{id}/content`; success includes `video_sha256` |
-| Media | 24 FPS, stereo audio, four transformer forwards; 1344×768 by default, six aspect ratios or the first frame's own; 124–345 frames |
+| Media | 24 FPS, stereo audio, eight transformer forwards (SMD-H3 E; four with FastH3 before 2026-11-21); 1344×768 by default, six aspect ratios or the first frame's own; 124–345 frames |
 
 The caller-facing reference, with a tested example client, is [API.md](API.md);
 keep it in step with this contract. The base URL, bearer token, API paths, and
@@ -405,6 +426,20 @@ These paths handle reported I/O errors. A filesystem call that hangs indefinitel
 can still block its process. The gateway host, its persistent storage, and network
 remain shared dependencies; there is no second gateway or replicated job database.
 
+**Do not list `jobs/` on the gateway host while callers are active.** After a job's
+video is archived, the gateway drops the job from memory. It then answers that job's
+status and download requests by reading `jobs/<id>.json` by path, and returns 404 "Unknown
+job" if the read finds no file. Records are replaced by renaming a new file over the old one.
+- **What happened.** At 18:07 UTC on 2026-11-23 an operator started a read-only `find`
+  over `jobs/` (more than 500,000 files) on the gateway host. One job's record was replaced
+  at 18:07:06, and its download two seconds later returned 404. The RL trainer treated
+  that as fatal and stopped job 1261.
+- **Likely cause.** A directory listing on the same MooseFS client can serve the entry
+  from before the rename, so the gateway's read found no file.
+- **Not proven.** The gateway keeps no access log, so this cannot be confirmed after the
+  fact. The record and video were intact, and the same download worked afterwards.
+- **Instead.** Read records by job ID, or scan only when no caller is active.
+
 A gateway restart reads every `jobs/*.json` before it answers, 32 records at a time
 (`STARTUP_READERS` in `gateway.py`). A single read on the shared MooseFS `/home` takes
 about 24 ms, so the old one-at-a-time scan took about seven minutes for 33,521 records
@@ -424,6 +459,23 @@ More GPUs can fill the archive faster. **No automatic result expiry or log
 rotation is installed by these changes.** Keep the present indefinite-download
 contract until a retention policy is agreed. A future log rotation policy should
 bound total log bytes and avoid deleting evidence for an active incident.
+
+**Worker disks under RL load (SMD-E, 2026-11-21 to 11-23).** Each node's four workers wrote
+about 1.05–1.1 GB/h of MP4s and first frames, about 25 GB a day. Workers refuse new jobs with
+507 below 20 GiB (21.5 GB) free, so a node with 112 GB free lasts about 3.5 days of that load.
+`/var/tmp/jeff-h3-base-fl2va` (145 GB per node) belongs to another project; leave it alone.
+
+**Worker cleanup.** `cleanup.py` in the `deployment/worker-output-cleanup-*/` records frees a
+node without losing a file that exists only there:
+- It deletes a worker MP4 only when the gateway archived it with the same SHA-256 and size.
+- It moves first frames and direct-job MP4s to `worker-outputs/<host>/<port>/` on shared storage,
+  checking each copy's SHA-256, and writes a manifest.
+- It keeps unsettled jobs, gateway-pending jobs and anything newer than 2 hours.
+
+Run it with `--apply` inside each node's allocation (`srun --jobid=<job> --overlap`), one node at
+a time, then `verify.py`. On 2026-11-23 it took about 53 s per node. No job failed during any run
+(2026-11-11, 11-18, twice on 11-21, 11-23), including under live RL load. It deletes files, so
+run it only with the deployment owner's approval.
 
 Before sustained traffic, monitor free bytes, inodes, quota, and filesystem errors
 on both the gateway and every GPU node. A starting alert policy is free space
@@ -564,7 +616,9 @@ The following defaults are implemented; they do not select available nodes:
 | `H3_GATE_FAILURE` | `dense`: run the numerical gate and use dense attention for the shapes it rejects. `off`: no gate, Sol attention for every shape (songyang's SMD-E service; the SMD-E fleet since 2026-11-21). Recorded in the registry and reused by watchdog restarts |
 
 An eight-GPU H200 allocation gives four workers; eight H100 GPUs give two
-four-GPU workers. They can coexist behind the same gateway. CPU affinities are
+four-GPU workers. They can coexist behind the same gateway, but they do not render the
+same video for the same request and seed (2026-11-23, [below](#h100-workers-on-another-cluster)).
+Keep a caller that needs reproducible outputs, such as an RL run, on one layout. CPU affinities are
 split across the workers; encoder threads remain eight each. Each allocation
 must have at least 32 logical CPUs. Do not run two allocations on overlapping
 ports: the base port also selects a separate registry/runtime directory. Reusing
@@ -654,10 +708,14 @@ ownership or availability.
      gate-rejected prompt;
    - SGLang-form requests at 345 frames, at least one of them with a first frame.
 
-   Validate four forwards, dimensions/FPS/audio, downloaded bytes/hashes, fallback
-   counters, and no unexpected process restarts. Record timings after warmup.
-   `validate.py` in `deployment/rollout-api-v2-20261105/` runs these checks
-   (`workers` before admission, `gateway` after).
+   Validate the profile's forward count (eight for `smd-e-8step`), dimensions/FPS/audio,
+   downloaded bytes/hashes, fallback counters, and no unexpected process restarts. Record
+   timings after warmup. `validate.py` in `deployment/rollout-api-v2-20261105/` runs these
+   checks (`workers` before admission, `gateway` after).
+   If the pool serves a caller that needs the same video for the same request and seed, such
+   as an RL run, also re-render some of its archived requests on the new workers and compare
+   the decoded frames and audio with the archive (`parity/` in the GMI record
+   `deployment/smd-e-h100-20261123/`). Admit only workers that match.
    For a change to the request contract or the decode, first rerun the test
    phases (`driver.py` in `deployment/api-v2-validation-20261105/`) on test workers
    behind a test gateway. H100 validation must include concurrent workers on the same node.
@@ -680,19 +738,21 @@ ownership or availability.
 
 The gateway must reach each worker, and the worker must retain the same bearer
 token. A registry on another cluster's `/home` is not automatically visible to the
-H200 gateway. The H100 nodes are on the GMI cluster, whose login host is
-`utopai-m1` (where `sbatch` runs); its deployment root is `/home/jeff/sol-h3-h100`
+H200 gateway. The H100 nodes are on the GMI cluster, whose login hosts
+`utopai-m1` and `utopai-m2` run `sbatch`; its deployment root is `/home/jeff/sol-h3-h100`
 with a copy of the same `deployment/token`.
 
 GMI node addresses are public, so workers bind to loopback
 (`H3_BIND_HOST=127.0.0.1`). The gateway host holds no credentials for the GMI
-cluster, so the allocation opens the tunnel in reverse with the existing key:
-gateway-host `127.0.0.1:28084`/`28085` → node `127.0.0.1:18080`/`18081`.
-The tunnel runs in a restart loop inside the allocation and ends with it:
+cluster, so the allocation opens the tunnel in reverse with Jeff's gateway login key,
+`~/.ssh/id_ed25519_h200_agent` on the shared `/home` (the older `~/.ssh/gmi` is no longer
+authorized there; checked 2026-11-23): gateway-host `127.0.0.1:28084`/`28085` → node
+`127.0.0.1:18080`/`18081`. The tunnel runs in a restart loop inside the allocation and ends with it:
 
 ```bash
-ssh -i ~/.ssh/gmi -p 44222 -N -o BatchMode=yes -o ExitOnForwardFailure=yes \
-  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+ssh -i ~/.ssh/id_ed25519_h200_agent -p 44222 -N -o BatchMode=yes -o IdentitiesOnly=yes \
+  -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
   -R 127.0.0.1:28084:127.0.0.1:18080 -R 127.0.0.1:28085:127.0.0.1:18081 jeff@157.66.255.187
 ```
 
@@ -775,9 +835,12 @@ Measured on gpu-004 with both workers running (processing time, through the MP4)
 | 9:16 5 s, first use of the shape | 21–22 s |
 
 Each node's allocation owns its reverse tunnel. The tunnel starts only once
-`tunnels-enabled` exists in the fleet directory. The gateway host's SSH key changed
-between 2026-11-05 and 2026-11-06, so `known_hosts` must be updated before the
-tunnels can start. Gateway ports:
+`tunnels-enabled` exists in the fleet directory. A flag created on the workstation can take
+30–60 s to appear on a node (NFS lookup cache), so wait for `TUNNEL_ENABLED` in the tunnel log.
+The gateway host's SSH key changed between 2026-11-05 and 2026-11-06. On 2026-11-23 the shared
+`~/.ssh/known_hosts` held the current key (ED25519
+`SHA256:j2Vpwb4vEKektYETD2dAPh9AZNK4ShPhQU6nBTB0Bb8`) and the tunnels started; accept a
+different key only after its owner confirms it. Gateway ports:
 
 | Node | Gateway port → node port |
 |---|---|
@@ -809,6 +872,41 @@ This is a field to merge, not a replacement for the existing pool file. If
 workers from dispatch; it does not change the external URL. Preserve a tunnel
 mapping until its accepted jobs have been archived, and drain it before remapping
 that origin to another worker/node.
+
+**2026-11-23: SMD-E on H100 renders different videos.** Three four-GPU SMD-E workers were
+started to add capacity behind the H200 gateway during an RL run. The record is
+`deployment/smd-e-h100-20261123/` on the GMI cluster.
+- **Setup.**
+  - The H200 release, copied to `/home/jeff/sol-h3-h100/releases/20261121-smd-e-11eeb3f94d12`
+    (all 118 manifest hashes match), with `H3_ADAPTER_PROFILE=smd-e-8step` and `H3_GATE_FAILURE=off`.
+  - The E file was staged from guian's copy on the GMI cluster and its SHA-256 checked.
+  - gpu-001 ran two workers (Slurm 1267, gateway ports 28086–28087). gpu-005 ran one on its four
+    free GPUs (Slurm 1268, port 28088). `preflight.py` reads each node's GPU count from `nodes.json`,
+    so a partial node passes.
+  - All three were ready 12 minutes after submission, from the cached environment and weights.
+- **Reachability.** Through the tunnels, `/healthz` answered in 0.6–1.1 s, inside the gateway's 2 s
+  probe limit. The origins were never added to `pool.json`.
+- **Parity failed.** `parity/run_parity.py` re-rendered five of the RL run's archived requests on
+  gpu-001 with the same seed: three `t2va` at 243–345 frames and two `fl2va` at 243 frames.
+  `parity/compare_frames.py` compared the decoded videos:
+  - Against the H200 video, mean frame PSNR was 18.0–23.2 dB for `t2va` and 28.5–30.5 dB for `fl2va`.
+    The audio differed too (SNR 0.4–19.8 dB).
+  - Rendering a request again on the same hardware gave 40.8 dB with bit-identical audio, on H200 and on
+    H100 alike, so MP4 encoding was the only difference. H100 against H200 stayed at 19.45 dB.
+  - So each layout is deterministic, but a four-GPU sharded H100 worker renders a different video
+    than a two-GPU H200 worker for the same request and seed.
+  - The cause was not investigated. The layouts differ in GPU, in Ulysses degree (4 against 2) and in
+    weight sharding, which on its own is bitwise neutral (`tests/test_weight_sharding.py`).
+  - Whether the H100 videos are as good is untested; that needs a judged A/B.
+- **Speed.** H100 generation took 34–43% less time: 345 frames in 50–51 s against 88–89 s on H200,
+  and 243 frames in 32–36 s against 50–56 s.
+- **Outcome.** The RL run's operators required identical outputs, so the workers were not admitted.
+  They were stopped at 04:02 UTC (`scancel 1267 1268`), and the operators chose to keep their runs on
+  H200 only.
+- **What remains.** The record, the release copy, the staged E file and the node caches.
+  - `submissions.json` holds the sbatch commands; the workers are ready about 13 minutes after
+    submission.
+  - Admission is `tunnels-enabled`, then `pool_h100.py exclude` and `admit` on the gateway host.
 
 ## Drain, stop, rollback
 
