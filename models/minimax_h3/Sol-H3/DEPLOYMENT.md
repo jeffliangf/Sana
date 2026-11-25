@@ -608,7 +608,7 @@ The following defaults are implemented; they do not select available nodes:
 | `H3_CHECKPOINT_ROOT` | `$H3_LOCAL_ROOT/sol-h3-checkpoints`; existing model/adapter layout |
 | `H3_BIND_HOST` | Node IP by default; `127.0.0.1` for SSH-forwarded workers |
 | `H3_MIN_FREE_GIB` | 20; node staging/output reserve. Gateway has its own `--min-free-gib` |
-| `H3_MAX_NUM_FRAMES` | Unset (345, the API maximum). A lower 17n+5 value caps what the worker admits and advertises; the gateway then routes longer requests elsewhere |
+| `H3_MAX_NUM_FRAMES` | Unset (the API maximum: 345 for T2V, 362 for Ref2VA). A lower 17n+5 value caps what the worker admits and advertises; the gateway then routes longer requests elsewhere |
 | `H3_ATTENTION_BACKEND` | `sol`. `dense` runs dense attention only; used to measure the gate-fallback path's memory |
 | `H3_ASYNC_PUBLICATION` | `0`: publish each MP4 before the next generation. `1`: publish in the background while the next video generates, one publication at a time ([Overlapped output publication](#overlapped-output-publication)). Recorded in the registry and reused by watchdog restarts |
 | `H3_CODE_DIR` | `$H3_DEPLOY_ROOT/Sol-H3`. The service code this allocation runs; point it at an immutable release directory so later changes cannot reach running workers. Recorded in the registry and reused by watchdog restarts |
@@ -910,7 +910,7 @@ started to add capacity behind the H200 gateway during an RL run. The record is
 
 ### Ref2VA gateway
 
-Ref2VA (`ref2va` with image references, the eight-step SMD-MiniMax-H3-Ref2VA-8step adapter) runs as a
+Ref2VA (`ref2va` with image, video and audio references, the eight-step SMD-MiniMax-H3-Ref2VA-8step adapter) runs as a
 separate deployment, so nothing about it can reach the T2V/I2V gateway, its workers or its callers.
 
 - **Root.** `/home/jeff/sol-h3-ref2va` on the GMI `/home`: its own `deployment/token`, registry
@@ -926,12 +926,16 @@ separate deployment, so nothing about it can reach the T2V/I2V gateway, its work
   42ed227e and SMD's 939557dc), symlinks to the node's cached T2V components, and the adapter. The T2V
   checkpoint root is not modified. `stage_node.py` in the record builds it in about 4 minutes.
 - **Gateway.** `gateway.py` from the same release runs inside the worker's allocation on
-  `127.0.0.1:18095`, with `--registry /home/jeff/sol-h3-ref2va/deployment`. GMI node addresses are public,
+  `127.0.0.1:18095`, with `--registry /home/jeff/sol-h3-ref2va/deployment` and `--max-body-mib 128` (twelve
+  references; the T2V gateway keeps its 28 MiB). GMI node addresses are public,
   so nothing listens beyond loopback: callers reach it from a step in the allocation
   (`srun --overlap --jobid <job>`) or through an SSH forward to the node. It stops with the allocation; its
   jobs and videos stay in `gateway/` for the next start.
-- **Contract.** Its `/healthz` lists `api.tasks: ["ref2va"]`. A `t2va`, `fl2va` or legacy request gets a
-  422 there, as `ref2va` does on the T2V gateway ([API](API.md#ref2va)).
+- **Contract.** Its `/healthz` lists `api.tasks: ["ref2va"]`, the reference types and limits, and 107–362
+  frames (4–15 s; a Ref2VA worker defaults `--max-num-frames` to 362, a T2V worker to 345). A `t2va`,
+  `fl2va` or legacy request gets a 422 there, as `ref2va` does on the T2V gateway ([API](API.md#ref2va)).
+  The worker decodes every video and audio reference with PyAV at admission (lengths, streams, channels,
+  shape), so a bad reference is a 422 rather than a failed job.
 
 ## Drain, stop, rollback
 

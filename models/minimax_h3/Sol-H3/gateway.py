@@ -22,8 +22,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from h3_request import (API_VERSION, MAX_BODY_BYTES, TASKS, GenerateRequest, accepts, capabilities, same_request,
-                        sglang_status)
+from h3_request import (API_VERSION, MAX_BODY_BYTES, REF2VA_MAX_BODY_BYTES, TASKS, GenerateRequest, accepts,
+                        capabilities, same_request, sglang_status)
 from serve import atomic_json, caller_job_id, read_request_body
 from service_storage import check_space, storage_probe
 
@@ -66,9 +66,11 @@ def unfinished_record(path):
 
 class Gateway:
     def __init__(self, registry, state_dir, token, *, pool_file=None, client=None,
-                 min_free_gib=20, refresh_seconds=2, worker_lost_seconds=600):
+                 min_free_gib=20, refresh_seconds=2, worker_lost_seconds=600, max_body_bytes=MAX_BODY_BYTES):
         if len(token) < 32:
             raise ValueError("Bearer token must contain at least 32 characters")
+        # 28 MiB fits one 20 MiB keyframe; a Ref2VA gateway passes REF2VA_MAX_BODY_BYTES for its references.
+        self.max_body_bytes = max_body_bytes
         self.registry, self.root = Path(registry), Path(state_dir)
         self.pool_file = Path(pool_file) if pool_file else self.root / "pool.json"
         for directory in ("jobs", "videos", "uncertain"):
@@ -213,6 +215,8 @@ class Gateway:
         tasks = [task for task in TASKS if any(task in a.get("tasks", ()) for a in upgraded)]
         api = ({**capabilities(max(a["num_frames"]["max"] for a in upgraded), tasks), "workers": len(upgraded)}
                if upgraded else {"version": 1, "tasks": ["t2va"], "workers": 0})
+        if "max_body_bytes" in api:  # what this gateway admits, which callers meet first
+            api["max_body_bytes"] = min(api["max_body_bytes"], self.max_body_bytes)
         return {"status": "storage_paused" if not storage_ready else ("ready" if ready else "unavailable"),
                 "service": "Sol-H3 gateway", "idempotency_key": True, "api": api,
                 "workers_ready": len(ready), "workers_discovered": len(self.discovered),
@@ -547,7 +551,7 @@ def create_app(gateway):
                 return JSONResponse({"detail": "Invalid Content-Length"}, status_code=400)
             if length < 0:
                 return JSONResponse({"detail": "Content-Length required"}, status_code=411)
-            if length > MAX_BODY_BYTES:
+            if length > gateway.max_body_bytes:
                 return JSONResponse({"detail": "Request body too large"}, status_code=413)
         return await call_next(request)
 
@@ -608,12 +612,18 @@ def main():
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--fd", type=int, help="Inherited systemd listening socket; preserves the port on restart")
     parser.add_argument("--min-free-gib", type=int, default=20)
+    parser.add_argument("--max-body-mib", type=int, default=MAX_BODY_BYTES // 2**20,
+                        help="Largest request body: 28 MiB fits a first frame (default); a Ref2VA gateway takes "
+                             f"{REF2VA_MAX_BODY_BYTES // 2**20} for its video and audio references")
     args = parser.parse_args()
+    if args.max_body_mib < 1:
+        parser.error("--max-body-mib must be positive")
     os.umask(0o077)
     import uvicorn
 
     gateway = Gateway(args.registry, args.state_dir, args.token_file.read_text().strip(),
-                      pool_file=args.pool_file, min_free_gib=args.min_free_gib)
+                      pool_file=args.pool_file, min_free_gib=args.min_free_gib,
+                      max_body_bytes=args.max_body_mib * 2**20)
     # Exactly one process owns dispatch and durable job records.
     uvicorn.run(create_app(gateway), host=args.host, port=args.port, fd=args.fd, workers=1, access_log=False,
                 limit_concurrency=256, timeout_graceful_shutdown=35)

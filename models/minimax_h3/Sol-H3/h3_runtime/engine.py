@@ -25,8 +25,10 @@ FPS = 24
 # from its adapter profile (adapter_profiles.json): ``MiniMaxH3Inference.transformer_forwards``.
 INFERENCE_STEPS = 5
 DURATION_FRAMES = {5: 124, 10: 243, 15: 362}
-# Every 17n+5 length the video VAE decodes between the 5- and 15-second presets.
-VALID_NUM_FRAMES = frozenset(range(DURATION_FRAMES[5], DURATION_FRAMES[15] + 1, 17))
+# Every 17n+5 length the video VAE decodes across MiniMax-H3's published 4-15 s: 107 frames (4.458 s, what SGLang
+# renders for 4 s) to 362 (15.083 s). The service admits 124-345 for T2V and the whole range for Ref2VA.
+MIN_NUM_FRAMES = 107
+VALID_NUM_FRAMES = frozenset(range(MIN_NUM_FRAMES, DURATION_FRAMES[15] + 1, 17))
 CANVAS_MULTIPLE = 32
 ATTENTION_BACKENDS = {"dense", "sol", "sol_bsa"}
 TASKS = {"t2v", "i2v", "ref2va"}
@@ -71,6 +73,34 @@ def _resolve_reference_image_size(
         max(multiple, round(height * scale / multiple) * multiple),
         max(multiple, round(width * scale / multiple) * multiple),
     )
+
+
+def _video_rotation(media) -> float:
+    """The display-matrix rotation PyAV reports on a video file's first frame (degrees counterclockwise)."""
+    import av
+
+    with av.open(str(media)) as container:
+        frame = next(container.decode(video=0), None)
+    return float(getattr(frame, "rotation", 0) or 0) if frame is not None else 0.0
+
+
+def upright_reference_video(decode, rotation_of=_video_rotation):
+    """Wrap Diffusers' ``decode_reference_video`` so that a phone video's frames come out upright.
+
+    The display matrix rotates the decoded frame counterclockwise by its angle, and ffmpeg (MiniMax-H3's
+    reference decode, and SGLang's) shows a clip that way: ``np.rot90(frames, k=turns)``. Diffusers applies
+    ``k=-turns``, which agrees for half turns but leaves a quarter-turn clip (rotation -90, a portrait phone
+    video) upside down. Turn those by another half turn.
+    """
+    import numpy as np
+
+    def decode_upright(media):
+        frames, frame_rate, soundtrack = decode(media)
+        if round(rotation_of(media) / 90.0) % 2:
+            frames = np.ascontiguousarray(np.rot90(frames, k=2, axes=(1, 2)))
+        return frames, frame_rate, soundtrack
+
+    return decode_upright
 
 
 def _state_value(state: Any, name: str) -> Any:
@@ -216,11 +246,12 @@ class MiniMaxH3Inference:
 
         from diffusers import ComponentsManager, ModularPipeline
 
-        # The released pipeline originally enforced a shorter public limit. The
-        # 362-frame shape is a native 17*n+5 H3 sequence and is used directly.
+        # The released pipeline enforces 5.0-15.0 s after rounding. The 362-frame (15.083 s) and 107-frame
+        # (4.458 s) shapes are native 17*n+5 H3 sequences, what SGLang renders for 15 s and 4 s requests.
         from diffusers.modular_pipelines.minimax_h3 import before_encoder
 
         before_encoder.MINIMAX_H3_MAX_DURATION = 364 / FPS
+        before_encoder.MINIMAX_H3_MIN_DURATION = 4.0
         if task == "ref2va":
             # before_encoder imports the resolver by name, so override that
             # binding without modifying the installed Diffusers package.
@@ -232,6 +263,12 @@ class MiniMaxH3Inference:
                     short_edge=self.reference_image_short_edge,
                 )
             )
+            # MiniMaxH3Reference decodes a video path through this module-level name.
+            from diffusers.modular_pipelines.minimax_h3 import packing_ref2va
+
+            if not getattr(packing_ref2va.decode_reference_video, "h3_upright", False):
+                packing_ref2va.decode_reference_video = upright_reference_video(packing_ref2va.decode_reference_video)
+                packing_ref2va.decode_reference_video.h3_upright = True
 
         manager = ComponentsManager()
         if task == "ref2va":
@@ -431,7 +468,7 @@ class MiniMaxH3Inference:
         """Generate one video. ``references`` is required only for Ref2VA.
 
         Give either a preset ``duration`` (5, 10, or 15 seconds) or ``num_frames`` (a
-        17n+5 count from 124 to 362). ``height`` and ``width`` default to 768x1344; a
+        17n+5 count from 107 to 362). ``height`` and ``width`` default to 768x1344; a
         first-frame ``image`` is stretched onto that canvas, as in MiniMax-H3 itself.
         """
         if not isinstance(prompt, str) or not prompt.strip():
@@ -441,7 +478,7 @@ class MiniMaxH3Inference:
                 raise ValueError("duration must be 5, 10, or 15 seconds")
             num_frames = DURATION_FRAMES[duration]
         elif num_frames not in VALID_NUM_FRAMES:
-            raise ValueError(f"num_frames must be a 17n+5 count from 124 to 362, got {num_frames}")
+            raise ValueError(f"num_frames must be a 17n+5 count from {MIN_NUM_FRAMES} to 362, got {num_frames}")
         height = HEIGHT if height is None else int(height)
         width = WIDTH if width is None else int(width)
         if min(height, width) < CANVAS_MULTIPLE or height % CANVAS_MULTIPLE or width % CANVAS_MULTIPLE:

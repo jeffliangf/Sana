@@ -32,8 +32,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from h3_request import (LEGACY_NUM_FRAMES, MAX_BODY_BYTES, MAX_NUM_FRAMES, VALID_NUM_FRAMES, WORKER_TASKS,
-                        GenerateRequest, RequestError, capabilities, inspect_image, output_profile, parse_request,
+from h3_request import (FRAME_STEP, LEGACY_NUM_FRAMES, WORKER_TASKS, GenerateRequest, RequestError, capabilities,
+                        frame_range, inspect_image, inspect_media, max_body_bytes, output_profile, parse_request,
                         resolve_canvas_size, same_request)
 from output_publication import (OutputPublisher, PublicationTask, encoder_timings, finish_output, freeze,
                                 partial_path, storage_error_message)
@@ -124,7 +124,7 @@ class WorkerState:
     """Rank zero's jobs: the admission queue, the job on the GPU (``active``), the job whose MP4 is
     published in the background (``publishing``, async mode only), and the durable records."""
 
-    def __init__(self, output_dir, *, capacity=8, min_free_gib=20, metadata=None, max_num_frames=MAX_NUM_FRAMES,
+    def __init__(self, output_dir, *, capacity=8, min_free_gib=20, metadata=None, max_num_frames=None,
                  tasks=WORKER_TASKS["t2v"]):
         self.root = Path(output_dir)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -137,9 +137,10 @@ class WorkerState:
         self.fatal_error = None  # a background publication failed fatally; the worker must stop
         self.completed = 0
         self.min_free_bytes = min_free_gib * 2**30
-        self.max_num_frames = max_num_frames
         self.tasks = tuple(tasks)
-        self.metadata = {**(metadata or {}), "api": capabilities(max_num_frames, self.tasks)}
+        self.max_num_frames = max_num_frames or frame_range(self.tasks[0])[1]
+        self.max_body_bytes = max_body_bytes(self.tasks)
+        self.metadata = {**(metadata or {}), "api": capabilities(self.max_num_frames, self.tasks)}
         self.records = {}  # Accepted requests remain readable during an I/O outage.
         self.dirty = {}
         self.held = None
@@ -238,13 +239,16 @@ class WorkerState:
                                        "msg": f"this worker serves {list(self.tasks)}, not {parsed.task}"}])
         # Decode keyframes and references outside the lock: it is CPU work, and /healthz shares the lock.
         sizes = []
-        for index, data in enumerate(parsed.images):
+        for index, (data, kind) in enumerate(zip(parsed.media, parsed.condition_types)):
             try:
-                info = inspect_image(data)
+                if kind == "image":
+                    info = inspect_image(data)
+                    sizes.append({"width": info["width"], "height": info["height"]})
+                else:  # the whole file, as the pipeline will decode it: streams, shape, length, channels
+                    sizes.append({key: value for key, value in inspect_media(data, kind).items() if key != "container"})
             except ValueError as error:
                 raise HTTPException(422, [{"loc": ["body", "conditions", index, "uri"], "msg": str(error),
                                            "type": "value_error"}]) from None
-            sizes.append((info["width"], info["height"]))
         try:
             output = parsed.resolve(sizes)
         except RequestError as error:
@@ -278,14 +282,14 @@ class WorkerState:
                 "status_url": f"/v1/jobs/{job_id}",
                 "video_url": f"/v1/jobs/{job_id}/video",
             }
-            if sizes:
-                record["condition_sizes"] = [{"width": width, "height": height} for width, height in sizes]
+            if sizes:  # per condition: an image's upright size; a video's size, length and soundtrack; audio's
+                record["condition_sizes"] = sizes
             written = []
             try:
                 self.storage = check_space(self.root, self.min_free_bytes,
-                                           reserve_bytes=sum(len(data) for data in parsed.images))
+                                           reserve_bytes=sum(len(data) for data in parsed.media))
                 # The keyframe must exist before the record that refers to it.
-                for index, (data, condition) in enumerate(zip(parsed.images, identity.get("conditions", ()))):
+                for index, (data, condition) in enumerate(zip(parsed.media, identity.get("conditions", ()))):
                     path = self.keyframe_path(job_id, index, condition["format"])
                     atomic_bytes(path, data)
                     written.append(path)
@@ -477,14 +481,15 @@ def stop_after_error(rank, state, publisher, *, async_publication, serving):
 
 def job_from_record(record, output_dir):
     """What a GPU job needs from a queued record; legacy records carry only a duration. Ref2VA references are
-    stored like keyframes, in request order (``<id>.keyframe<i>.<format>``)."""
+    stored like keyframes, in request order (``<id>.keyframe<i>.<format>``), and reach the job as
+    ``(type, path)`` pairs."""
     output = record.get("output") or legacy_output(record["duration"])
     image = references = None
     conditions = record.get("conditions") or []
     paths = [str(Path(output_dir) / f"{record['id']}.keyframe{index}.{condition['format']}")
              for index, condition in enumerate(conditions)]
     if record.get("task") == "ref2va":
-        references = paths
+        references = [(condition["type"], path) for condition, path in zip(conditions, paths)]
     elif paths:
         image = paths[0]
     return {"prompt": record["prompt"], "seed": record["seed"], "output": output, "image": image,
@@ -657,7 +662,7 @@ def create_app(state, token):
                 return JSONResponse({"detail": "Invalid Content-Length"}, status_code=400)
             if length < 0:
                 return JSONResponse({"detail": "Content-Length required"}, status_code=411)
-            if length > MAX_BODY_BYTES:
+            if length > state.max_body_bytes:
                 return JSONResponse({"detail": "Request body too large"}, status_code=413)
         return await call_next(request)
 
@@ -718,16 +723,15 @@ def parse_args(argv=None):
     parser.add_argument("--warmup-prompt-file", type=Path, required=True)
     parser.add_argument("--ready-file", type=Path)
     parser.add_argument("--expect-gpu", default="H200")
-    parser.add_argument("--max-num-frames", type=int, default=MAX_NUM_FRAMES,
-                        help="Largest output frame count this worker admits (a 17n+5 value, 124-345)")
+    parser.add_argument("--max-num-frames", type=int,
+                        help="Largest output frame count this worker admits, a 17n+5 value: 124-345 for T2V "
+                             "(default 345), 107-362 for Ref2VA (default 362)")
     parser.add_argument("--async-publication", action="store_true",
                         help="Finish and publish each MP4 on a background thread while the next video generates, "
                              "one publication at a time (DEPLOYMENT.md); default: publish before the next job")
     args = parser.parse_args(argv)
     if min(args.queue_capacity, args.encoder_threads, args.min_free_gib) < 1:
         parser.error("queue capacity, encoder threads, and free disk threshold must be positive")
-    if args.max_num_frames not in VALID_NUM_FRAMES:
-        parser.error(f"--max-num-frames must be one of {list(VALID_NUM_FRAMES)}")
     if not 1 <= args.port <= 65535:
         parser.error("invalid TCP port")
     # The launchers set both from H3_ASYNC_PUBLICATION; a mismatch means the supervisor and watchdog drifted.
@@ -753,6 +757,11 @@ def parse_args(argv=None):
         parser.error(str(error))
     if args.task == "ref2va" and args.attention_backend == "sol":
         parser.error("a Ref2VA worker needs --attention-backend dense or sol_bsa")
+    low, high = frame_range("ref2va" if args.task == "ref2va" else "t2va")
+    if args.max_num_frames is None:
+        args.max_num_frames = high
+    elif args.max_num_frames not in range(low, high + 1, FRAME_STEP):
+        parser.error(f"--max-num-frames must be one of {list(range(low, high + 1, FRAME_STEP))} for this worker")
     return args
 
 
@@ -881,10 +890,18 @@ def main():
         def generate(job):
             expected = job["output"]
             references = job.get("references")
-            if references is not None:  # Ref2VA: image references in request order, EXIF-upright RGB
+            if references is not None:  # Ref2VA: (type, file) pairs in request order
                 from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3Reference
 
-                references = [MiniMaxH3Reference(image=engine._load_image(item)) for item in references]
+                def reference(kind, item):
+                    if kind == "image":  # EXIF-upright RGB
+                        return MiniMaxH3Reference(image=engine._load_image(item))
+                    if kind == "audio":
+                        return MiniMaxH3Reference(audio=str(item))
+                    # video and video_audio: PyAV decodes the frames and, when there is one, the soundtrack.
+                    return MiniMaxH3Reference(video=str(item))
+
+                references = [reference(kind, item) for kind, item in references]
             return engine.generate(job["prompt"], num_frames=expected["num_frames"], height=expected["height"],
                                    width=expected["width"], seed=job["seed"], image=job["image"],
                                    references=references)
@@ -917,7 +934,7 @@ def main():
                                state=state, publisher=publisher, transformer_forwards=engine.transformer_forwards)
 
         prompt = read_prompt(args.warmup_prompt_file)
-        references = [warmup_reference()] if args.task == "ref2va" else None
+        references = [("image", warmup_reference())] if args.task == "ref2va" else None
         warmups = []
         if rank == 0:
             state.phase = "warming"

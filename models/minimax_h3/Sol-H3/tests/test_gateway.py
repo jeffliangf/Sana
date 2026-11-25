@@ -36,6 +36,7 @@ class Fleet:
         self.legacy = set()  # Predates job ID support.
         self.v1 = set()  # Predates the SGLang-form contract.
         self.ref2va = set()  # Ref2VA workers: serve ref2va only.
+        self.images_only = set()  # Ref2VA workers from before video and audio references.
         self.async_workers = set()  # Publish in the background: new health fields, a "publishing" stage.
         self.published = set()
         self.bodies = []
@@ -53,6 +54,8 @@ class Fleet:
             if endpoint not in self.v1:
                 health["api"] = h3_request.capabilities(
                     tasks=h3_request.WORKER_TASKS["ref2va" if endpoint in self.ref2va else "t2v"])
+                if endpoint in self.images_only:
+                    health["api"].update(reference_types=["image"], num_frames={"min": 124, "max": 345, "step": 17})
             if endpoint in self.async_workers:  # busy publishing an earlier video, with the GPU free
                 health.update(active_job=str(uuid4()), gpu_active_job=None, publishing_jobs=["earlier"],
                               publication_mode="async", publication_capacity=1, drained=False, fatal_error=None,
@@ -382,6 +385,10 @@ def test_http_contract_auth_and_persistence_without_workers(tmp_path):
         assert client.post("/v1/videos", json={"prompt": ""}, headers=AUTH).status_code == 422
         assert client.post("/v1/videos", content=b"x" * (h3_request.MAX_BODY_BYTES + 1),
                            headers=AUTH).status_code == 413
+        router.max_body_bytes = h3_request.REF2VA_MAX_BODY_BYTES  # a Ref2VA gateway (--max-body-mib 128)
+        assert client.post("/v1/videos", content=b"x" * (h3_request.MAX_BODY_BYTES + 1),
+                           headers=AUTH).status_code == 422  # admitted, then not JSON
+        router.max_body_bytes = h3_request.MAX_BODY_BYTES
         response = client.post("/v1/videos", json={"prompt": "test"}, headers=AUTH)
         assert response.status_code == 202
         job = response.json()
@@ -778,7 +785,19 @@ def test_ref2va_requests_reach_only_ref2va_workers(tmp_path):
         fleet.ref2va.update(URLS)  # a Ref2VA-only gateway
         await router.refresh_pool()
         assert router.health()["api"]["tasks"] == ["ref2va"]
-        assert router.health()["api"]["reference_types"] == ["image"]
+        api = router.health()["api"]
+        assert api["reference_types"] == ["image", "video", "video_audio", "audio"]
+        assert api["num_frames"]["min"] == 107 and api["max_body_bytes"] == 28 * 2**20  # this gateway's own limit
+        # A video reference goes only to a worker that publishes video references.
+        fleet.images_only.add(URLS[0])
+        await router.refresh_pool()
+        video = {"type": "video", "role": "reference",
+                 "uri": "data:video/mp4;base64," + __import__("base64").b64encode(b"\0\0\0\x20ftypisom").decode()}
+        for _ in range(3):
+            job = await router.submit(h3_request.parse_request({**body, "conditions": [body["conditions"][0], video]}))
+            assert router.load(job["id"])["worker"] != URLS[0]
+        fleet.images_only.clear()
+        await router.refresh_pool()
         # A task no worker of this gateway serves is a permanent 422, not a retryable 503.
         for request in (h3_request.parse_request({"task": "t2va", "prompt": "x"}), gateway.GenerateRequest(prompt="x")):
             with pytest.raises(HTTPException) as error:

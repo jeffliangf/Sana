@@ -101,7 +101,8 @@ def test_disk_pressure_and_body_limit(tmp_path):
     state.phase = "ready"
     state.min_free_bytes = 2**70
     assert client.post("/v1/videos", json={"prompt": "test"}, headers=AUTH).status_code == 507
-    assert client.post("/v1/videos", content=b"x" * (service.MAX_BODY_BYTES + 1), headers=AUTH).status_code == 413
+    assert state.max_body_bytes == 28 * 2**20  # a T2V worker: one 20 MiB first frame
+    assert client.post("/v1/videos", content=b"x" * (state.max_body_bytes + 1), headers=AUTH).status_code == 413
     assert client.post("/v1/videos", content=b"not json", headers=AUTH).status_code == 422
     assert not list(tmp_path.glob("*.json"))
 
@@ -183,7 +184,9 @@ def test_ref2va_worker_admits_only_ordered_image_references(tmp_path):
     state.phase = "ready"
     with TestClient(service.create_app(state, TOKEN)) as client:
         api = client.get("/healthz").json()["api"]
-        assert api["tasks"] == ["ref2va"] and api["reference_types"] == ["image"]
+        assert api["tasks"] == ["ref2va"] and api["reference_types"] == ["image", "video", "video_audio", "audio"]
+        assert api["num_frames"]["min"] == 107 and api["num_frames"]["max"] == 362
+        assert state.max_body_bytes == 128 * 2**20
         for other in ({"prompt": "A bird sings.", "duration": 5}, {"task": "t2va", "prompt": "x"}):
             response = client.post("/v1/videos", json=other, headers=AUTH)
             assert response.status_code == 422 and "ref2va" in response.text
@@ -197,9 +200,9 @@ def test_ref2va_worker_admits_only_ordered_image_references(tmp_path):
         reordered = {**body, "conditions": body["conditions"][::-1]}
         assert client.post("/v1/videos", json=reordered, headers={**AUTH, "Idempotency-Key": key}).status_code == 409
     gpu_job = service.job_from_record(state.next_command(), tmp_path)
-    assert gpu_job["image"] is None and [Path(p).name for p in gpu_job["references"]] == [
-        f"{key}.keyframe0.png", f"{key}.keyframe1.png"]
-    assert [Path(p).read_bytes() for p in gpu_job["references"]] == images
+    assert gpu_job["image"] is None and [(kind, Path(p).name) for kind, p in gpu_job["references"]] == [
+        ("image", f"{key}.keyframe0.png"), ("image", f"{key}.keyframe1.png")]
+    assert [Path(p).read_bytes() for _, p in gpu_job["references"]] == images
     reference = service.warmup_reference()
     assert reference.size == (512, 512) and reference.mode == "RGB"
     # A T2V worker keeps its contract and turns Ref2VA away.
@@ -207,3 +210,53 @@ def test_ref2va_worker_admits_only_ordered_image_references(tmp_path):
     t2v.phase = "ready"
     assert t2v_client.post("/v1/videos", json=body, headers=AUTH).status_code == 422
     assert service.job_from_record({"id": "x", "prompt": "p", "seed": 1, "duration": 5}, tmp_path)["references"] is None
+
+
+def test_ref2va_worker_decodes_video_and_audio_references_at_admission(tmp_path):
+    import base64
+
+    import pytest
+    pytest.importorskip("av")
+    pytest.importorskip("PIL")
+    import media_samples
+    from PIL import Image
+    import io
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (512, 512), (90, 90, 200)).save(buffer, "PNG")
+    picture, clip, voice = buffer.getvalue(), media_samples.mp4(3), media_samples.wav(4)
+
+    def ref(kind, data):  # images keep their image/* rule; video and audio are read from their bytes
+        mime = "image/png" if kind == "image" else "application/octet-stream"
+        return {"type": kind, "role": "reference", "uri": f"data:{mime};base64," + base64.b64encode(data).decode()}
+
+    body = {"task": "ref2va", "prompt": "<Picture 1> talks like <Audio 2> in the room of <Video 1>.", "seed": 3,
+            "target": {"duration_seconds": 15, "aspect_ratio": "9:16"},
+            "conditions": [ref("image", picture), ref("video_audio", clip), ref("audio", voice)]}
+    state = service.WorkerState(tmp_path, capacity=4, min_free_gib=0, tasks=("ref2va",))
+    state.phase = "ready"
+    with TestClient(service.create_app(state, TOKEN)) as client:
+        key = str(uuid4())
+        response = client.post("/v1/videos", json=body, headers={**AUTH, "Idempotency-Key": key})
+        assert response.status_code == 202, response.text
+        job = response.json()
+        assert job["output"] == {"width": 768, "height": 1344, "num_frames": 362, "fps": 24, "duration_seconds": 15.083333}
+        sizes = job["condition_sizes"]
+        assert sizes[0] == {"width": 512, "height": 512}
+        assert (sizes[1]["width"], sizes[1]["height"], sizes[1]["frames"], sizes[1]["seconds"]) == (64, 48, 72, 3.0)
+        assert sizes[1]["audio"]["channels"] == 2 and sizes[2]["channels"] == 1 and sizes[2]["seconds"] == 4.0
+        # Only a decode finds these: too short, too many channels, a silent video_audio, a broken file.
+        for index, data, kind, message in ((1, media_samples.mp4(1.5), "video", "2-15 s"),
+                                           (2, media_samples.wav(4, channels=6), "audio", "mono or stereo"),
+                                           (1, media_samples.mp4(3, audio_channels=0), "video_audio", "soundtrack"),
+                                           (1, b"\0\0\0\x20ftypisom" + b"\0" * 64, "video", "could not be decoded")):
+            conditions = list(body["conditions"])
+            conditions[index] = ref(kind, data)
+            response = client.post("/v1/videos", json={**body, "conditions": conditions}, headers=AUTH)
+            assert response.status_code == 422 and message in response.text, response.text
+            assert response.json()["detail"][0]["loc"][:3] == ["body", "conditions", index]
+    gpu_job = service.job_from_record(state.next_command(), tmp_path)
+    assert [(kind, Path(path).name) for kind, path in gpu_job["references"]] == [
+        ("image", f"{key}.keyframe0.png"), ("video_audio", f"{key}.keyframe1.mp4"), ("audio", f"{key}.keyframe2.wav")]
+    assert [Path(path).read_bytes() for _, path in gpu_job["references"]] == [picture, clip, voice]
+    assert gpu_job["output"]["num_frames"] == 362
