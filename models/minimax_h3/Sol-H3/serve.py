@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""One resident, authenticated T2V and first-frame I2V worker per torchrun process group.
+"""One resident, authenticated MiniMax-H3 worker per torchrun process group: T2V and first-frame I2V, or Ref2VA
+when its adapter profile is a Ref2VA one.
 
 Requests use the original {prompt, duration, seed} form or the SGLang MiniMax-H3 form (see h3_request.py).
 
@@ -31,8 +32,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from h3_request import (LEGACY_NUM_FRAMES, MAX_BODY_BYTES, MAX_NUM_FRAMES, VALID_NUM_FRAMES, GenerateRequest,
-                        RequestError, capabilities, inspect_image, output_profile, parse_request,
+from h3_request import (LEGACY_NUM_FRAMES, MAX_BODY_BYTES, MAX_NUM_FRAMES, VALID_NUM_FRAMES, WORKER_TASKS,
+                        GenerateRequest, RequestError, capabilities, inspect_image, output_profile, parse_request,
                         resolve_canvas_size, same_request)
 from output_publication import (OutputPublisher, PublicationTask, encoder_timings, finish_output, freeze,
                                 partial_path, storage_error_message)
@@ -123,7 +124,8 @@ class WorkerState:
     """Rank zero's jobs: the admission queue, the job on the GPU (``active``), the job whose MP4 is
     published in the background (``publishing``, async mode only), and the durable records."""
 
-    def __init__(self, output_dir, *, capacity=8, min_free_gib=20, metadata=None, max_num_frames=MAX_NUM_FRAMES):
+    def __init__(self, output_dir, *, capacity=8, min_free_gib=20, metadata=None, max_num_frames=MAX_NUM_FRAMES,
+                 tasks=WORKER_TASKS["t2v"]):
         self.root = Path(output_dir)
         self.root.mkdir(parents=True, exist_ok=True)
         self.pending = queue.Queue(maxsize=capacity)
@@ -136,7 +138,8 @@ class WorkerState:
         self.completed = 0
         self.min_free_bytes = min_free_gib * 2**30
         self.max_num_frames = max_num_frames
-        self.metadata = {**(metadata or {}), "api": capabilities(max_num_frames)}
+        self.tasks = tuple(tasks)
+        self.metadata = {**(metadata or {}), "api": capabilities(max_num_frames, self.tasks)}
         self.records = {}  # Accepted requests remain readable during an I/O outage.
         self.dirty = {}
         self.held = None
@@ -230,7 +233,10 @@ class WorkerState:
     def submit(self, request, job_id=None):
         """Admit a validated request (a ParsedRequest, or a legacy GenerateRequest)."""
         parsed = request if hasattr(request, "identity") else read_request_body(request.model_dump())
-        # Decode keyframes outside the lock: it is CPU work, and /healthz shares the lock.
+        if parsed.task not in self.tasks:
+            raise HTTPException(422, [{"loc": ["body", "task"], "type": "value_error",
+                                       "msg": f"this worker serves {list(self.tasks)}, not {parsed.task}"}])
+        # Decode keyframes and references outside the lock: it is CPU work, and /healthz shares the lock.
         sizes = []
         for index, data in enumerate(parsed.images):
             try:
@@ -470,13 +476,27 @@ def stop_after_error(rank, state, publisher, *, async_publication, serving):
 
 
 def job_from_record(record, output_dir):
-    """What a GPU job needs from a queued record; legacy records carry only a duration."""
+    """What a GPU job needs from a queued record; legacy records carry only a duration. Ref2VA references are
+    stored like keyframes, in request order (``<id>.keyframe<i>.<format>``)."""
     output = record.get("output") or legacy_output(record["duration"])
-    image = None
-    if record.get("conditions"):
-        condition = record["conditions"][0]
-        image = str(Path(output_dir) / f"{record['id']}.keyframe0.{condition['format']}")
-    return {"prompt": record["prompt"], "seed": record["seed"], "output": output, "image": image}
+    image = references = None
+    conditions = record.get("conditions") or []
+    paths = [str(Path(output_dir) / f"{record['id']}.keyframe{index}.{condition['format']}")
+             for index, condition in enumerate(conditions)]
+    if record.get("task") == "ref2va":
+        references = paths
+    elif paths:
+        image = paths[0]
+    return {"prompt": record["prompt"], "seed": record["seed"], "output": output, "image": image,
+            "references": references}
+
+
+def warmup_reference():
+    """A deterministic 512x512 picture for a Ref2VA worker's warmups, which need a reference like any request."""
+    from PIL import Image
+
+    channels = [Image.radial_gradient("L"), Image.linear_gradient("L"), Image.linear_gradient("L").rotate(90)]
+    return Image.merge("RGB", channels).resize((512, 512))
 
 
 class JobExecutor:
@@ -680,7 +700,8 @@ def parse_args(argv=None):
     parser.add_argument("--model", required=True)
     parser.add_argument("--adapter-profile",
                         help="Adapter profile from adapter_profiles.json: the LoRA plus its forward count, flow shifts "
-                             "and strength (default: the T2V/I2V default, FastH3)")
+                             "and strength (default: the T2V/I2V default, FastH3). A Ref2VA-only profile makes a "
+                             "Ref2VA worker")
     parser.add_argument("--adapter", type=Path,
                         help="Adapter file (default: the profile's file below the directory that holds --model)")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -716,13 +737,22 @@ def parse_args(argv=None):
     if setting and (setting == "1") != args.async_publication:
         parser.error(f"--async-publication {'is missing' if setting == '1' else 'is set'} "
                      f"but H3_ASYNC_PUBLICATION={setting}")
-    from h3_runtime.adapters import get_profile
+    from h3_runtime.adapters import get_profile, load_profiles
 
     try:
-        # Resolve before loading anything: an unknown or Ref2VA-only profile is a launch error.
-        args.adapter_profile = get_profile(args.adapter_profile, task="t2v").name
+        # Resolve before loading anything: an unknown profile is a launch error. The profile decides the worker's
+        # task: T2V (with first-frame I2V), or Ref2VA for a Ref2VA-only profile.
+        if args.adapter_profile is None:
+            profile = get_profile(None, task="t2v")
+        else:
+            profile = load_profiles()[1].get(args.adapter_profile)
+            if profile is None:
+                raise ValueError(f"unknown adapter profile {args.adapter_profile!r}")
+        args.adapter_profile, args.task = profile.name, profile.worker_task
     except ValueError as error:
         parser.error(str(error))
+    if args.task == "ref2va" and args.attention_backend == "sol":
+        parser.error("a Ref2VA worker needs --attention-backend dense or sol_bsa")
     return args
 
 
@@ -742,7 +772,7 @@ def main():
     from h3_runtime import MiniMaxH3Inference
     from h3_runtime.adapters import get_profile
 
-    profile = get_profile(args.adapter_profile)
+    profile = get_profile(args.adapter_profile, task=args.task)
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -790,7 +820,8 @@ def main():
                                           "gpu": torch.cuda.get_device_name(device), "attention": args.attention_backend,
                                           "gate_failure_policy": args.gate_failure, "gate_each_request": gate,
                                           "duration_seconds": [5, 10], "width": 1344, "height": 768,
-                                          "fps": 24, "transformer_forwards": profile.transformer_forwards,
+                                          "fps": 24, "task": args.task,
+                                          "transformer_forwards": profile.transformer_forwards,
                                           # Replaced by the loaded file's details once the engine exists.
                                           "adapter": {"profile": profile.name},
                                           "encoder_threads": args.encoder_threads,
@@ -800,7 +831,7 @@ def main():
                                           # The running code: its directory and a digest of its Python sources.
                                           "release": {"code_dir": str(code_dir), "source_sha256": source_digest(code_dir)},
                                           "slurm_job_id": os.environ.get("SLURM_JOB_ID")},
-                                max_num_frames=args.max_num_frames)
+                                max_num_frames=args.max_num_frames, tasks=WORKER_TASKS[args.task])
             server = uvicorn.Server(uvicorn.Config(create_app(state, token), host=args.host, port=args.port,
                                                   access_log=False, log_level="info", limit_concurrency=64))
             server_thread = threading.Thread(target=server.run, name="http", daemon=True)
@@ -812,7 +843,7 @@ def main():
                 time.sleep(0.1)
 
         engine = MiniMaxH3Inference(args.model, args.adapter, attention_backend=args.attention_backend,
-                                    task="t2v", compute_quant="none", lora_mode="merged",
+                                    task=args.task, compute_quant="none", lora_mode="merged",
                                     weight_sharding=weight_sharding, adapter_profile=args.adapter_profile)
         if rank == 0:
             with state.lock:
@@ -849,8 +880,14 @@ def main():
 
         def generate(job):
             expected = job["output"]
+            references = job.get("references")
+            if references is not None:  # Ref2VA: image references in request order, EXIF-upright RGB
+                from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3Reference
+
+                references = [MiniMaxH3Reference(image=engine._load_image(item)) for item in references]
             return engine.generate(job["prompt"], num_frames=expected["num_frames"], height=expected["height"],
-                                   width=expected["width"], seed=job["seed"], image=job["image"])
+                                   width=expected["width"], seed=job["seed"], image=job["image"],
+                                   references=references)
 
         def metrics():
             memory = {"rank": rank, "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30,
@@ -880,6 +917,7 @@ def main():
                                state=state, publisher=publisher, transformer_forwards=engine.transformer_forwards)
 
         prompt = read_prompt(args.warmup_prompt_file)
+        references = [warmup_reference()] if args.task == "ref2va" else None
         warmups = []
         if rank == 0:
             state.phase = "warming"
@@ -895,7 +933,7 @@ def main():
                     try:
                         # Warmups always publish synchronously, so readiness follows complete outputs.
                         result = executor.execute({"prompt": prompt, "seed": 42, "output": legacy_output(duration),
-                                                   "image": None}, path)
+                                                   "image": None, "references": references}, path)
                         break
                     except OutputStorageError as error:
                         if rank == 0:

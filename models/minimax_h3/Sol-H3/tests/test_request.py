@@ -119,6 +119,62 @@ def test_fl2va_first_frame_follows_the_image_and_rejects_other_keyframes():
         assert message in rejected(body)[0]["msg"]
 
 
+def ref2va(*uris, **target):
+    body = {"task": "ref2va", "prompt": "<Subject 1> from <Picture 1> meets <Subject 2> from <Picture 2>.",
+            "conditions": [{"type": "image", "uri": uri, "role": "reference"} for uri in uris]}
+    if target:
+        body["target"] = target
+    return body
+
+
+def test_ref2va_takes_ordered_image_references():
+    person, toy = image_bytes(1024, 1024), image_bytes(640, 960, "JPEG")
+    parsed = parse_request(ref2va(data_uri(person), data_uri(toy, "image/jpeg")))
+    assert parsed.task == "ref2va" and parsed.images == [person, toy]  # request order is the <Picture n> order
+    assert parsed.canvas == (768, 1344) and parsed.num_frames == 124  # 16:9 and 5 s, as for t2va
+    assert [c["role"] for c in parsed.identity["conditions"]] == ["reference", "reference"]
+    assert [c["format"] for c in parsed.identity["conditions"]] == ["png", "jpg"]
+    assert all("uri" not in c and "frame_index" not in c for c in parsed.identity["conditions"])
+    assert [set(c) for c in parsed.payload["conditions"]] == [{"type", "uri", "role"}] * 2
+    assert parse_request(parsed.payload).identity == parsed.identity  # what the worker re-parses
+    assert parsed.resolve([(1024, 1024), (640, 960)])["width"] == 1344
+    # References are not frames: 'auto' is the Ref2VA pipeline's own 16:9 default.
+    assert parse_request(ref2va(data_uri(person), aspect_ratio="auto")).canvas == (768, 1344)
+    assert parse_request(ref2va(data_uri(person), aspect_ratio="9:16", duration_seconds=10)).canvas == (1344, 768)
+    with pytest.raises(RequestError) as wide:
+        parse_request(ref2va(data_uri(person), data_uri(toy))).resolve([(1024, 1024), (1000, 200)])
+    assert wide.value.detail[0]["loc"] == ["body", "conditions", 1, "uri"]
+    uri = data_uri(person)
+    assert "at least one" in rejected(ref2va())[0]["msg"]
+    assert "at most 9" in rejected(ref2va(*[uri] * 10))[0]["msg"]
+    for change, message in ((("role", "keyframe"), "role 'reference'"), (("frame_index", 0), "omit frame_index"),
+                            (("type", "video"), "image references only"), (("type", "audio"), "image references only"),
+                            (("uri", "https://example.com/a.png"), "base64")):
+        body = ref2va(uri)
+        body["conditions"][0][change[0]] = change[1]
+        assert message in rejected(body)[0]["msg"]
+    # A first-frame request is still the fl2va form, and t2va still takes no conditions.
+    assert parse_request(fl2va(uri)).payload["conditions"][0]["frame_index"] == 0
+    rejected({**ref2va(uri), "task": "t2va"})
+
+
+def test_capabilities_follow_the_worker_tasks():
+    t2v = h3_request.capabilities()
+    assert t2v["tasks"] == ["t2va", "fl2va"] and t2v["keyframe_frame_indices"] == [[0]]
+    assert list(t2v) == ["version", "tasks", "aspect_ratios", "short_edges", "keyframe_frame_indices", "fps",
+                         "num_frames", "image_formats", "max_image_bytes"]  # unchanged for T2V workers
+    ref = h3_request.capabilities(345, h3_request.WORKER_TASKS["ref2va"])
+    assert ref["tasks"] == ["ref2va"] and "keyframe_frame_indices" not in ref
+    assert ref["reference_types"] == ["image"] and ref["max_references"] == 9
+    parsed_ref = parse_request(ref2va(data_uri(image_bytes(64, 64))))
+    parsed_t2v = parse_request({"task": "t2va", "prompt": "x"})
+    legacy = parse_request({"prompt": "x"})
+    assert h3_request.accepts(ref, parsed_ref) and not h3_request.accepts(t2v, parsed_ref)
+    assert h3_request.accepts(t2v, parsed_t2v) and not h3_request.accepts(ref, parsed_t2v)
+    assert h3_request.accepts(t2v, legacy) and h3_request.accepts(None, legacy)  # pre-v2 workers serve it
+    assert not h3_request.accepts(ref, legacy)
+
+
 @pytest.mark.parametrize("uri", ["https://example.com/a.png", "file:///tmp/a.png", "/tmp/a.png",
                                  "data:image/png,notbase64", "data:text/plain;base64,aGVsbG8=",
                                  "data:image/png;base64,***", "data:image/png;base64," + base64.b64encode(b"GIF89a").decode()])

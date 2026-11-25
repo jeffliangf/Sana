@@ -45,9 +45,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--reference-image-resize-mode",
-        choices=("match", "diffusers"),
-        default="match",
-        help="Ref2VA image sizing: fast match mode (default) or official Diffusers 2048 mode",
+        choices=("match", "diffusers", "short_edge"),
+        help="Ref2VA image sizing: the adapter profile's trained short edge when it sets one (short_edge), "
+             "otherwise fast match mode; diffusers is the official 2048 mode",
     )
     parser.add_argument("--duration", type=int, choices=(5, 10, 15), required=True)
     parser.add_argument("--seed", type=int, default=0)
@@ -138,7 +138,7 @@ def main() -> int:
                         "lora_mode": args.lora_mode,
                         "adapter": engine.adapter,
                         "reference_image_resize_mode": (
-                            args.reference_image_resize_mode if args.task == "ref2va" else None
+                            engine.reference_image_resize_mode if args.task == "ref2va" else None
                         ),
                         "inference_s": round(result.elapsed_s, 3),
                     },

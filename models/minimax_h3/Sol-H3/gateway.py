@@ -22,7 +22,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from h3_request import (API_VERSION, MAX_BODY_BYTES, GenerateRequest, accepts, capabilities, same_request,
+from h3_request import (API_VERSION, MAX_BODY_BYTES, TASKS, GenerateRequest, accepts, capabilities, same_request,
                         sglang_status)
 from serve import atomic_json, caller_job_id, read_request_body
 from service_storage import check_space, storage_probe
@@ -209,7 +209,9 @@ class Gateway:
         # Advertise the SGLang-form contract only while upgraded workers can serve it.
         upgraded = [h["api"] for h in ready.values()
                     if isinstance(h.get("api"), dict) and h["api"].get("version", 0) >= API_VERSION]
-        api = ({**capabilities(max(a["num_frames"]["max"] for a in upgraded)), "workers": len(upgraded)}
+        # The tasks some ready worker serves (T2V workers: t2va and fl2va; Ref2VA workers: ref2va).
+        tasks = [task for task in TASKS if any(task in a.get("tasks", ()) for a in upgraded)]
+        api = ({**capabilities(max(a["num_frames"]["max"] for a in upgraded), tasks), "workers": len(upgraded)}
                if upgraded else {"version": 1, "tasks": ["t2va"], "workers": 0})
         return {"status": "storage_paused" if not storage_ready else ("ready" if ready else "unavailable"),
                 "service": "Sol-H3 gateway", "idempotency_key": True, "api": api,
@@ -354,6 +356,13 @@ class Gateway:
                               and h.get("queued", 0) < h["queue_capacity"]]
                 if not candidates:
                     if self.ready and not capable:
+                        # Workers that publish their tasks and none serves this one: another gateway serves it
+                        # (the Ref2VA gateway serves ref2va only, the main one t2va and fl2va), so do not retry.
+                        published = [h["api"].get("tasks", ()) for h in self.ready.values()
+                                     if isinstance(h.get("api"), dict) and h["api"].get("version", 0) >= API_VERSION]
+                        served = [task for task in TASKS if any(task in tasks for tasks in published)]
+                        if published and parsed.task not in served:
+                            raise HTTPException(422, f"This gateway serves {served}, not {parsed.task}")
                         raise HTTPException(503, f"No ready worker accepts {parsed.task} with {parsed.num_frames} "
                                                  "frames yet", headers={"Retry-After": "5"})
                     code = next(iter(rejections)) if len(rejections) == 1 else (429 if capable else 503)

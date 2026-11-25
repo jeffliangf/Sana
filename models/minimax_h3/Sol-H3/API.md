@@ -65,8 +65,9 @@ Returns `status` (`ready`, `unavailable`, or `storage_paused`), `idempotency_key
 `queue_capacity`, `jobs_pending`, and storage diagnostics. `api` describes the
 request contract the ready workers serve: `tasks`, `aspect_ratios`,
 `short_edges`, `num_frames` (`min`, `max`, `step`), `image_formats`,
-`max_image_bytes`, and `workers` (how many accept the SGLang form). During a
-rolling upgrade `api.version` is 1 and only the original form is served.
+`max_image_bytes`, and `workers` (how many accept the SGLang form); a Ref2VA
+gateway adds `reference_types` and `max_references`. During a rolling upgrade
+`api.version` is 1 and only the original form is served.
 
 ### `POST /v1/videos`
 
@@ -99,11 +100,11 @@ MiniMax-H3 cookbook, restricted to what this deployment runs.
 
 | Field | Type | Rules | Default |
 |---|---|---|---|
-| `task` | string | `t2va` (text only) or `fl2va` (text and a first frame); `ref2va` is rejected | required |
+| `task` | string | `t2va` (text only) or `fl2va` (text and a first frame) on this gateway; `ref2va` (text and reference images) on the [Ref2VA gateway](#ref2va). A gateway answers a task its workers do not serve with a 422 | required |
 | `prompt` | string | 1–16,000 characters, not only whitespace | required |
-| `conditions` | array | `t2va`: empty. `fl2va`: exactly one `{"type": "image", "role": "keyframe", "frame_index": 0, "uri": ...}` | `[]` |
+| `conditions` | array | `t2va`: empty. `fl2va`: exactly one `{"type": "image", "role": "keyframe", "frame_index": 0, "uri": ...}`. `ref2va`: 1–9 `{"type": "image", "role": "reference", "uri": ...}` in prompt order, without `frame_index` | `[]` |
 | `conditions[].uri` | string | A base64 image: `data:image/png;base64,...` (or `image/jpeg`, `image/webp`), or SGLang's `base64://...`. PNG, JPEG, or WebP; at most 20 MiB; sides of 32–8,192 pixels; at most 40 million pixels | required |
-| `target.aspect_ratio` | string | `auto`, `21:9`, `16:9`, `4:3`, `1:1`, `3:4`, or `9:16` | `16:9` for `t2va`, `auto` for `fl2va` |
+| `target.aspect_ratio` | string | `auto`, `21:9`, `16:9`, `4:3`, `1:1`, `3:4`, or `9:16`; for `ref2va`, `auto` is 16:9 | `16:9` for `t2va` and `ref2va`, `auto` for `fl2va` |
 | `target.duration_seconds` | number | 4–15; converted to frames as described below, and the result must be 124–345 frames | `5.0` |
 | `target.short_edge` | integer | `768` | `768` |
 | `seed` | integer or null | 0 to 2^63−1 | `42` |
@@ -469,10 +470,39 @@ about 2,000–5,000 characters.
 Jobs cannot be found by prompt, so save the key before every POST. For access,
 the token, large batches, and incidents, contact the deployment owner, Jeff.
 
+## Ref2VA
+
+A separate gateway serves reference-to-video with audio from the eight-step
+[SMD-MiniMax-H3-Ref2VA-8step](https://huggingface.co/zjwfufu/SMD-MiniMax-H3-Ref2VA-8step)
+adapter on MiniMax-H3's `transformer_ref`. Its workers serve `ref2va` only, and
+this page's other rules (authentication, jobs, idempotency, downloads, frames,
+aspect ratios) apply unchanged. Its URL and token differ from this gateway's;
+the [deployment runbook](DEPLOYMENT.md#ref2va-gateway) says where they are.
+
+- **References.** 1–9 images, each `{"type": "image", "role": "reference",
+  "uri": "data:image/png;base64,..."}`, in the order the prompt names them:
+  `<Picture 1>` is the first condition. They define appearance, not the first
+  frame. Each image is at most 20 MiB and within 1:4 to 4:1, but the whole body
+  must fit in 28 MiB, so several references should be a few MiB each. They are
+  resized to a 512-pixel short edge, as the adapter was trained.
+- **Not yet.** Video and audio references (`type: "video"` or `"audio"`) get a
+  422.
+- **Prompts.** Write them in MiniMax-H3's reference format (`subject_definitions`,
+  `<Subject 1> is ... in <Picture 1>`, then the shot description), as in the
+  adapter's [example case](https://huggingface.co/zjwfufu/SMD-MiniMax-H3-Ref2VA-8step/blob/main/examples/case.json).
+
+```json
+{"task": "ref2va", "prompt": "subject_definitions:\n<Subject 1> is the man in <Picture 1>. ...", "seed": 42,
+ "target": {"aspect_ratio": "16:9", "duration_seconds": 5},
+ "conditions": [{"type": "image", "role": "reference", "uri": "data:image/png;base64,iVBORw0..."},
+                {"type": "image", "role": "reference", "uri": "data:image/png;base64,iVBORw0..."}]}
+```
+
 ## Changelog
 
 | Date | Change |
 |---|---|
+| 2026-11-23 | A separate [Ref2VA gateway](#ref2va) serves `ref2va` with image references (SMD-MiniMax-H3-Ref2VA-8step). This gateway is unchanged |
 | 2026-11-21 | The model behind the same URL is SMD-H3 E (eight steps) instead of FastH3 (four steps), with the same settings as songyang's SMD-E service. The same request and seed now give a different video than before. Generation takes about 1.6 times as long ([Capacity and latency](#capacity-and-latency)). Requests, responses, job fields, `/healthz`, and limits are unchanged |
 | 2026-11-09 | Additive job fields: `stage` while running, and timing diagnostics. Workers publish a video while generating the next. Status values, existing fields, and their meaning, including `processing_s`, are unchanged |
 | 2026-11-05 | The SGLang MiniMax-H3 request form: `t2va` and first-frame `fl2va` with base64 images, six aspect ratios or the image's own, 124–345 frames; `/v1/videos/{id}` and `/v1/videos/{id}/content`; `task`, `target`, `conditions`, and `output` on jobs; `api` in `/healthz`; 28 MiB request limit. The original form is unchanged |

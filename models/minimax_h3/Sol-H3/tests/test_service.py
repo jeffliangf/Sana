@@ -160,3 +160,50 @@ def test_sglang_form_t2va_and_first_frame_jobs(tmp_path):
 def json_text(value):
     import json
     return json.dumps(value)
+
+
+def test_ref2va_worker_admits_only_ordered_image_references(tmp_path):
+    import base64
+    import io
+
+    import pytest
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    def png(width, height, color):
+        buffer = io.BytesIO()
+        Image.new("RGB", (width, height), color).save(buffer, "PNG")
+        return buffer.getvalue()
+
+    images = [png(512, 512, (200, 40, 40)), png(400, 600, (40, 200, 40))]
+    body = {"task": "ref2va", "prompt": "<Picture 1> and <Picture 2>.", "seed": 7,
+            "conditions": [{"type": "image", "role": "reference",
+                            "uri": "data:image/png;base64," + base64.b64encode(data).decode()} for data in images]}
+    state = service.WorkerState(tmp_path, capacity=4, min_free_gib=0, tasks=("ref2va",))
+    state.phase = "ready"
+    with TestClient(service.create_app(state, TOKEN)) as client:
+        api = client.get("/healthz").json()["api"]
+        assert api["tasks"] == ["ref2va"] and api["reference_types"] == ["image"]
+        for other in ({"prompt": "A bird sings.", "duration": 5}, {"task": "t2va", "prompt": "x"}):
+            response = client.post("/v1/videos", json=other, headers=AUTH)
+            assert response.status_code == 422 and "ref2va" in response.text
+        key = str(uuid4())
+        response = client.post("/v1/videos", json=body, headers={**AUTH, "Idempotency-Key": key})
+        assert response.status_code == 202, response.text
+        job = response.json()
+        assert job["task"] == "ref2va" and job["output"]["width"] == 1344 and job["output"]["num_frames"] == 124
+        assert job["condition_sizes"] == [{"width": 512, "height": 512}, {"width": 400, "height": 600}]
+        assert "base64" not in json_text(job)
+        reordered = {**body, "conditions": body["conditions"][::-1]}
+        assert client.post("/v1/videos", json=reordered, headers={**AUTH, "Idempotency-Key": key}).status_code == 409
+    gpu_job = service.job_from_record(state.next_command(), tmp_path)
+    assert gpu_job["image"] is None and [Path(p).name for p in gpu_job["references"]] == [
+        f"{key}.keyframe0.png", f"{key}.keyframe1.png"]
+    assert [Path(p).read_bytes() for p in gpu_job["references"]] == images
+    reference = service.warmup_reference()
+    assert reference.size == (512, 512) and reference.mode == "RGB"
+    # A T2V worker keeps its contract and turns Ref2VA away.
+    t2v, t2v_client = make_client(tmp_path / "t2v")
+    t2v.phase = "ready"
+    assert t2v_client.post("/v1/videos", json=body, headers=AUTH).status_code == 422
+    assert service.job_from_record({"id": "x", "prompt": "p", "seed": 1, "duration": 5}, tmp_path)["references"] is None

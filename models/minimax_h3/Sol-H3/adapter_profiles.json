@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "about": "Few-step adapters a worker can merge into MiniMax-H3, each with the sampling settings its authors recommend. A worker serves one profile for life (serve.py --adapter-profile, deploy env H3_ADAPTER_PROFILE). 'file' is relative to the checkpoint root (the directory holding MiniMax-H3/). 'alpha' is set only for files that embed none; otherwise the loader reads per-layer alpha tensors, then the file's metadata alpha, and FastVideo hybrid files use their rank. 'final_step_size_scale' (default 1) shortens the last step as SMD's sampler does. 'source' is a Hugging Face file (repo, path, revision) or, for a file delivered outside the Hub, 'copy_from': its shared path.",
+  "about": "Few-step adapters a worker can merge into MiniMax-H3, each with the sampling settings its authors recommend. A worker serves one profile for life (serve.py --adapter-profile, deploy env H3_ADAPTER_PROFILE); a Ref2VA-only profile makes it a Ref2VA worker. 'file' is relative to the checkpoint root (the directory holding MiniMax-H3/). 'alpha' is set only for files that embed none; otherwise the loader reads per-layer alpha tensors, then the file's metadata alpha, and FastVideo hybrid files use their rank. 'final_step_size_scale' (default 1) shortens the last step as SMD's sampler does. 'reference_image_short_edge' (Ref2VA only) is the short edge reference images were trained at; without it the engine's reference resize mode applies. 'source' is a Hugging Face file (repo, path, revision) or, for a file delivered outside the Hub, 'copy_from': its shared path.",
   "defaults": {
     "t2v": "fasth3-dense-datafree",
     "i2v": "fasth3-dense-datafree",
@@ -21,6 +21,24 @@
       "strength": 1.0,
       "alpha": null,
       "reference": "SMD release sampling.json (8 steps, final_step_size_scale 0.5, shifts 12/3) and raw_sigma_grid in its tools/infer_minimax_h3.py; the delivery README: a drop-in for smd_lora.safetensors, rank and alpha 192 in the file metadata, base MiniMax-H3 939557dc (same weights as 42ed227e)"
+    },
+    "smd-ref2va-8step": {
+      "description": "SMD-MiniMax-H3-Ref2VA-8step: 8-step SMD student for reference-guided video and audio (image references), a LoRA on transformer_ref",
+      "tasks": ["ref2va"],
+      "file": "SMD-MiniMax-H3-Ref2VA-8step/smd_lora.safetensors",
+      "source": {"repo": "zjwfufu/SMD-MiniMax-H3-Ref2VA-8step",
+                 "path": "smd_lora.safetensors",
+                 "revision": "43c63243aeac06216e1bfb2143c21b0e1679090f"},
+      "bytes": 1383677792,
+      "sha256": "f8aabc9258d443a5c04833a637246ecb3551cb53847e5aba1ef4a00b444e462c",
+      "transformer_forwards": 8,
+      "video_shift": 12.0,
+      "audio_shift": 3.0,
+      "final_step_size_scale": 0.5,
+      "reference_image_short_edge": 512,
+      "strength": 1.0,
+      "alpha": null,
+      "reference": "https://huggingface.co/zjwfufu/SMD-MiniMax-H3-Ref2VA-8step: sampling.json (8 steps, final_step_size_scale 0.5, shifts 12/3, transformer_ref, base 939557dc = 42ed227e weights) and infer.py (--reference-image-short-edge 512); rank and alpha 128 in the file metadata"
     },
     "fasth3-dense-datafree": {
       "description": "FastVideo FastH3 4-step Preview v1, dense attention, data-free (prompt-only DMD2); trained for text-to-video",

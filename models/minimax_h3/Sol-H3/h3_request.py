@@ -4,14 +4,17 @@ Two request forms are accepted on ``POST /v1/videos``:
 
 * The original Sol-H3 form, ``{"prompt", "duration": 5|10, "seed"}``. It is unchanged.
 * The SGLang MiniMax-H3 form, ``{"task", "prompt", "conditions", "target", "seed"}``, as
-  served by ``sglang serve --model-variant fl2va``. This deployment serves ``t2va`` and
-  first-frame ``fl2va``; it rejects the parts of that contract it cannot run (``ref2va``,
-  last-frame keyframes, non-768 short edges, and per-request sampler settings).
+  served by ``sglang serve --model-variant fl2va`` or ``ref2va``. A T2V worker serves ``t2va``
+  and first-frame ``fl2va``; a Ref2VA worker serves ``ref2va`` with up to nine ordered image
+  references (``role: "reference"``). Both reject the parts of that contract they cannot run
+  (last-frame keyframes, video and audio references, non-768 short edges, and per-request
+  sampler settings). Each worker publishes its tasks in /healthz ``api.tasks``.
 
 Geometry follows MiniMax-H3 itself: a 768-pixel short edge with the area capped at
 1344x768, both axes rounded to multiples of 32, and frame counts snapped up to the
 ``17 * n + 5`` lengths its video VAE decodes. ``target.aspect_ratio: "auto"`` takes the
-canvas from the first keyframe, as the base pipeline does without an explicit size.
+canvas from the first keyframe, as the base pipeline does without an explicit size; for
+``ref2va`` it is 16:9, the Ref2VA pipeline's own default (references are not frames).
 
 This module must stay importable without torch or Pillow: the gateway has neither.
 """
@@ -40,7 +43,10 @@ MIN_DURATION_SECONDS, MAX_DURATION_SECONDS = 4.0, 15.0  # SGLang's accepted requ
 LEGACY_NUM_FRAMES = {5: 124, 10: 243}
 DEFAULT_ASPECT_RATIO = "16:9"  # 1344x768
 ASPECT_RATIOS = ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16")
-TASKS = ("t2va", "fl2va")
+TASKS = ("t2va", "fl2va", "ref2va")
+# What a worker serves, by its engine task (the adapter profile's): T2V workers also run first-frame I2V.
+WORKER_TASKS = {"t2v": ("t2va", "fl2va"), "ref2va": ("ref2va",)}
+MAX_REFERENCE_IMAGES = 9  # MiniMax-H3 Ref2VA's limit
 # About 3,500 Qwen tokens of English or 12,300 of Chinese. The model has no limit of its own: the text encoder
 # reads the whole prompt and each token becomes one DiT row, next to about 104,000 rows for a 345-frame clip.
 MAX_PROMPT_CHARS = 16000
@@ -66,12 +72,17 @@ UNSUPPORTED_FIELDS = {
 }
 
 
-def capabilities(max_num_frames=MAX_NUM_FRAMES):
-    """What a worker built from this module accepts; published in /healthz as ``api``."""
-    return {"version": API_VERSION, "tasks": list(TASKS), "aspect_ratios": ["auto", *ASPECT_RATIOS],
-            "short_edges": [SHORT_EDGE], "keyframe_frame_indices": [[0]], "fps": FPS,
-            "num_frames": {"min": MIN_NUM_FRAMES, "max": int(max_num_frames), "step": FRAME_STEP},
-            "image_formats": sorted(IMAGE_FORMATS.values()), "max_image_bytes": MAX_IMAGE_BYTES}
+def capabilities(max_num_frames=MAX_NUM_FRAMES, tasks=WORKER_TASKS["t2v"]):
+    """What a worker serving ``tasks`` accepts; published in /healthz as ``api``."""
+    api = {"version": API_VERSION, "tasks": list(tasks), "aspect_ratios": ["auto", *ASPECT_RATIOS],
+           "short_edges": [SHORT_EDGE]}
+    if "fl2va" in tasks:
+        api["keyframe_frame_indices"] = [[0]]
+    api.update({"fps": FPS, "num_frames": {"min": MIN_NUM_FRAMES, "max": int(max_num_frames), "step": FRAME_STEP},
+                "image_formats": sorted(IMAGE_FORMATS.values()), "max_image_bytes": MAX_IMAGE_BYTES})
+    if "ref2va" in tasks:
+        api.update(reference_types=["image"], max_references=MAX_REFERENCE_IMAGES, max_body_bytes=MAX_BODY_BYTES)
+    return api
 
 
 class RequestError(Exception):
@@ -218,11 +229,14 @@ class GenerateRequest(BaseModel):
 
 
 class KeyframeCondition(BaseModel):
+    """A keyframe (``fl2va``: role ``keyframe`` with a ``frame_index``) or a reference (``ref2va``: role
+    ``reference``, no ``frame_index``)."""
+
     model_config = ConfigDict(extra="forbid", strict=True)
     type: str
     uri: str = Field(min_length=1)
     role: str
-    frame_index: int
+    frame_index: int | None = None
 
 
 class VideoTarget(BaseModel):
@@ -275,6 +289,11 @@ class ParsedRequest:
     def resolve(self, image_sizes=()):
         """The output profile once keyframe sizes (EXIF-upright ``(width, height)``) are known."""
         canvas = self.canvas
+        if self.task == "ref2va":
+            for index, (width, height) in enumerate(image_sizes):
+                if width > 4 * height or height > 4 * width:
+                    raise _invalid(_error(("conditions", index, "uri"),
+                                          f"a reference image must be within 1:4 and 4:1, got {width}x{height}"))
         if canvas is None:
             width, height = image_sizes[0]
             try:
@@ -310,9 +329,7 @@ def parse_request(payload):
 
     errors = []
     task = request.task.strip().lower()
-    if task == "ref2va":
-        errors.append(_error(("task",), "ref2va needs the MiniMax-H3 Ref2VA checkpoint, which this deployment does not serve"))
-    elif task not in TASKS:
+    if task not in TASKS:
         errors.append(_error(("task",), f"task must be one of {list(TASKS)}"))
     for name in ("num_outputs_per_prompt", "n"):
         if getattr(request, name) not in (None, 1):
@@ -365,6 +382,30 @@ def parse_request(payload):
             images.append(data)
             conditions.append({"type": "image", "role": "keyframe", "frame_index": 0, "format": kind,
                                "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+    elif task == "ref2va":
+        if not request.conditions:
+            errors.append(_error(("conditions",), "ref2va needs at least one reference image"))
+        elif len(request.conditions) > MAX_REFERENCE_IMAGES:
+            errors.append(_error(("conditions",), f"ref2va takes at most {MAX_REFERENCE_IMAGES} reference images"))
+        # Order matters: the prompt names references as <Picture 1>, <Picture 2>, ... in this order.
+        for index, condition in enumerate(request.conditions[:MAX_REFERENCE_IMAGES]):
+            location = ("conditions", index)
+            if condition.role != "reference":
+                errors.append(_error((*location, "role"), "ref2va conditions must have role 'reference'"))
+            if condition.frame_index is not None:
+                errors.append(_error((*location, "frame_index"), "a reference is not a keyframe; omit frame_index"))
+            if condition.type != "image":
+                errors.append(_error((*location, "type"), "this deployment takes image references only; video and "
+                                                          "audio references are not supported yet"))
+                continue
+            try:
+                data, kind = decode_image_uri(condition.uri)
+            except ValueError as error:
+                errors.append(_error((*location, "uri"), str(error)))
+                continue
+            images.append(data)
+            conditions.append({"type": "image", "role": "reference", "format": kind,
+                               "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
     if errors:
         raise _invalid(*errors)
 
@@ -373,7 +414,8 @@ def parse_request(payload):
     identity = {"task": task, "prompt": request.prompt, "seed": seed, "target": resolved_target,
                 "conditions": conditions}
     forwarded = {"task": task, "prompt": request.prompt, "seed": seed, "target": resolved_target,
-                 "conditions": [{"type": c.type, "uri": c.uri, "role": c.role, "frame_index": c.frame_index}
+                 "conditions": [{"type": c.type, "uri": c.uri, "role": c.role,
+                                 **({"frame_index": c.frame_index} if c.frame_index is not None else {})}
                                 for c in request.conditions]}
     canvas = None if aspect_ratio == "auto" and task == "fl2va" else resolve_canvas_size(
         *map(int, (aspect_ratio if aspect_ratio != "auto" else DEFAULT_ASPECT_RATIO).split(":")))
@@ -383,9 +425,10 @@ def parse_request(payload):
 
 def accepts(api, parsed):
     """Whether a worker's published capabilities cover a request."""
-    if parsed.legacy:
-        return True
-    if not isinstance(api, dict) or api.get("version", 0) < API_VERSION:
+    upgraded = isinstance(api, dict) and api.get("version", 0) >= API_VERSION
+    if parsed.legacy:  # text to video; every worker before API v2 serves it
+        return not upgraded or "t2va" in api.get("tasks", ())
+    if not upgraded:
         return False
     frames = api.get("num_frames") or {}
     return parsed.task in api.get("tasks", ()) and frames.get("min", 0) <= parsed.num_frames <= frames.get("max", 0)

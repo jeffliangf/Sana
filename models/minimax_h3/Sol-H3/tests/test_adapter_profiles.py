@@ -16,6 +16,7 @@ def test_checked_in_profiles_carry_the_recommended_settings():
                         "ref2va": "lightx2v-ref2v-4step-v0.1"}
     expected = {  # name: (forwards, video shift, audio shift, final step scale, strength, explicit alpha)
         "smd-e-8step": (8, 12.0, 3.0, 0.5, 1.0, None),
+        "smd-ref2va-8step": (8, 12.0, 3.0, 0.5, 1.0, None),
         "fasth3-dense-datafree": (4, 12.0, 3.0, 1.0, 1.0, None),
         "lightx2v-fl2v-4step-v1.2": (4, 6.0, 3.0, 1.0, 1.0, None),
         "lightx2v-fl2v-4step-v1.3": (4, 6.0, 3.0, 1.0, 1.0, None),
@@ -54,6 +55,34 @@ def test_smd_profile_samples_the_release_schedule():
     # Even steps keep the scheduler's own grid, so the existing profiles sample exactly as before.
     assert adapters.get_profile("fasth3-dense-datafree").sigmas(12.0) is None
     assert adapters.raw_sigma_grid(4, 1.0) == [1.0, 0.75, 0.5, 0.25, 0.0]
+
+
+def test_smd_ref2va_profile_matches_its_release():
+    profile = adapters.get_profile("smd-ref2va-8step", task="ref2va")
+    assert profile.tasks == ("ref2va",) and profile.worker_task == "ref2va"
+    assert profile.reference_image_short_edge == 512  # the release's infer.py: --reference-image-short-edge 512
+    assert profile.sigmas(12.0) == [12.0 * s / (1 + 11.0 * s) for s in SMD_RAW_SIGMAS]
+    assert profile.sha256 == "f8aabc9258d443a5c04833a637246ecb3551cb53847e5aba1ef4a00b444e462c"
+    assert profile.source["repo"] == "zjwfufu/SMD-MiniMax-H3-Ref2VA-8step"
+    assert profile.summary()["reference_image_short_edge"] == 512
+    # Profiles without the field report exactly what they did before.
+    assert "reference_image_short_edge" not in adapters.get_profile("smd-e-8step", task="t2v").summary()
+    assert adapters.get_profile("smd-e-8step", task="t2v").worker_task == "t2v"
+    assert adapters.get_profile("lightx2v-ref2v-4step-v0.1", task="ref2va").reference_image_short_edge is None
+
+
+def test_reference_short_edge_is_a_ref2va_multiple_of_32(tmp_path):
+    path = write_profiles(tmp_path)
+    data = json.loads(path.read_text())
+    data["profiles"]["r"]["reference_image_short_edge"] = 512
+    path.write_text(json.dumps(data))
+    assert adapters.get_profile("r", task="ref2va", path=path).reference_image_short_edge == 512
+    for value, profile in ((500, "r"), (0, "r"), (True, "r"), (512.0, "r"), (512, "x")):
+        data = json.loads(write_profiles(tmp_path).read_text())
+        data["profiles"][profile]["reference_image_short_edge"] = value
+        path.write_text(json.dumps(data))
+        with pytest.raises(ValueError, match="reference_image_short_edge"):
+            adapters.load_profiles(path)
 
 
 def test_explicit_schedule_replaces_the_pipeline_step_count():
@@ -148,6 +177,12 @@ def test_serve_resolves_the_profile_before_loading_anything():
     assert serve.parse_args(REQUIRED).adapter_profile == "fasth3-dense-datafree"
     args = serve.parse_args(REQUIRED + ["--adapter-profile", "lightx2v-fl2v-4step-v1.3"])
     assert args.adapter_profile == "lightx2v-fl2v-4step-v1.3" and args.adapter is None
-    for name in ("lightx2v-ref2v-4step-v0.1", "no-such-profile"):
-        with pytest.raises(SystemExit):
-            serve.parse_args(REQUIRED + ["--adapter-profile", name])
+    assert args.task == "t2v"
+    with pytest.raises(SystemExit):
+        serve.parse_args(REQUIRED + ["--adapter-profile", "no-such-profile"])
+    # A Ref2VA-only profile makes a Ref2VA worker, which cannot use direct Sol attention.
+    with pytest.raises(SystemExit):
+        serve.parse_args(REQUIRED + ["--adapter-profile", "smd-ref2va-8step"])
+    for backend in ("dense", "sol_bsa"):
+        args = serve.parse_args(REQUIRED + ["--adapter-profile", "smd-ref2va-8step", "--attention-backend", backend])
+        assert (args.adapter_profile, args.task) == ("smd-ref2va-8step", "ref2va")

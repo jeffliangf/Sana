@@ -908,6 +908,31 @@ started to add capacity behind the H200 gateway during an RL run. The record is
     submission.
   - Admission is `tunnels-enabled`, then `pool_h100.py exclude` and `admit` on the gateway host.
 
+### Ref2VA gateway
+
+Ref2VA (`ref2va` with image references, the eight-step SMD-MiniMax-H3-Ref2VA-8step adapter) runs as a
+separate deployment, so nothing about it can reach the T2V/I2V gateway, its workers or its callers.
+
+- **Root.** `/home/jeff/sol-h3-ref2va` on the GMI `/home`: its own `deployment/token`, registry
+  (`deployment/<node>-p18090/node.json`), gateway state (`gateway/`), releases and record
+  (`deployment/ref2va-smd-20261123/`, with `launch.sh`, `submissions.json` and the validation).
+- **Worker.** A Ref2VA-only adapter profile makes a Ref2VA worker: `H3_ADAPTER_PROFILE=smd-ref2va-8step`
+  selects the task, `transformer_ref`, eight forwards with SMD's shortened last step, and the 512-pixel
+  reference short edge the adapter was trained at. It runs on four H100s with sharded weights and
+  `H3_ATTENTION_BACKEND=dense` (SMD's own sampler is dense; Sol BSA was never validated for Ref2VA on
+  SM90). Port 18090 on loopback, so its outputs stay apart from the T2V workers' `sol-h3-service/18080`.
+- **Checkpoints.** `H3_CHECKPOINT_ROOT=/var/tmp/jeff-sol-h3/sol-h3-checkpoints-ref2va` holds
+  `MiniMax-H3/transformer_ref` (copied and checked against the Hub's SHA-256 values, identical at
+  42ed227e and SMD's 939557dc), symlinks to the node's cached T2V components, and the adapter. The T2V
+  checkpoint root is not modified. `stage_node.py` in the record builds it in about 4 minutes.
+- **Gateway.** `gateway.py` from the same release runs inside the worker's allocation on
+  `127.0.0.1:18095`, with `--registry /home/jeff/sol-h3-ref2va/deployment`. GMI node addresses are public,
+  so nothing listens beyond loopback: callers reach it from a step in the allocation
+  (`srun --overlap --jobid <job>`) or through an SSH forward to the node. It stops with the allocation; its
+  jobs and videos stay in `gateway/` for the next start.
+- **Contract.** Its `/healthz` lists `api.tasks: ["ref2va"]`. A `t2va`, `fl2va` or legacy request gets a
+  422 there, as `ref2va` does on the T2V gateway ([API](API.md#ref2va)).
+
 ## Drain, stop, rollback
 
 Exclude the affected endpoints, stop direct callers, and wait for every accepted

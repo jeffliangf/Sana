@@ -32,6 +32,8 @@ class AdapterProfile:
     audio_shift: float
     strength: float = 1.0
     final_step_size_scale: float = 1.0
+    # Ref2VA: the short edge reference images are resized to (upscaling included), as the adapter was trained.
+    reference_image_short_edge: int | None = None
     alpha: float | None = None
     sha256: str | None = None
     bytes: int | None = None
@@ -59,7 +61,15 @@ class AdapterProfile:
         return {"profile": self.name, "transformer_forwards": self.transformer_forwards,
                 "video_shift": self.video_shift, "audio_shift": self.audio_shift,
                 "final_step_size_scale": self.final_step_size_scale, "strength": self.strength,
-                "alpha": self.alpha, "sha256": self.sha256, "source": self.source}
+                "alpha": self.alpha, "sha256": self.sha256, "source": self.source,
+                **({"reference_image_short_edge": self.reference_image_short_edge}
+                   if self.reference_image_short_edge is not None else {})}
+
+    @property
+    def worker_task(self) -> str:
+        """The engine task a worker with this profile runs: T2V (which also serves first-frame I2V) when the
+        profile supports it, otherwise Ref2VA."""
+        return "t2v" if "t2v" in self.tasks else self.tasks[0]
 
 
 def raw_sigma_grid(forwards: int, final_step_size_scale: float) -> list[float]:
@@ -114,6 +124,12 @@ def _profile(name: str, entry: dict) -> AdapterProfile:
             or not 0 < scale <= 1:
         raise ValueError(f"adapter profile {name}: 'final_step_size_scale' must be a number in (0, 1]")
     values["final_step_size_scale"] = float(scale)
+    short_edge = entry.get("reference_image_short_edge")
+    if short_edge is not None and (not isinstance(short_edge, int) or isinstance(short_edge, bool)
+                                   or not 32 <= short_edge <= 4096 or short_edge % 32 or "ref2va" not in tasks):
+        raise ValueError(f"adapter profile {name}: 'reference_image_short_edge' must be a multiple of 32 from 32 to "
+                         "4096, on a Ref2VA profile")
+    values["reference_image_short_edge"] = short_edge
     alpha = entry.get("alpha")
     if alpha is not None and (not isinstance(alpha, (int, float)) or isinstance(alpha, bool)
                               or not math.isfinite(alpha) or alpha <= 0):

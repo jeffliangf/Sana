@@ -147,7 +147,8 @@ def launch_settings(environ, root):
 def adapter_profiles(environ, code_dir, workers):
     """One adapter profile per worker from H3_ADAPTER_PROFILE: one name for every worker, or a comma-separated list
     with one name per worker (in port order). Unset means the code directory's T2V default (FastH3). Names are
-    checked against that directory's adapter_profiles.json, without importing the model runtime."""
+    checked against that directory's adapter_profiles.json, without importing the model runtime; a Ref2VA-only
+    profile makes that worker a Ref2VA worker."""
     path = Path(code_dir) / "h3_runtime/adapters.py"
     name = f"h3_adapter_profiles_{hashlib.sha256(str(path).encode()).hexdigest()[:16]}"
     spec = importlib.util.spec_from_file_location(name, path)
@@ -160,7 +161,18 @@ def adapter_profiles(environ, code_dir, workers):
         names *= workers
     if len(names) != workers:
         raise ValueError(f"H3_ADAPTER_PROFILE lists {len(names)} profiles for {workers} workers")
-    return [adapters.get_profile(name, task="t2v").name for name in names]
+    _, profiles = adapters.load_profiles()
+    resolved = []
+    for name in names:
+        profile = adapters.get_profile(None, task="t2v") if name is None else profiles.get(name)
+        if profile is None:
+            raise ValueError(f"unknown adapter profile {name!r}; known: {sorted(profiles)}")
+        # A Ref2VA-only profile makes a Ref2VA worker (serve.py), which cannot use direct Sol attention.
+        if profile.worker_task == "ref2va" and environ.get("H3_ATTENTION_BACKEND", "sol") == "sol":
+            raise ValueError(f"adapter profile {profile.name} makes a Ref2VA worker; set H3_ATTENTION_BACKEND to "
+                             "dense or sol_bsa")
+        resolved.append(profile.name)
+    return resolved
 
 
 GATE_POLICIES = ("dense", "off")

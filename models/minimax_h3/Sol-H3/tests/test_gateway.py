@@ -35,6 +35,7 @@ class Fleet:
         self.down = set()  # Refuse every connection.
         self.legacy = set()  # Predates job ID support.
         self.v1 = set()  # Predates the SGLang-form contract.
+        self.ref2va = set()  # Ref2VA workers: serve ref2va only.
         self.async_workers = set()  # Publish in the background: new health fields, a "publishing" stage.
         self.published = set()
         self.bodies = []
@@ -50,7 +51,8 @@ class Fleet:
             health = {"status": "ready", "gpus": 2, "queued": 0, "queue_capacity": 8,
                       "active_job": None, "idempotency_key": endpoint not in self.legacy}
             if endpoint not in self.v1:
-                health["api"] = h3_request.capabilities()
+                health["api"] = h3_request.capabilities(
+                    tasks=h3_request.WORKER_TASKS["ref2va" if endpoint in self.ref2va else "t2v"])
             if endpoint in self.async_workers:  # busy publishing an earlier video, with the GPU free
                 health.update(active_job=str(uuid4()), gpu_active_job=None, publishing_jobs=["earlier"],
                               publication_mode="async", publication_capacity=1, drained=False, fatal_error=None,
@@ -752,3 +754,40 @@ def test_http_sglang_routes_and_validation(tmp_path):
         assert client.get(f"/v1/videos/{job['id']}/content").status_code == 401
         assert client.get(f"/v1/videos/{job['id']}/content", headers=AUTH).content == fleet.media
         assert client.get(f"/v1/videos/{uuid4()}", headers=AUTH).status_code == 404
+
+
+def test_ref2va_requests_reach_only_ref2va_workers(tmp_path):
+    async def run():
+        fleet = Fleet()
+        fleet.ref2va.add(URLS[0])
+        router = make_gateway(tmp_path, fleet)
+        await router.refresh_pool()
+        assert router.health()["api"]["tasks"] == ["t2va", "fl2va", "ref2va"]
+        uri = "data:image/png;base64," + __import__("base64").b64encode(FAKE_PNG).decode()
+        body = {"task": "ref2va", "prompt": "<Picture 1> waves.", "conditions": [
+            {"type": "image", "role": "reference", "uri": uri}, {"type": "image", "role": "reference", "uri": uri}]}
+        for _ in range(3):
+            job = await router.submit(h3_request.parse_request(body))
+            assert router.load(job["id"])["worker"] == URLS[0]
+        assert fleet.bodies[-1]["conditions"] == body["conditions"]  # forwarded whole, in order
+        for _ in range(3):
+            legacy = await router.submit(gateway.GenerateRequest(prompt="old form"))
+            assert router.load(legacy["id"])["worker"] != URLS[0]
+            t2va = await router.submit(h3_request.parse_request({"task": "t2va", "prompt": "x"}))
+            assert router.load(t2va["id"])["worker"] != URLS[0]
+        fleet.ref2va.update(URLS)  # a Ref2VA-only gateway
+        await router.refresh_pool()
+        assert router.health()["api"]["tasks"] == ["ref2va"]
+        assert router.health()["api"]["reference_types"] == ["image"]
+        # A task no worker of this gateway serves is a permanent 422, not a retryable 503.
+        for request in (h3_request.parse_request({"task": "t2va", "prompt": "x"}), gateway.GenerateRequest(prompt="x")):
+            with pytest.raises(HTTPException) as error:
+                await router.submit(request)
+            assert error.value.status_code == 422 and "t2va" in error.value.detail
+        fleet.ref2va.clear()  # the main gateway turns ref2va away the same way
+        await router.refresh_pool()
+        with pytest.raises(HTTPException) as error:
+            await router.submit(h3_request.parse_request(body))
+        assert error.value.status_code == 422 and "ref2va" in error.value.detail
+        await router.client.aclose()
+    asyncio.run(run())

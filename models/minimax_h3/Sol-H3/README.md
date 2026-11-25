@@ -354,6 +354,7 @@ was distilled for. The AdaLN precompute fixes the step schedule on the first req
 | `lightx2v-fl2v-4step-v1.2`, `-v1.3` | LightX2V MiniMax-H3 Turbo FL2V 4-step | 4 | 6/3 | file alpha 8 at rank 128 |
 | `lightx2v-fl2v-8step-v1.2` | LightX2V MiniMax-H3 Turbo FL2V 8-step | 8 | 12/3 | per-layer alpha tensors |
 | `lightx2v-ref2v-4step-v0.1` | LightX2V Ref2VA 4-step | 4 | 12/3 | Ref2VA default |
+| `smd-ref2va-8step` | SMD-MiniMax-H3-Ref2VA-8step | 8 | 12/3 | last step x0.5; 512-pixel reference short edge; a worker with it serves `ref2va` (DEPLOYMENT.md, Ref2VA gateway) |
 | `smd-e-8step` | SMD-H3 E (`smd_h3_div16f_ck3`) | 8 | 12/3 | last step at half size (`final_step_size_scale` 0.5); production since 2026-11-21 |
 
 **LoRA alpha.** The loader never guesses alpha. It reads, in order: per-layer `.alpha` tensors, then the file's
@@ -608,7 +609,7 @@ torchrun --standalone --nproc_per_node=8 infer.py \
   --output output.mp4 --warmup
 ```
 
-Ref2VA accepts image, video, and audio references. Audio cannot be the only reference. Use `sol_bsa` (default) or `dense` for this task. Reference images use the validated fast `match` profile by default; pass `--reference-image-resize-mode diffusers` only when official 2048-short-edge preprocessing parity is required.
+Ref2VA accepts image, video, and audio references. Audio cannot be the only reference. Use `sol_bsa` (default) or `dense` for this task. Reference images follow the adapter profile's `reference_image_short_edge` when it sets one (`smd-ref2va-8step`: 512, as SMD trained), otherwise the validated fast `match` profile; pass `--reference-image-resize-mode diffusers` only when official 2048-short-edge preprocessing parity is required.
 
 Main options:
 
@@ -622,7 +623,7 @@ Main options:
 | `--prompt` / `--prompt-file` | Prompt text or UTF-8 prompt file |
 | `--image` | First frame for `i2v` |
 | `--reference` | Ordered `image:PATH`, `video:PATH`, or `audio:PATH` for `ref2va`; repeat as needed |
-| `--reference-image-resize-mode` | `match` (fast default) or `diffusers` (official 2048 mode) |
+| `--reference-image-resize-mode` | Default: the profile's short edge (`short_edge`) if it sets one, else `match` (fast); `diffusers` is the official 2048 mode |
 | `--seed` | Random seed |
 | `--output` | Output MP4 path |
 | `--warmup` | Warm up the selected duration and prompt before generation |

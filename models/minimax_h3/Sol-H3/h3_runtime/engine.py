@@ -30,7 +30,7 @@ VALID_NUM_FRAMES = frozenset(range(DURATION_FRAMES[5], DURATION_FRAMES[15] + 1, 
 CANVAS_MULTIPLE = 32
 ATTENTION_BACKENDS = {"dense", "sol", "sol_bsa"}
 TASKS = {"t2v", "i2v", "ref2va"}
-REFERENCE_IMAGE_RESIZE_MODES = {"match", "diffusers"}
+REFERENCE_IMAGE_RESIZE_MODES = {"match", "diffusers", "short_edge"}
 
 
 def _resolve_reference_image_size(
@@ -38,6 +38,7 @@ def _resolve_reference_image_size(
     height: int,
     *,
     mode: str,
+    short_edge: int | None = None,
 ) -> tuple[int, int]:
     """Resolve Ref2VA image geometry for the selected deployment profile."""
     if width <= 0 or height <= 0:
@@ -53,6 +54,13 @@ def _resolve_reference_image_size(
         # Official Diffusers parity mode. This intentionally upscales every
         # reference image to a 2048-pixel short edge.
         scale = 2048 / min(width, height)
+    elif mode == "short_edge":
+        # The Diffusers rule at the short edge an adapter was trained at (its profile's
+        # reference_image_short_edge; SMD Ref2VA: 512), upscaling included and with no
+        # area cap, as Diffusers' configurable reference_image_short_edge does.
+        if not short_edge:
+            raise ValueError("the short_edge reference resize mode needs a short edge")
+        scale = short_edge / min(width, height)
     else:
         raise ValueError(
             f"reference_image_resize_mode must be one of {sorted(REFERENCE_IMAGE_RESIZE_MODES)}"
@@ -127,7 +135,7 @@ class MiniMaxH3Inference:
         adapter_path: str | Path | None = None,
         attention_backend: str = "sol_bsa",
         task: str = "t2v",
-        reference_image_resize_mode: str = "match",
+        reference_image_resize_mode: str | None = None,
         compute_quant: str = "none",
         lora_mode: str = "merged",
         weight_sharding: bool = False,
@@ -135,7 +143,8 @@ class MiniMaxH3Inference:
     ) -> None:
         """``adapter_profile`` (a name in adapter_profiles.json, default: the task's) fixes the adapter's
         forward count, flow shifts, strength, and alpha policy. ``adapter_path`` defaults to the profile's
-        file below the directory that holds ``model_path``."""
+        file below the directory that holds ``model_path``. ``reference_image_resize_mode`` (Ref2VA)
+        defaults to the profile's ``reference_image_short_edge`` when it has one, else ``match``."""
         lora_mode = lora_mode.lower()
         if lora_mode not in {"merged", "separate", "fused"}:
             raise ValueError("lora_mode must be merged, separate, or fused")
@@ -170,12 +179,18 @@ class MiniMaxH3Inference:
             raise ValueError("SOL attention requires 2, 4, or 8 GPU processes")
         if task == "ref2va" and attention_backend == "sol":
             raise ValueError("Ref2VA supports dense or sol_bsa attention")
+        self.adapter_profile = get_profile(adapter_profile, task=task)
+        self.reference_image_short_edge = self.adapter_profile.reference_image_short_edge
+        if reference_image_resize_mode is None:
+            reference_image_resize_mode = "short_edge" if self.reference_image_short_edge else "match"
         reference_image_resize_mode = reference_image_resize_mode.lower()
         if reference_image_resize_mode not in REFERENCE_IMAGE_RESIZE_MODES:
             raise ValueError(
                 "reference_image_resize_mode must be one of "
                 f"{sorted(REFERENCE_IMAGE_RESIZE_MODES)}"
             )
+        if reference_image_resize_mode == "short_edge" and not self.reference_image_short_edge:
+            raise ValueError(f"adapter profile {self.adapter_profile.name} sets no reference_image_short_edge")
         compute_quant = compute_quant.lower()
         if compute_quant not in COMPUTE_QUANT_MODES:
             raise ValueError(f"compute_quant must be one of {sorted(COMPUTE_QUANT_MODES)}")
@@ -183,17 +198,16 @@ class MiniMaxH3Inference:
             from .compute_quant import validate_platform
 
             validate_platform()
-        if weight_sharding and (
-            self.world_size == 1 or task == "ref2va" or lora_mode != "merged" or compute_quant != "none"
-        ):
+        # Ref2VA's transformer_ref has the same blocks as the T2V transformer, and its text encoder
+        # reads the same hidden state (the vision tower stays replicated), so the same sharding applies.
+        if weight_sharding and (self.world_size == 1 or lora_mode != "merged" or compute_quant != "none"):
             raise ValueError(
-                "weight sharding supports multi-GPU T2V/I2V with a merged LoRA and BF16 compute only"
+                "weight sharding supports multi-GPU workers with a merged LoRA and BF16 compute only"
             )
         self.task = task
         self.attention_backend = attention_backend
         self.reference_image_resize_mode = reference_image_resize_mode
         self.compute_quant = compute_quant
-        self.adapter_profile = get_profile(adapter_profile, task=task)
         self.transformer_forwards = self.adapter_profile.transformer_forwards
         self.inference_steps = self.adapter_profile.scheduler_points
         adapter_path = Path(adapter_path) if adapter_path else self.adapter_profile.default_path(model_path)
@@ -215,6 +229,7 @@ class MiniMaxH3Inference:
                     width,
                     height,
                     mode=self.reference_image_resize_mode,
+                    short_edge=self.reference_image_short_edge,
                 )
             )
 

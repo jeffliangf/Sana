@@ -136,6 +136,16 @@ def test_supervisor_refuses_unknown_or_miscounted_profiles(tmp_path, monkeypatch
         run_supervisor(tmp_path, monkeypatch, {"H3_ADAPTER_PROFILE": setting})
 
 
+def test_supervisor_starts_ref2va_workers_with_a_ref2va_attention_backend(tmp_path, monkeypatch):
+    popen, registry, _ = run_supervisor(tmp_path, monkeypatch,
+                                        {"H3_ADAPTER_PROFILE": "smd-ref2va-8step", "H3_ATTENTION_BACKEND": "dense"})
+    assert registry["launch"]["adapter_profiles"] == ["smd-ref2va-8step"] * 2
+    for call in popen.call_args_list:
+        command = call.args[0]
+        assert profile_of(command) == "smd-ref2va-8step"
+        assert command[command.index("--attention-backend") + 1] == "dense"
+
+
 def gate_of(command):
     return command[command.index("--gate-failure") + 1]
 
