@@ -914,8 +914,12 @@ Ref2VA (`ref2va` with image, video and audio references, the eight-step SMD-Mini
 separate deployment, so nothing about it can reach the T2V/I2V gateway, its workers or its callers.
 
 - **Root.** `/home/jeff/sol-h3-ref2va` on the GMI `/home`: its own `deployment/token`, registry
-  (`deployment/<node>-p18090/node.json`), gateway state (`gateway/`), releases and record
-  (`deployment/ref2va-smd-20261123/`, with `launch.sh`, `submissions.json` and the validation).
+  (`deployment/<node>-p<port>/node.json`), gateway state (`gateway/`), releases and records.
+  - **How to launch.** `LAUNCH.md` there covers the gateway, the workers, the check and the stop for the current
+    release.
+  - **Records.** `deployment/ref2va-smd-20261123/` is the first deploy and its validation.
+    `deployment/ref2va-av-20261124/` is the current release's gateway and first worker.
+    `deployment/ref2va-scale-20261125/` adds more workers.
 - **Worker.** A Ref2VA-only adapter profile makes a Ref2VA worker: `H3_ADAPTER_PROFILE=smd-ref2va-8step`
   selects the task, `transformer_ref`, eight forwards with SMD's shortened last step, and the 512-pixel
   reference short edge the adapter was trained at. It runs on four H100s with sharded weights and
