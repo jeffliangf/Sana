@@ -64,10 +64,14 @@ image-to-video with stereo audio at 24 fps, in either request form:
   most 109 s. Since 18:22 UTC on 2026-11-23 the fleet serves RL job 1335, until about 2026-11-25
   23:25 UTC; see the fleet freeze in the [runbook](DEPLOYMENT.md).
 - **H100 workers render different videos.** On 2026-11-23, four-GPU SMD-E workers on H100 gave a
-  different video for the same request and seed, so they were not added
-  ([H100 workers](DEPLOYMENT.md#h100-workers-on-another-cluster)).
+  different video for the same request and seed, so they were not added then.
+  - Since 06:01 UTC on 2026-11-26, three of them (GMI Slurm 1461 and 1462) serve behind the gateway at the user's
+    request.
+  - `h100-routed-jobs.json` in their record lists the jobs they rendered
+    ([H100 workers](DEPLOYMENT.md#h100-workers-on-another-cluster)).
 - **Evidence.** `deployment/smd-e-20261121/`.
-- **Other nodes.** Nodes 035, 048 and 067 run other users' jobs.
+- **Other nodes.** 048 rejoined on 2026-11-24 with four more workers (Slurm 106). With the H100 workers, the
+  gateway routes to 27 workers on 60 GPUs. Nodes 035 and 067 run other users' jobs.
 - **Node-local files.** The rebuilt cluster keeps node-local environments, weights,
   caches, and outputs in `/var/tmp/jeff-sol-h3`.
 - **Live capacity.** Check `/healthz`.
@@ -422,6 +426,8 @@ Evidence is in `/home/jeff/sol-h3-h200/deployment/` on the cluster unless noted.
 | 2026-11-21 | SMD-H3 E on 20 workers (Slurm 101–105): adapter profile `smd-e-8step`, gate off, same gateway and API. The same videos as songyang's SMD-E service on 52 of its stored requests (26 T2V, 26 I2V): video PSNR 33.7–43.0 dB (median 38.4) and audio correlation 0.94–0.9997 (median 0.996) after the encoders' 1024-sample AAC offset. Re-encoding our own output with their encoder settings produces the same gap; a different seed gives 8.3 dB and 0.002. Worker outputs cleaned to about 115 GB free per node | `smd-e-20261121/`, `worker-output-cleanup-20261121/` |
 | 2026-11-21/23 | RL training on SMD-E (GMI Slurm 1225–1229, 1261): 63,198 gateway jobs, all succeeded; median 58 s and at most 109 s per job on its worker. Worker outputs cleaned again under load (15:06 UTC on 11-21, 03:16 UTC on 11-23), with no failed job. Job 1261 stopped on 11-23 at 18:10 UTC after one download 404, most likely caused by a `find` over the gateway's `jobs/` directory; job 1335 replaced it | `worker-output-cleanup-20261121T1506Z/`, `worker-output-cleanup-20261123T0316Z/` |
 | 2026-11-23 | Three SMD-E H100 workers on GMI gpu-001/005 reached the gateway host through reverse tunnels but rendered different videos from the H200 workers for the same seed (18–31 dB PSNR), so they were not admitted and were stopped | GMI cluster: `deployment/smd-e-h100-20261123/` |
+| 2026-11-24 | 048 rejoined with four SMD-E workers (Slurm 106) after direct validation: 24 H200 workers | `add-048-20261124/` |
+| 2026-11-26 | The three SMD-E H100 workers were restarted (GMI Slurm 1461/1462) and admitted at the user's request, although they render different videos for the same seed: 27 workers on 60 GPUs. `h100-routed-jobs.json` lists their jobs | GMI cluster: `deployment/smd-e-h100-20261123/` |
 
 ## Validation
 

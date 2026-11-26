@@ -6,6 +6,14 @@ adapter** service: SMD-H3 E since 2026-11-21, the four-step FastH3 adapter befor
 the launchers in this directory. It does not use the separate SGLang deployment
 instructions at the repository root.
 
+**State on 2026-11-26.** The gateway routes to 27 SMD-E workers on 60 GPUs:
+- the 20 H200 workers described below;
+- four more on 048 since 2026-11-24 (Slurm 106, `deployment/add-048-20261124/`);
+- since 06:01 UTC on 2026-11-26, three four-GPU workers on H100 (GMI Slurm 1461 and 1462), behind reverse tunnels.
+For the same request and seed, the H100 workers render a different video than the H200 workers. The user admitted
+them knowing this ([H100 workers](#h100-workers-on-another-cluster)). `deployment/jobs.json` lists the H200
+allocations, and its `h100_workers_20261126` section lists the H100 ones.
+
 **State on 2026-11-23 (H200).** Since 2026-11-21, 20 two-GPU H200 workers serve **SMD-H3 E** through the
 unchanged gateway, in both request forms, with
 [overlapped output publication](#overlapped-output-publication) (`H3_ASYNC_PUBLICATION=1`).
@@ -50,7 +58,8 @@ They accept prompts of up to 16,000 characters.
   2026-11-25 23:25 UTC.
   - Its operators rely on the profile, gate and worker count. Do not change them while it runs without telling
     its operators.
-  - They decided to keep their runs on these H200 workers only (see H100 below).
+  - They decided to keep their runs on these H200 workers only (see H100 below). On 2026-11-26 the user admitted
+    three H100 workers anyway.
 - **The 2026-11-18 FastH3 fleet.** Release `20261118-prompt-16k-f2ff5008346a`, Slurm 52–56, was stopped on
   2026-11-20 (`deployment/stop-20-workers-20261120T211328Z/`). Its 16,000-character memory test still bounds the
   worst case: 129.7 GiB allocated at 345 frames on the widest canvas, under the 132.8 GiB cap.
@@ -59,9 +68,9 @@ They accept prompts of up to 16,000 characters.
   nodes idle. If workers answer but `squeue` lists no `h3-api-*` job, `scancel`
   cannot stop them: drain, send SIGTERM to the node's `serve_node.py`, wait a minute
   for the ports' TIME_WAIT to clear (preflight binds them), then submit.
-- Since 17:47 UTC on 2026-11-09, 048 and 067 run other users' jobs
-  (`deployment/release-2-nodes-20261109T174700Z/`). `pool.json` excludes their
-  origins; leave them alone.
+- Since 17:47 UTC on 2026-11-09, 067 runs other users' jobs
+  (`deployment/release-2-nodes-20261109T174700Z/`). `pool.json` excludes its
+  origins; leave it alone. 048, released at the same time, rejoined the fleet on 2026-11-24.
 - 035 (Slurm 57) was drained and released at 19:41 UTC on 2026-11-18 at the user's
   request; no job failed. Since about 20:04 it runs another user's job. `pool.json`
   keeps its four origins excluded. The record `deployment/release-035-20261118/` says
@@ -81,7 +90,8 @@ They accept prompts of up to 16,000 characters.
   Its inventory is under `previous_inventory` in `jobs.json`; do not use its job IDs.
 - **H100, 2026-11-23 (SMD-E).** Three four-GPU SMD-E workers on GMI gpu-001 and gpu-005 (Slurm 1267 and 1268)
   reached the gateway host through reverse tunnels. For the same request and seed they rendered a different video
-  than the H200 workers (18–31 dB PSNR), so they were not admitted. They were stopped at 04:02 UTC; see
+  than the H200 workers (18–31 dB PSNR), so they were not admitted. They were stopped at 04:02 UTC. On
+  2026-11-26 they were restarted as Slurm 1461 and 1462 and admitted at the user's request; see
   [H100 workers](#h100-workers-on-another-cluster).
 - **H100, 2026-11-06.** Eight four-GPU H100 workers with sharded weights ran on GMI
   nodes gpu-001/004/005/006. On that cluster's Slurm, whose job IDs restarted after a
@@ -907,6 +917,41 @@ started to add capacity behind the H200 gateway during an RL run. The record is
   - `submissions.json` holds the sbatch commands; the workers are ready about 13 minutes after
     submission.
   - Admission is `tunnels-enabled`, then `pool_h100.py exclude` and `admit` on the gateway host.
+
+**2026-11-26: admitted at the user's request.** The user asked for three H100 workers to add capacity for the
+RL run `grpo-mixed-hydrogen-group8-16h100-20261124-s150-kl150-lr5e7-smd-cir` (GMI Slurm 1376, later 1467). They
+were reminded of the parity result above and chose to admit them. The record is still
+`deployment/smd-e-h100-20261123/` on the GMI cluster (`README.md`, `actions.log`).
+- **Restart.**
+  - The same release copy, `launch.sh` and `nodes.json`.
+  - Slurm 1461 runs gpu-001's two workers (gateway ports 28086–28087). Slurm 1462 runs one worker on gpu-005's four
+    free GPUs (port 28088).
+  - Both have no time limit (`--time=0`).
+  - Submitted at 05:49 UTC; the workers were ready at 05:54, because the node caches were warm.
+- **Admission.**
+  - `pool_h100.py exclude`, then `tunnels-enabled`.
+  - Direct validation through the tunnels with `validate.py` from `deployment/add-048-20261124/`: 12 of 12
+    checks passed.
+  - `pool_h100.py admit` at 06:01:22 UTC, after the H200 watchdog's hourly run, which also writes `pool.json`.
+  - The gateway then reported 27 workers on 60 GPUs.
+- **Which renders came from H100.** Gateway records name the worker (`http://127.0.0.1:28086`–`28088`).
+  - `h100_routed_jobs.py` in the record writes `h100-routed-jobs.json`: every job the three workers accepted, with
+    the gateway job ID, which is the caller's `Idempotency-Key`.
+  - It reads the nodes' own job records, so nobody needs to list the gateway's `jobs/` directory.
+- **Production to 18:10 UTC.** 2,831 jobs: 2,814 succeeded, 17 queued or running, and none failed.
+  - The first 23 were checked end to end: the same SHA-256 on the worker, in the gateway record and in the
+    archive.
+  - Processing took a median of 35 s at 243 frames, against 50–55 s on H200, and at most 65 s at 345 frames.
+- **Tunnels.**
+  - `/healthz` through a tunnel takes 0.6–1.2 s, against the gateway's 2 s probe limit. A worker therefore
+    sometimes drops out of `ready` for a probe or two, and its running jobs continue.
+  - Polls through the tunnels sometimes fail with "Server disconnected without sending a response" and are retried
+    2 s later. Every affected job finished and was archived.
+- **Stop.**
+  1. Run `pool_h100.py exclude` on the gateway host.
+  2. Keep the tunnels up until the gateway has archived the jobs these workers accepted (`jobs_pending`).
+  3. Remove `tunnels-enabled`.
+  4. Run `scancel 1461 1462` on the GMI cluster.
 
 ### Ref2VA gateway
 
